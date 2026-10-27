@@ -6,13 +6,16 @@ own squidkid locally (instant controls) and streams it to the others, who render
 as a local character, interpolated ~100 ms behind. Ink is replicated splat-for-splat from whoever painted it, so every
 screen shows the same turf.
 
-Transport: one WebSocket per player to a Cloudflare Durable Object relay (`server/`), one room object per code.
+Transport: one WebSocket per player to a room relay — the public Cloudflare Worker (`server/`, one Durable Object per
+code) or, for LAN play, the dependency-free Node relay in `tools/relay.mjs`, which speaks the same protocol. Which
+address a screen uses is decided by `src/net/transport.js` (see [Relays and addresses](#relays-and-addresses)).
 
 ## `G.net` — the session (src/net/session.js)
 
 ```js
 G.net.state      // 'offline' | 'connecting' | 'lobby' | 'starting' | 'match' | 'error'
 G.net.code       // 'K7QXM' while in a room, else null
+G.net.relay      // the relay address this room is on ('ws://192.168.1.5:8490'), else null
 G.net.myId       // this player's id in the room
 G.net.hostId
 G.net.isHost     // boolean
@@ -97,15 +100,52 @@ with its exact counts) and a count snapshot twice a second go on its event timel
 step with the paint that caused them. Guests follow (zones.js `netEvent`): they only predict the count between
 snapshots, and each client fills its own players' special gauges.
 
-**Relay (server/).** One Durable Object per room code: membership, host election, join refusal (unknown / full /
-match running) and blind fan-out of `b|` / `s|to|` payloads. Clients send `"ping"` every 2 s, answered by the runtime
-without waking the room; a sweep drops sockets silent for 10 s during a match (150 s in the lobby).
+**Relay (server/, tools/relay.mjs).** One room per code: membership, host election, join refusal (unknown / full /
+match running) and blind fan-out of `b|` / `s|to|` payloads. Clients send `"ping"` every 2 s, answered without waking
+the room; a sweep drops sockets silent for 20 s during a match (150 s in the lobby). The Worker implementation keeps a
+Durable Object per code and hibernates when quiet; `tools/relay.mjs` keeps rooms in memory (they end when the relay
+does) and needs no account, no internet and no dependencies, which is what makes LAN play work offline.
 
-**Testing.** `node tools/net-test.mjs` (game on :8490, `cd server && npx wrangler dev --port 8787`) plays real headless
+**Mouse capture.** Every shot comes from `input.mouse`, and `input.js` ignores the mouse entirely while the pointer is
+not locked — so a player who never gets pointer lock can walk but cannot aim or fire. A browser grants
+`requestPointerLock()` only with transient user activation and a focused document, and an online round starts on the
+relay's `go` message rather than on a click: the guest's request at match start is refused (the host gets no special
+treatment either, they have simply clicked more recently, which is why offline — where the lock follows the START
+click — this never shows up). So `main.js` says *Click to take the mouse (or press any key)* while
+`input.wantLock && !input.locked`, and `input.js` retries the lock on the next click or key press
+(`input.relockAllowed` keeps menus and the attract loop from grabbing the pointer). Chrome 131+ also gates pointer lock
+behind a per-site permission on plain `http://` addresses: if the retry is refused too, the prompt says so and it has
+to be allowed once per machine.
+
+**Testing.** `npm run lan-test` (no browser, no internet) checks the relay protocol — create / join / refusals / host
+election / fan-out / lock / ping / liveness sweep / rate and size caps — the game's own address picking and a real
+room handshake through `Transport`, and `tools/serve.mjs` serving the game and the relay on one port.
+`node tools/net-test.mjs` (game on :8490, `cd server && npx wrangler dev --port 8787`) plays real headless
 clients against the local relay and reports consistency (clock, coverage, rosters, results) and what is drawn:
 per-frame "kink" and path error of every remote squidkid against its owner's own frames.
 `--clients 3 --leave host --drop kill|freeze` tests migration, `--full` plays through results back to the lobby,
 `--net "netlag=40&netjitter=30&netspike=0.01"` simulates a real connection, `WORST=8` explains the worst frames.
+
+## Relays and addresses
+
+`src/net/transport.js` picks the relay, best first, and always says which one answered (`Transport.url` →
+`G.net.relay`):
+
+1. `?relay=…`, else `localStorage['inkwave.relay']` (the online screen's **LAN RELAY** row, `relayOverride()` /
+   `setRelayOverride()`) — `normalizeRelay()` accepts `192.168.1.9`, `box.local:8490`, `ws://…` and `wss://…`, and
+   fills in the page's own port when none is typed; `auto`/empty clears it;
+2. the page's own origin (`ws(s)://<page host>:<page port>`) — what `tools/serve.mjs` provides, so **any** address the
+   page is reachable at is also the relay address: real LANs, virtual LANs (Tailscale `100.x`, ZeroTier, Radmin `26.x`,
+   Hamachi `25.x`), IPv6 literals and `.local` names;
+3. `ws://<page host>:8787` — a standalone `npm run relay`;
+4. the public Worker (`wss://inkwave-net.inkwave.workers.dev`).
+
+A candidate that doesn't answer (refused connection, no WebSocket upgrade, timeout) falls through to the next one; a
+relay that answers with a refusal ("Room not found", "Room is full", "Match in progress", …) is authoritative — the
+game reports that and stops, so two players can never be split across different relays by a fallback. `?relay=` and the
+stored address are the escape hatch for a page hosted somewhere the relay isn't (a static host, or another machine's
+LAN address) and for pointing every player at the same machine. Everyone in a room must be on the same relay; the usual
+way is the simplest one — everybody opens the host's URL (`npm run serve`).
 
 ## Showcase lobby set (src/game/showcase.js)
 

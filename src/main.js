@@ -31,6 +31,8 @@ import { Showcase } from './game/showcase.js';
 import { ZoneMarks } from './fx/zoneMarks.js';
 import { BOSS_MODE } from './boss/bossMode.js';
 import { setLang, t } from './i18n/strings.js';
+import * as accounts from './net/accounts.js';
+import { initRelayConfig } from './net/transport.js';
 
 const params = new URLSearchParams(location.search);
 // dev-only: ?devstage lets an online-only stage (config onlineOnly — Cargo Terminal) boot as the backdrop and be walked
@@ -41,7 +43,12 @@ const REFRESH_RATES = [30, 48, 50, 60, 75, 90, 100, 120, 144, 165, 240]; // comm
 
 // ------------------------------------------------------------------------------------------ persistence
 function loadJSON(key, def) { try { const v = JSON.parse(localStorage.getItem(key)); return v ? { ...def, ...v } : { ...def }; } catch { return { ...def }; } }
-function saveJSON(key, v) { try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* private mode */ } }
+function saveJSON(key, v) {
+  try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* private mode */ }
+  // signed in: every save of the two synced blobs schedules a cloud push (debounced in accountsSync);
+  // suppressed while the cloud's own data is being applied back into memory (_cloudPush pulled branch)
+  if ((key === 'inkwave.settings' || key === 'inkwave.profile') && !G._cloudQuiet) G.accountsSync?.note();
+}
 const DEFAULT_PROFILE = { name: 'Player', level: 1, xp: 0, wins: 0, matches: 0, totalTurf: 0, weapon: 'shooter' };
 
 // Modules that may fall back to a stub when their file is missing. Written as literal import() calls on purpose: a
@@ -70,6 +77,9 @@ async function loadModule(path, stubName) {
 class Game {
   async boot() {
     const t0 = performance.now();
+    await initRelayConfig();   // self-host: pick up RELAY_PUBLIC_URL (/relay.txt) before anything dials the relay
+    await this._cloudRestore();   // signed in? pull the cloud save before anything reads it
+    this._cloudSyncInit();
     // real top-down thumbnails for the stage cards, generated from each layout's geometry
     for (const m of MAPS) { try { m.thumb = layoutThumbSVG(MAP_LAYOUTS[m.layout || m.id], m.theme); } catch (e) { console.warn('thumb', m.id, e); } }
     this.settings = G.settings = loadJSON('inkwave.settings', DEFAULT_SETTINGS);
@@ -213,6 +223,10 @@ class Game {
       };
       document.addEventListener('visibilitychange', this._onHide);
     }
+    // a live round wants the pointer; menus, the pause screen and the attract loop do not (input.js retries the lock
+    // on the player's next click or key press, which is the only thing a browser accepts as a gesture — an online
+    // guest's round starts on a network message, so its first lock request has no gesture behind it)
+    this.input.relockAllowed = () => G.mode === 'match' && !!this.match && !this.match.attract && !this.match.paused && !this.menus?.current && !params.has('autopilot');
     // after a focus steal while the map was held, the next click on the game takes the mouse back (no pause detour)
     this.R.renderer.domElement.addEventListener('mousedown', () => {
       if (this._relock && G.mode === 'match' && this.match && !this.match.paused && !this.menus?.current) { this._relock = false; this.input.requestLock(); }
@@ -482,6 +496,66 @@ class Game {
     const c = color.isColor ? color : this._tmpC.set(color);
     for (let t = 0; t < 2; t++) { const k = G.teamColors[t]; if (Math.abs(k.r - c.r) + Math.abs(k.g - c.g) + Math.abs(k.b - c.b) < 0.05) return t; }
     return -1;
+  }
+
+  // ---------------------------------------------------------------------------------------- account cloud save
+  // Pull the signed-in account's cloud save BEFORE anything reads inkwave.settings / inkwave.profile, so the rest
+  // of boot (touch quality defaults, Renderer tier, menus) sees the synced values as if they were local. When the
+  // cloud copy is newer than this browser's last sync it simply replaces the localStorage blobs here. Runs with
+  // nothing on screen yet — a slow or missing relay costs at most a short black screen, and only for signed-in
+  // sessions (logged-out boots don't even fetch).
+  async _cloudRestore() {
+    const acc = accounts.current();
+    if (!acc) return;
+    try {
+      const remote = await accounts.pull(acc.token);
+      if (remote && remote.data && (remote.updatedAt || 0) > accounts.syncedAt()) {
+        if (remote.data.settings) localStorage.setItem('inkwave.settings', JSON.stringify(remote.data.settings));
+        if (remote.data.profile) localStorage.setItem('inkwave.profile', JSON.stringify(remote.data.profile));
+        accounts.setSyncedAt(remote.updatedAt);
+        console.info(`[accounts] restored cloud save for ${acc.name} (updatedAt ${remote.updatedAt})`);
+      }
+    } catch (e) { console.warn('[accounts] cloud restore skipped — staying local:', e.message); }
+  }
+
+  _cloudSyncInit() {
+    const self = this;
+    let timer = null;
+    this.accountsSync = G.accountsSync = {
+      get current() { return accounts.current(); },
+      /** Called by saveJSON after either synced blob changes; pushes at most every 2.5 s. */
+      note() {
+        if (!accounts.current()) return;
+        clearTimeout(timer);
+        timer = setTimeout(() => self._cloudPush(), 2500);
+      },
+      /** Manual "sync now" (account screen): take newer cloud data first, else push local up. */
+      async syncNow() { clearTimeout(timer); return self._cloudPush(true); },
+    };
+  }
+
+  async _cloudPush(forceCheck = false) {
+    const acc = accounts.current();
+    if (!acc) return null;
+    try {
+      if (forceCheck) {
+        const remote = await accounts.pull(acc.token).catch(() => null);
+        if (remote && remote.data && (remote.updatedAt || 0) > accounts.syncedAt()) {
+          G._cloudQuiet = true;   // applying the cloud's own data must not schedule another push
+          try {
+            if (remote.data.settings) this.settings = G.settings = { ...DEFAULT_SETTINGS, ...remote.data.settings };
+            if (remote.data.profile) this.profile = G.profile = { ...DEFAULT_PROFILE, ...remote.data.profile };
+            accounts.setSyncedAt(remote.updatedAt);
+            this._setSettings({});   // re-apply the (possibly changed) settings to the live renderer
+            saveJSON('inkwave.profile', this.profile);
+          } finally { G._cloudQuiet = false; }
+          return { pulled: true, updatedAt: remote.updatedAt };
+        }
+      }
+      const r = await accounts.push(acc.token, { settings: this.settings, profile: this.profile });
+      if (r && r.updatedAt) accounts.setSyncedAt(r.updatedAt);
+      return { pulled: false, updatedAt: r && r.updatedAt };
+    } catch (e) { console.warn('[accounts] cloud push failed:', e.message); return null; }
   }
 
   // ---------------------------------------------------------------------------------------- menus api
@@ -1560,7 +1634,15 @@ class Game {
     this._hintT += dt;
     let prompt = null;
     const inkF = a.ink / PLAYER.inkMax;
-    if (m.state === 'playing' && a.alive) {
+    // the mouse is not captured (an online round starts on the relay's "go", and a browser only grants pointer lock to
+    // a user gesture): say so instead of leaving the player unable to aim or fire — input.js then takes the lock on
+    // the click (or key press) this prompt asks for. If even that was refused, the browser is blocking it for this
+    // site (Chrome 131+ gates pointer lock behind a permission on plain http addresses).
+    if (this.input.wantLock && !this.input.locked && !params.has('autopilot') && m.state !== 'finish') {
+      prompt = this.input.lockTries > 1 && this.input.lockError
+        ? 'Mouse capture is blocked — allow pointer lock for this site, then click again'
+        : 'Click to take the mouse (or press any key)';
+    } else if (m.state === 'playing' && a.alive) {
       if (m.controller?.mapHeld) prompt = null;   // the map diorama carries its own super-jump hints
       else if (a.superJumpState) prompt = null;
       else if (this._lowInkFlash > 0) { this._lowInkFlash -= dt; prompt = { id: 'Low ink! Hold SHIFT in your ink to refill' }; }

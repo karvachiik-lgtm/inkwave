@@ -6,6 +6,7 @@
 // together. In the match NetMatch (netmatch.js) does the replication.
 import { G, emit } from '../core/ctx.js';
 import { MAPS, WEAPONS, WEAPON_ORDER, SUBS, SUB_ORDER, SPECIALS, SPECIAL_ORDER, MATCH, ZONES, BOT_NAMES, TEAM_PALETTES, mapNoBots, mapBossOk, bossFallbackMap, noBotsStartBlock } from '../config.js';
+import { BOSS_MODE } from '../boss/bossMode.js';
 import { randomStyle } from '../game/character-style.js';
 import { Transport } from './transport.js';
 import { NetMatch } from './netmatch.js';
@@ -14,7 +15,7 @@ import { ERR, netError, codeFromText } from './errors.js';
 // no 0/O or 1/I (misread), and no W/A/S/D: those move the menu cursor, so any other key typed on the online hub can
 // only mean a room code (28⁵ ≈ 17 M codes)
 const CODE_CHARS = 'BCEFGHJKLMNPQRTUVXYZ23456789';
-const TEAM = 4;
+const TEAM = 5;
 // a loadout's sub / special: a known id, or null (= the weapon's own)
 const subOf = (id) => (SUBS[id] ? id : null), specialOf = (id) => (SPECIALS[id] ? id : null);
 
@@ -26,6 +27,7 @@ export class NetSession {
     this.hostId = null;
     this.error = null;         // last failure, for logs / fallback text
     this.errorCode = null;     // stable code for the same failure (src/net/errors.js) — what the UI keys off
+    this.relay = null;          // the relay address this session is speaking to (transport.js picks it: LAN, same origin, public)
     this.lobby = this._blankLobby();
     this._subs = new Map();
     this.tr = null;
@@ -33,6 +35,7 @@ export class NetSession {
     this._members = new Map();  // relay membership (id → name), authoritative for who is connected
     this._startCfg = null;
     this._botsPref = null;      // host: the "fill with bots" choice, kept while a humans-only stage forces bots off
+    this.public = false;        // host: the room is listed in the public online lobby
   }
 
   get isHost() { return !!this.myId && this.myId === this.hostId; }
@@ -92,12 +95,17 @@ export class NetSession {
     this.error = null;
     this._setState('connecting');
     const tr = (this.tr = new Transport());
+    this.relay = null;
     tr.onControl = (o) => this._control(o);
     tr.onMessage = (from, d) => this._message(from, d);
     tr.onClose = (reason) => this._closed(reason);
     const me = this._profile();
-    const welcome = await tr.connect(code, name || me.name, create);
+    let welcome;
+    try { welcome = await tr.connect(code, name || me.name, create); }
+    catch (e) { if (this.tr !== tr) return; throw e; }   // superseded connect: swallow its late reject, the newer session owns the state
+    if (this.tr !== tr) return;
     this.code = code;
+    this.relay = tr.url || null;
     this.myId = welcome.id;
     this.hostId = welcome.host;
     this._members.clear();
@@ -118,10 +126,11 @@ export class NetSession {
     this.match?.dispose(); this.match = null;
     this.tr?.close(); this.tr = null;
     const was = this.state;
-    this.code = null; this.myId = null; this.hostId = null;
+    this.code = null; this.myId = null; this.hostId = null; this.relay = null;
     this._members.clear();
     this.lobby = this._blankLobby();
     this._startCfg = null;
+    this.public = false;
     if (!silent && was !== 'offline') { this._setState('offline'); this._emit('lobby', { lobby: this.lobby }); }
     else this.state = 'offline';
   }
@@ -129,6 +138,7 @@ export class NetSession {
   _fail(e) {
     this.errorCode = e?.code || ERR.CONNECT;
     this.error = e?.message || 'Could not connect';
+    this.relay = null;
     this.tr?.close(); this.tr = null;
     this._setState('error');
     this._emit('error', { code: this.errorCode, message: this.error });
@@ -142,6 +152,8 @@ export class NetSession {
     this.match?.dispose(); this.match = null;
     this.tr = null;
     this.code = null;
+    this.public = false;
+    this.relay = null;
     this._setState(this.error ? 'error' : 'offline');
     if (this.error) this._emit('error', { code: this.errorCode, message: this.error });
     if (inMatch) G.game?.netMatchAborted?.(this.errorCode || this.error);
@@ -149,6 +161,7 @@ export class NetSession {
 
   // ------------------------------------------------------------------ relay membership
   _control(o) {
+    if (o.t === 'meta') { this.public = !!o.public; this._emit('meta', { public: this.public }); return; }
     if (o.t === 'join') {
       this._members.set(o.m.id, o.m.name);
       if (this.isHost) {
@@ -175,7 +188,7 @@ export class NetSession {
     return { id, name: (name || 'Player').slice(0, 16), team: 'auto', weapon: WEAPONS[o.weapon] ? o.weapon : 'shooter', sub: subOf(o.sub), special: specialOf(o.special), style: o.style || randomStyle(), ready: false, host: id === this.hostId, ping: 0 };
   }
 
-  // host: honour team requests while keeping ≤ 4 a side, then place everyone still on 'auto' on the smaller side
+  // host: honour team requests while keeping ≤ 5 a side, then place everyone still on 'auto' on the smaller side
   _fixTeams() {
     const ps = this.lobby.players;
     const count = [0, 0];
@@ -254,6 +267,18 @@ export class NetSession {
     if (l.mode === 'boss' && !mapBossOk(l.map)) l.map = bossFallbackMap(wasMap);
     l.bots = mapNoBots(l.map) ? false : (this._botsPref ?? l.bots);
     this._broadcastLobby();
+    if (this.public) this._pushMeta();   // keep the lobby card's mode/map fresh
+  }
+
+  // public-lobby card: the host marks the room public/private; the Room relays the state to the other players and
+  // upserts/removes the card in the public registry
+  setPublic(v) {
+    if (!this.isHost) return;
+    this.public = !!v;
+    this._pushMeta();
+  }
+  _pushMeta() {
+    if (this.tr) this.tr.meta({ public: this.public, mode: this.lobby.mode, map: this.lobby.map });
   }
 
   canStart() {
@@ -277,14 +302,14 @@ export class NetSession {
     const roster = [];
     let nid = 0;
     const names = [...BOT_NAMES].sort(() => Math.random() - 0.5);
-    const boss = l.mode === 'boss' && mapBossOk(l.map);   // one squad of up to 8 (all team 0), bots fill the rest
+    const boss = l.mode === 'boss' && mapBossOk(l.map);   // one squad of 8 (BOSS_MODE.squad, all team 0), bots fill the rest
     for (let team = 0; team < (boss ? 1 : 2); team++) {
       const humans = boss ? l.players : l.players.filter((p) => p.team === team);
       const weapons = [...WEAPON_ORDER].sort(() => Math.random() - 0.5);
       let slot = 0;
       for (const p of humans) roster.push({ nid: nid++, owner: p.id, bot: false, team, slot: slot++, name: p.name, weapon: p.weapon, sub: subOf(p.sub), special: specialOf(p.special), style: p.style });
       if (bots) {
-        while (slot < (boss ? TEAM * 2 : TEAM)) {
+        while (slot < (boss ? BOSS_MODE.squad : TEAM)) {
           const used = new Set(roster.filter((r) => r.team === team).map((r) => r.weapon));
           const wpn = weapons.find((w) => !used.has(w)) || weapons[slot % weapons.length];
           // bots carry a random sub / special about half the time, as offline (else their weapon's own)
