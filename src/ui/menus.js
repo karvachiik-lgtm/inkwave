@@ -1035,7 +1035,7 @@ export class Menus {
       { id: 'loadout', label: 'LOADOUT', icon: weaponIcon(W.kind || lo.weapon), cls: 'iw-btn--menu', accept: () => this._go('loadout') },
       { id: 'locker', label: 'LOCKER', icon: GLYPHS.hanger, cls: 'iw-btn--menu', accept: () => this._go('locker') },
       { id: 'settings', label: 'SETTINGS', icon: GLYPHS.gear, cls: 'iw-btn--menu', accept: () => this._go('settings') },
-      { id: 'account', label: 'ACCOUNT', sub: signedIn ? `${signedIn.name} · cloud save` : 'Progress stays on this device · tap to sign in', icon: GLYPHS.users, cls: 'iw-btn--menu', accept: () => this._go('account') },
+      { id: 'account', label: 'ACCOUNT', sub: signedIn ? t('{name} · cloud save', { name: signedIn.name }) : t('Progress stays on this device · tap to sign in'), icon: GLYPHS.users, cls: 'iw-btn--menu', accept: () => this._go('account') },
       { id: 'howto', label: 'HOW TO PLAY', icon: GLYPHS.question, cls: 'iw-btn--menu', accept: () => this._go('howto') },
       { id: 'credits', label: 'CREDITS', icon: GLYPHS.star, cls: 'iw-btn--menu', accept: () => this._go('credits') },
     ];
@@ -1380,14 +1380,14 @@ export class Menus {
     };
     const refreshStageRow = () => {
       const m = byId(st.mapId), i = maps.indexOf(m);
-      const t = timeOf(m.id);
-      stageRow.classList.toggle('is-dusk', t === 'dusk');
+      const tod = timeOf(m.id);
+      stageRow.classList.toggle('is-dusk', tod === 'dusk');
       stageRow.classList.toggle('is-sel', true);
-      stageRow.querySelector('.iw-stagerow__name').textContent = m.name;
+      stageRow.querySelector('.iw-stagerow__name').textContent = t(m.name);
       stageRow.querySelector('.iw-stagerow__num').textContent = `${String(i + 1).padStart(2, '0')} / ${String(maps.length).padStart(2, '0')}`;
       const art = stageRow.querySelector('.iw-stagerow__art');
-      if (art.dataset.src !== `${m.id}|${t}`) {
-        art.dataset.src = `${m.id}|${t}`;
+      if (art.dataset.src !== `${m.id}|${tod}`) {
+        art.dataset.src = `${m.id}|${tod}`;
         art.innerHTML = m.thumb || mapThumb(m, i + 2);
       }
     };

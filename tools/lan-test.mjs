@@ -352,6 +352,8 @@ async function onePort() {
 
     const c = client(`ws://127.0.0.1:${port}/room/PORT1?name=One&v=1&create=1`);
     const w = await c.welcome();
+    const lob = await fetch(base + '/lobby');
+    ok('GET /lobby is answered by the relay on the game port', lob.status === 200 && Array.isArray((await lob.json()).rooms), String(lob.status));
     ok('a room opens through the same port', !!w.id && w.host === w.id);
     c.close();
   } catch (e) {

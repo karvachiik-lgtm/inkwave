@@ -74,7 +74,7 @@ function serve2(req, res, file, st) {
 
 const server = createServer((req, res) => {
   const url = req.url || '/';
-  if (relayHandler && (url === '/health' || url.startsWith('/health?') || url.startsWith('/room/'))) return relayHandler(req, res);
+  if (relayHandler && (url === '/health' || url.startsWith('/health?') || url === '/lobby' || url.startsWith('/lobby?') || url.startsWith('/room/'))) return relayHandler(req, res);
   return serve(req, res);
 });
 if (hub) server.on('upgrade', (req, socket, head) => hub.handleUpgrade(req, socket, head));
