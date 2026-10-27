@@ -8,6 +8,23 @@ are predictions from diffs and trial merges, not yet verified by running the gam
 
 ---
 
+## Status (updated as phases land)
+
+| Phase | State | Notes |
+|---|---|---|
+| 0 Prepare | done | Fork remotes added; work happens on `claude/elegant-edison-izu48c` (acts as the integration branch). |
+| 1 Content + platform (zgj) | done | Clean merge. 8 stages, Zone Control, Boss Battle, full arsenal, Electron, mobile touch, perf lab. |
+| 2 Language | done | norfan's `t()` + picker; 1,123 zh entries after importing jy (192) and Panda (394); Phase 3 text adds more. |
+| 3 Network | done | One resolver chain, Room + Lobby + Store Worker (migrations v1/v2/v3), Node relay with lobby and error codes, public rooms UI, LAN RELAY row, accounts + cloud save (English `t()` text). `lan-test` 66 checks and a 16-check run against the merged Worker pass. |
+| 4 Rules, split-screen, pad | next | jy's `mock.js` team cap of 5 and its lobby geometry are deliberately not applied yet. |
+| 5 GPU picker | pending | jy's `gpuPref` settings row was left out until its renderer support lands. |
+| 6 Delivery | pending | Docker files, Windows packaging, release scripts, APK build. |
+| 7 Docs | pending | |
+
+Not yet verified: the full game has not been played in a browser after the merges (the sandbox only has software
+rendering, where the smoke test times out before a match starts). Syntax, import links, the relay tests and the
+Worker run above are what has been checked.
+
 ## 1. Where everything comes from
 
 ```
