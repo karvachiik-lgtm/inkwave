@@ -542,3 +542,58 @@ Third-party (weaker): [aiindigo review](https://aiindigo.com/tool/spawn),
 Repo references: [`docs/MERGE_ROADMAP.md`](docs/MERGE_ROADMAP.md) · [`docs/NET.md`](docs/NET.md) ·
 `src/config.js` · `src/game/physics.js` · `server/src/index.js` · `tools/lan-test.mjs` · `tools/worker-test.mjs` ·
 `tools/i18n-tour.mjs`.
+
+
+
+
+
+
+Here's the real answer, not the marketing version. You're asking what actually pulls a human in and what keeps them, so I'll separate "the hook" from "the glue" — and flag which parts survive when you cut multiplayer and payments, since that's your case.
+
+## What actually attracts (the first 10 seconds)
+
+The genre's #1 attractor is one sentence: **it's a shooter for people who are bad at shooters.** That's the whole trick. In CoD, a new player dies before they understand why. Here, you can pick a roller, mash the trigger, and *contribute* by painting floor even with zero aim. That widens the funnel enormously. This is the single most important design property of a Splatoon-like.
+
+The rest of the pull:
+
+- **Visible territory.** Humans are territorial animals. Watching the map physically turn your color is a dopamine loop that needs no numbers, no scoreboard, no UI. Paint = instant, legible progress. It's a coloring book with stakes.
+- **Movement fantasy.** Squid-swim, wall-climb, dolphin jump. Fluid, fast, expressive movement is the *actual* game. Aim is the sideshow. People stay for how it feels to *move*.
+- **Bright, cool aesthetic.** Color *is* self-expression. It looks nothing like the gray military shooters.
+- **3-minute sessions.** No commitment. Perfect "one more."
+- **No-voice-chat social safety.** Huge, underrated. A big chunk of the audience is *afraid of CoD lobbies.* A team shooter you can play with strangers and zero talking is a whole market.
+
+## What actually sticks (hours, then weeks)
+
+Attraction gets them in the door. Retention is a different machine entirely:
+
+- **A mastery curve you can *feel*.** Movement tech, map knowledge, weapon matchups. The player can sense themselves getting better. If skill expression is shallow, they leave in a week.
+- **Playstyle identity.** "I'm a roller main" / "I'm a charger." Weapon choice becomes part of who they are. Identity attachment beats stat unlocks.
+- **The comeback mechanic.** This is the genre's secret weapon. The last 30 seconds decide the match. A team comfortably ahead gets erased by one push. That produces *stories* ("we were down 60% and won") and stories are what make people come back.
+- **Near-miss losses.** Close matches + matchmaking tuned to keep you near 50% win rate = "I'll win next time." Losing 49-51% is stickier than winning 90-10%.
+- **Self-expression as a grind.** Cosmetics, colors, name, banners. Even with zero monetization, earning a new look is retention.
+- **Content rotation.** Maps and weapon sets on a schedule give a daily reason to log in and keep it feeling fresh.
+- **Polish/juice.** Splat sounds, screen shake, the pop of paint landing. Cheap to make, enormous for stickiness.
+
+And the one Splatoon nails that nobody copies: **a no-stakes social space.** "Squid parties" — people just goofing off, spinning, doing nothing. That's a retention axis for the casual majority who will never grind rank.
+
+## What survives when you cut multiplayer + payments
+
+This is the part the plan glosses over. Remove online opponents and the retention levers shrink hard. Bots don't surprise you, don't trash-talk, don't have playstyles. So for a bot-only game you must replace:
+
+- **Live opponents → a bot difficulty ladder.** Bots need escalating personalities and strategies (an aggressive charger bot, a defensive turf-hog bot). Progression = "beat the level 7 bots." Without this, your game is solved in an hour.
+- **Rank/ladder → local challenge structure.** Daily modifiers, score attack, turf-% targets, time trials. Give a reason to replay a map.
+- **Cosmetic store → local unlocks.** Earn colors, skins, weapon variants by playing. Even offline, "unlock the thing" works.
+- **The comeback drama → scripted bot comebacks.** Tune bots to push hard in the last minute so matches still produce the 49-51 stories.
+
+## The traps
+
+- **Team toxicity.** Even with bots, humans blame teammates. Keep roles simple so blame is diffuse.
+- **Stomp/being stomped.** Matchmaking exists for a reason. In a bot version, difficulty auto-scaling to the player matters more than any content.
+- **Grind fatigue.** Dailies and battle passes burn people out. If you're payment-free, don't import a paid-game's chore structure.
+- **Shallow skill ceiling.** If movement and weapon mastery don't have depth, the "sticks" column collapses and you have a 2-hour toy.
+
+**The one-line version:** attraction = "you can contribute without aiming, and the floor turns your color." Retention = "movement mastery, playstyle identity, and last-second comebacks." If you're bot-only, you have to *manufacture* the comeback and the mastery ladder, because online play is what normally supplies both.
+
+
+
+generate players again with tripo
