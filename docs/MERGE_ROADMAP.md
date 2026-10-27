@@ -21,6 +21,8 @@ are predictions from diffs and trial merges, not yet verified by running the gam
 | 6 Delivery | pending | Docker files, Windows packaging, release scripts, APK build. |
 | 7 Docs | pending | |
 
+Playtest (headless Chrome, software rendering): boot, every menu screen and the live language switch were driven; this found and fixed `/lobby` not being served on the LAN server, a `t()` shadowing crash on the setup screen, and 343 duplicate dictionary entries. See `HANDOFF.md` §2.3–2.4 for what is and is not verified.
+
 Not yet verified: the full game has not been played in a browser after the merges (the sandbox only has software
 rendering, where the smoke test times out before a match starts). Syntax, import links, the relay tests and the
 Worker run above are what has been checked.
