@@ -49,3 +49,30 @@ screen-FX modules should subscribe to these instead of editing gameplay code.
 - Extra SFX names available to everyone via `G.audio.play(name, { pos, volume, pitch })`: `step_dry`, `step_ink`,
   `step_enemy`, `ink_drip`, `gull`, `harbor_ambience` (loop) — plus the full list in docs/CONTRACTS.md §2.
 - Need a new sound? Add a def in src/audio/audio.js and list it in SFX_GROUPS.
+
+## Added since upstream 1.0 (this fork)
+Specials, subs and Zone Control emit these on top of the table above. `actor:dive`, `footstep` and `handplant` are no
+longer emitted.
+
+| event | payload | where |
+|---|---|---|
+| `actor:cheer` | `{ actor, helped }` | specials.js (Cheer Orb) |
+| `actor:dodge` / `weapon:dodge` | `{ actor, dir }` / `{ actor, pos, dir }` | weapons.js (Twins dodge roll) |
+| `actor:poisoned` / `actor:tracked` | `{ actor }` / `{ actor, team }` | subs.js (poison / point sensor) |
+| `bomb:arm` / `bomb:explode` | `{ actor, pos, team, radius }` | subs.js |
+| `match:count` | `{ n }` (final countdown) | match.js |
+| `special:start` / `special:end` | `{ actor, id }` / `{ actor, id, reason }` | specials.js |
+| `special:launch` / `special:sonar` / `special:shield` | `{ actor, to }` / `{ actor, pos }` / `{ actor, time }` | specials.js |
+| `special:strike` / `special:wail` | `{ actor, pos, radius }` / `{ actor, pos, dir }` | specials.js |
+| `storm:end` | `{ pos, team, actor }` | weapons.js |
+| `sub:use` | `{ actor, kind }` | subs.js |
+| `sub:land` / `sub:arm` / `sub:cloud` / `sub:destroyed` | `{ kind, pos, team, radius? }` | subs.js |
+| `sub:charge` | `{ actor, kind: 'shaker', level, max }` — the Shaker Bomb in hand reached a new charge (2, then 3 = max) | kits/shaker.js |
+| `sub:lock` / `sub:end` | `{ kind: 'waddle', pos, team, actor, target }` / `{ kind, why, team, pos }` (why: reached · travel · life · lost · stuck · fuse · popped · sea · fell · cleared) | kits/waddle.js |
+| `zones:zone` | `{ zone, owner }` — one zone taken (≥ 80 % ink); it is then flooded with the taker's ink | zones.js |
+| `zones:control` | `{ owner, prev, objective }` — the live objective's holder changed (owner −1 = neutral) | zones.js |
+| `zones:contest` | `{ zone, holder, share }` — the other team has inked a held zone to the warning share (ZONES.warn) | zones.js |
+| `zones:penalty` | `{ team, penalty, total, start, end }` | zones.js |
+| `zones:active` | `{ objective, zones, final, moved }` — rotation (final = the last-30-s centre lock) | zones.js |
+| `zones:overtime` | `{ losing }` | zones.js |
+| `zones:end` | `{ winner, reason, counts }` (reason: knockout · time · comeback · retake · neutralised · overtime-cap) | zones.js |

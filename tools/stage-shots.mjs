@@ -1,4 +1,4 @@
-// Stage-select art (menus stream): one hero shot per stage × time of day, rendered from the REAL game — attract mode
+// Stage-select art: one hero shot per stage × time of day, rendered from the REAL game — attract mode
 // booted on the stage, every actor hidden, ink / projectiles / FX cleared, a static cinematic camera, a fixed world
 // clock — then captured straight from the WebGL canvas (no DOM UI) at 2× supersampling and saved as WebP.
 //
@@ -18,6 +18,7 @@
 //          q ≈ 0.82), <out>/manifest.json, and a review sheet /private/tmp/menus/stages/contact.png (the crop of the
 //          ~1100×520 `object-fit: cover` hero panel is shown undimmed; everything outside it is dimmed).
 import puppeteer from 'puppeteer-core';
+import { chromePath, gpuArgs } from './chrome.mjs';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,6 +54,9 @@ const SHOTS = {
   // (HALYARD MARINA sign) back right, the city skyline across the bay (windows lit at dusk). Sun behind-left.
   // (x/z nudged 3 m sideways so the quay palm at (-15.5, -38.5) stays out of the bottom-left corner.)
   halyard: { pos: [-41, 16, -43], look: [-0.55, 6.92, 0.38], fov: 58, t: 40, palette: 'tangerine-cobalt' },
+  // Cargo Terminal — over the gate-side shoulder of the Alpha base looking up the turned berth: K7's portal over the
+  // Landing, the stacks either side of the truck lane, CORAL MAXIMA's bow (the layout's own `art` camera, in world space)
+  cargo: { pos: [11.3, 26, -64.07], look: [-0.98, 4, 5.57], fov: 60, t: 40, palette: 'tangerine-cobalt' },
 };
 // A stage missing from the table gets a generic 3/4 aerial from its layout bounds (computed in the page).
 const FALLBACK = { pos: null, look: null, fov: 60, t: 40, palette: 'tangerine-cobalt' };
@@ -179,9 +183,9 @@ async function captureInPage(P) {
 
 // ------------------------------------------------------------------------------------------------ browser
 const browser = await puppeteer.launch({
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  executablePath: chromePath(),
   headless: 'new',
-  args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required', `--window-size=${W},${H}`],
+  args: gpuArgs([`--window-size=${W},${H}`]),
   defaultViewport: { width: W, height: H, deviceScaleFactor: DSF },
   protocolTimeout: 600000,
 });
@@ -190,7 +194,8 @@ const READY = "window.__inkwave && __inkwave.menus && __inkwave.menus.current ==
 
 // Boot one stage × time; a boot that fails (the shared dev server may be mid-edit) is retried after a minute.
 async function boot(id, time) {
-  const url = `${BASE}/?map=${encodeURIComponent(id)}&time=${time}&skipTitle`;
+  // (devstage: online-only stages — Cargo Terminal — only boot offline with the dev override)
+  const url = `${BASE}/?map=${encodeURIComponent(id)}&time=${time}&skipTitle&devstage`;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const page = await browser.newPage();
     const logs = [];

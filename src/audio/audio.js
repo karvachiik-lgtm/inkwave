@@ -5,7 +5,8 @@
 //   audio.setVolumes({ master, music, sfx })       // 0..1 each (perceptual taper)
 //   audio.setListener(pos, forward, up)            // THREE.Vector3-like {x,y,z}; every frame
 //   audio.play(name, { pos, volume = 1, pitch = 1 })   // one-shot; pos → 3D (HRTF, inverse distance) else 2D
-//   const h = audio.loop(name, { pos, volume, pitch }); h.set({ volume, pitch, pos }); h.stop(fade = 0.15)
+//   const h = audio.loop(name, { pos, volume, pitch }); h.set({ volume, pitch, pos, params }); h.stop(fade = 0.15)
+//                                                  (params: loops with extra controls, e.g. zone_hum { mode, tension })
 //   audio.duck(amount = 0.5, seconds = 1.2)        // temporarily lowers the music bus
 //
 // Loop pitch conventions: charger_charge pitch = 1 + 1.5 * charge (0..1); roll / swim / climb pitch ≈ 0.7 + speed
@@ -190,11 +191,12 @@ export class AudioEngine {
 
   _dist(p) { const dx = p.x - this.L.x, dy = p.y - this.L.y, dz = p.z - this.L.z; return Math.sqrt(dx * dx + dy * dy + dz * dz); }
 
-  _panner(pos) {
+  // ref: the def's reference distance (m) — giant sources (the boss) stay loud across the arena
+  _panner(pos, ref = 3) {
     const ctx = this.ctx;
     const p = ctx.createPanner();
     p.panningModel = this.hrtf ? 'HRTF' : 'equalpower';
-    p.distanceModel = 'inverse'; p.refDistance = 3; p.maxDistance = 60; p.rolloffFactor = 1.2;
+    p.distanceModel = 'inverse'; p.refDistance = ref; p.maxDistance = Math.max(60, ref * 20); p.rolloffFactor = 1.2;
     p.coneInnerAngle = 360; p.coneOuterAngle = 360;
     if (p.positionX) { p.positionX.value = pos.x; p.positionY.value = pos.y; p.positionZ.value = pos.z; }
     else p.setPosition(pos.x, pos.y, pos.z);
@@ -206,7 +208,7 @@ export class AudioEngine {
     const p = voice.panner;
     if (p.positionX) { p.positionX.setTargetAtTime(pos.x, t, 0.02); p.positionY.setTargetAtTime(pos.y, t, 0.02); p.positionZ.setTargetAtTime(pos.z, t, 0.02); }
     else p.setPosition(pos.x, pos.y, pos.z);
-    const d = this._dist(pos);
+    const d = this._dist(pos) * (voice.dk || 1);
     voice.lp.frequency.setTargetAtTime(distCut(d), t, 0.05);
     if (voice.send) voice.send.gain.setTargetAtTime(voice.rev * this._sendScale(d), t, 0.05);
   }
@@ -223,9 +225,10 @@ export class AudioEngine {
     if (withFade) { voice.fade = ctx.createGain(); out.connect(voice.fade); head = voice.fade; v.nodes.push(voice.fade); }
     let scale = 1;
     if (validPos(pos)) {
-      const d = this._dist(pos);
+      voice.dk = 3 / (def.ref || 3);                  // big sources: distance air-absorption / reverb scale with their size
+      const d = this._dist(pos) * voice.dk;
       voice.lp = ctx.createBiquadFilter(); voice.lp.type = 'lowpass'; voice.lp.Q.value = 0.5; voice.lp.frequency.value = distCut(d);
-      voice.panner = this._panner(pos);
+      voice.panner = this._panner(pos, def.ref || 3);
       head.connect(voice.lp); voice.lp.connect(voice.panner); voice.panner.connect(this.sfxIn);
       v.nodes.push(voice.lp, voice.panner);
       voice.rev += Math.min(0.25, Math.max(0, (d - 6) / 60));
@@ -333,6 +336,7 @@ export class AudioEngine {
         const now = eng.ctx.currentTime;
         if (p.volume != null && Number.isFinite(+p.volume)) outG.setTargetAtTime(Math.max(0, +p.volume) * gain, now, 0.04);
         if (p.pitch != null && Number.isFinite(+p.pitch) && ctl.pitch) ctl.pitch(Math.max(0.05, +p.pitch), now);
+        if (p.params && ctl.params) ctl.params(p.params, now);
         if (p.pos) eng._setPos(voice, p.pos, now);
       },
       stop(fade = 0.15) {
@@ -1033,6 +1037,711 @@ def('super_jump', {
   },
 });
 
+/* ---- Special weapons ----
+ * Loop pitch conventions: tornado pitch ≈ intensity (1..2); blower_inflate pitch ≈ bubble size (1..2);
+ * booyah_charge pitch = 1 + charge (1..2, rises an octave); crab_move / crab_roll pitch ≈ speed factor (≈0.5..1.6);
+ * wail_blast / jet_loop pitch ≈ 1 (small variations ok). */
+// struck metal: inharmonic free-bar partials + a contact click
+function clank(v, t, f, peak, d, p = 1, n = 4, to) {
+  const P = [[1, 1, 1], [2.76, 0.55, 0.65], [5.4, 0.3, 0.4], [8.93, 0.15, 0.25]];
+  for (let i = 0; i < n; i++) { const [r, a, k] = P[i]; v.tone({ t, f: f * r * p, a: 0.0006, d: d * k, peak: peak * a, to }); }
+  v.nz({ t, ft: 'highpass', f: 3000, a: 0.0004, d: 0.01, peak: peak * 0.5, to });
+}
+// band-passed noise whoosh: centre f0 → fm (at `mid` of dur) → f1, level follows env ([[frac, level], ...])
+function whoosh(v, t, dur, f0, fm, f1, peak, o = {}) {
+  const T = v.t + t, g = v.gain(0, o.to || v.out), bp = v.filter('bandpass', f0, o.q ?? 1.5, g);
+  bp.frequency.setValueAtTime(f0, T);
+  bp.frequency.exponentialRampToValueAtTime(fm, T + dur * (o.mid ?? 0.55));
+  bp.frequency.exponentialRampToValueAtTime(f1, T + dur);
+  pts(g.gain, T, (o.env || [[0, 0], [0.5, 1], [0.7, 0.6], [1, 0]]).map(([x, y]) => [x * dur, y * peak]));
+  v.noise(o.kind || 'pink', T, T + dur + 0.02, bp);
+  return bp;
+}
+// big wet explosion core shared by the heavy impacts (sub drop, crack, driven noise burst, wash, bloops, hiss tail)
+function inkBoom(v, t, p, s, o = {}) {
+  const len = o.len ?? 1;
+  v.tone({ t, f: (o.f ?? 85) * p, f1: (o.f1 ?? 26) * p, sw: 0.75 * len, a: 0.002, d: 0.95 * len, peak: s });
+  v.tone({ t, type: 'triangle', f: 180 * p, f1: 55 * p, sw: 0.14, a: 0.001, d: 0.18, peak: 0.45 * s });
+  v.nz({ t, ft: 'highpass', f: 1800, a: 0.0003, d: 0.05, peak: (o.crack ?? 1) * s });
+  const sh = v.shaper(2.4, v.gain(0.75, v.out));
+  v.nz({ t, kind: 'pink', ft: 'lowpass', f: o.bright ?? 5500, f1: 160, sw: 0.7 * len, q: 0.85, a: 0.002, d: 0.85 * len, peak: s, to: sh });
+  v.nz({ t: t + 0.04, f: 1300 * p, f1: 280 * p, sw: 0.8 * len, q: 2.5, a: 0.006, d: 0.85 * len, peak: 0.65 * s });   // wash
+  bloops(v, t + 0.05, o.bloops ?? 7, 0.45 * len, [280, 680], 0.3 * s, p);
+  v.nz({ t: t + 0.07, ft: 'highpass', f: 3000, a: 0.05, d: 0.8 * len, peak: 0.28 * s });
+  plips(v, t + 0.2, o.plips ?? 5, 0.6 * len, [800, 1700], 0.1 * s, p);                                  // droplets raining back
+}
+// sawtooth "voice" through parallel band-pass formants → to; returns the source oscillators
+function vox(v, T, t1, f0, formants, to, detune = 8) {
+  const mix = v.gain(1);
+  const srcs = [-detune, detune].map((dt) => { const o = v.osc('sawtooth', f0, T, t1, mix); o.detune.value = dt; return o; });
+  const fs = formants.map(([f, q, a]) => { const bp = v.filter('bandpass', f, q, v.gain(a, to)); mix.connect(bp); return bp; });
+  return { srcs, fs };
+}
+
+def('special_end', {
+  gain: 0.43, max: 2, jitter: 0, reverb: 0.25,
+  build(v, p) {
+    const T = v.t;
+    const lp = v.filter('lowpass', 5000, 0.8, v.out), pw = pulseWave(v.ctx, 0.25);
+    sweep(lp.frequency, T, 5000, 900, 0.5);
+    [84, 79, 76, 72, 67, 60].forEach((m, i) => v.tone({ t: i * 0.05, type: pw, f: mtof(m) * p, f1: mtof(m) * 0.94 * p, sw: 0.15, a: 0.002, d: 0.15, peak: 0.2, to: lp }));
+    const g = v.gain(0, v.out), end = ahr(g.gain, T, 0.02, 0.22, 0.18, 0.3);                            // falling glide
+    const o = v.osc('triangle', 1400 * p, T, end + 0.01, g);
+    sweep(o.frequency, T, 1400 * p, 200 * p, 0.5);
+    v.lfo(9, 25, o.detune, T, end);
+    const ng = v.gain(0, v.out), bp = v.filter('bandpass', 7000, 1.5, ng);                               // falling air
+    sweep(bp.frequency, T, 7000, 500, 0.5);
+    pts(ng.gain, T, [[0, 0], [0.04, 0.3], [0.5, 0]]);
+    v.noise('white', T, T + 0.52, bp);
+    v.tone({ t: 0.05, f: 220 * p, f1: 55 * p, sw: 0.4, a: 0.01, d: 0.4, peak: 0.35 });                  // power-down
+  },
+});
+// a transformation special is about to run out (last ~2 s): a looping 8-bit figure that speeds up and climbs, like a
+// power-up wearing off
+def('special_ending', {
+  gain: 0.34, max: 2, jitter: 0, reverb: 0.15,
+  build(v, p) {
+    const lp = v.filter('lowpass', 5200, 0.7, v.out), pw = pulseWave(v.ctx, 0.25);
+    const fig = [72, 76, 79, 84, 79, 76];
+    let t = 0, i = 0;
+    while (t < 1.9) {
+      const k = t / 1.9, gap = 0.15 - 0.085 * k;
+      const m = fig[i % fig.length] + (k > 0.66 ? 2 : 0);
+      v.tone({ t, type: pw, f: mtof(m) * p, a: 0.002, h: gap * 0.35, d: gap * 0.55, peak: 0.16 + 0.08 * k, to: lp });
+      t += gap; i++;
+    }
+  },
+});
+def('shield_up', {
+  gain: 0.37, max: 2, jitter: 0.02, reverb: 0.2,
+  build(v, p) {
+    const T = v.t;
+    const g = v.gain(0, v.out), end = pts(g.gain, T, [[0, 0], [0.05, 0.22], [0.26, 0.32], [0.5, 0.06], [0.62, 0]]);
+    const wob = { depth: v.gain(45) };                                                                    // wobble, speeding up
+    wob.osc = v.osc('sine', 8, T, end, wob.depth);
+    sweep(wob.osc.frequency, T, 8, 17, 0.3);
+    [[1, 'triangle', 1], [1.5, 'sine', 0.5], [2.005, 'sine', 0.35]].forEach(([r, type, a], i) => {
+      const o = v.osc(type, 300 * r * p, T, end + 0.01, v.gain(a, g));
+      sweep(o.frequency, T, 300 * r * p, 900 * r * p, 0.28);
+      o.detune.value = (i - 1) * 7; wob.depth.connect(o.detune);
+    });
+    whoosh(v, 0, 0.32, 900, 4500, 6000, 0.22, { q: 2, kind: 'white', mid: 0.8, env: [[0, 0], [0.8, 1], [1, 0]] });
+    v.tone({ t: 0.26, f: 720 * p, f1: 260 * p, sw: 0.05, a: 0.001, d: 0.07, peak: 0.6 });               // soft pop
+    v.tone({ t: 0.26, f: 170 * p, f1: 85 * p, sw: 0.1, a: 0.003, d: 0.14, peak: 0.45 });                 // whum
+    bell(v, T + 0.27, mtof(96) * p, 0.1, { d: 0.5 });
+    plips(v, 0.28, 2, 0.06, [1200, 1800], 0.1, p);
+  },
+});
+def('shield_hit', {
+  gain: 0.37, max: 4, jitter: 0.08, reverb: 0.08, minGap: 0.04,
+  build(v, p) {
+    const T = v.t;
+    v.tone({ f: 260 * p, f1: 120 * p, sw: 0.05, a: 0.001, d: 0.06, peak: 0.7 });                        // thump
+    for (const [f, a, d] of [[1850, 0.28, 0.09], [2790, 0.18, 0.07], [4150, 0.1, 0.05]]) v.tone({ f: f * p, a: 0.0006, d, peak: a }); // glass
+    const g = v.gain(0, v.out), end = perc(g.gain, T + 0.008, 0.004, 0.45, 0.2);                       // boing
+    const o = v.osc('sine', 330 * p, T + 0.008, end + 0.01, g);
+    sweep(o.frequency, T + 0.008, 330 * p, 520 * p, 0.2);
+    const o2 = v.osc('triangle', 660 * p, T + 0.008, end + 0.01, v.gain(0.2, g));
+    sweep(o2.frequency, T + 0.008, 660 * p, 1040 * p, 0.2);
+    const w = v.lfo(19, 0, o.detune, T + 0.008, end);
+    w.depth.connect(o2.detune);
+    pts(w.depth.gain, T + 0.008, [[0, 160], [0.2, 0]]);
+    v.nz({ ft: 'highpass', f: 5000, a: 0.0004, d: 0.01, peak: 0.25 });
+  },
+});
+def('shield_pop', {
+  gain: 0.53, max: 2, jitter: 0.04, reverb: 0.22,
+  build(v, p) {
+    v.nz({ ft: 'highpass', f: 2500, a: 0.0004, d: 0.03, peak: 0.8 });
+    v.tone({ f: 1100 * p, f1: 300 * p, sw: 0.06, a: 0.001, d: 0.08, peak: 0.7 });                       // pop
+    v.tone({ f: 200 * p, f1: 70 * p, sw: 0.12, a: 0.002, d: 0.16, peak: 0.6 });                         // whump
+    for (let i = 0; i < 9; i++) {                                                                         // glassy shards
+      const f = v.r(2200, 5200) * p;
+      v.tone({ t: 0.01 + v.r(0, 0.22), f, f1: f * 0.9, sw: 0.1, a: 0.0006, d: v.r(0.08, 0.2), peak: v.r(0.06, 0.14) });
+    }
+    whoosh(v, 0, 0.4, 6000, 3500, 1500, 0.35, { q: 3, kind: 'white', env: [[0, 0], [0.03, 1], [1, 0]] });
+    plips(v, 0.03, 3, 0.1, [900, 1600], 0.2, p);
+  },
+});
+def('sonar_ping', {
+  gain: 0.35, max: 2, jitter: 0, reverb: 0.4,
+  build(v, p) {
+    const T = v.t, f = 523 * p;
+    v.tone({ f: 70 * p, f1: 42 * p, sw: 0.4, a: 0.004, d: 0.55, peak: 0.7 });                          // sub pulse
+    for (let k = 0; k < 6; k++) {                                                                         // ping + darkening echoes
+      const t = k * 0.3, a = Math.pow(0.48, k), to = k ? v.pan(k % 2 ? 0.45 : -0.45, v.out) : v.out;
+      v.tone({ t, f: f * 1.04, f1: f, sw: 0.05, a: 0.003, d: k ? 0.5 : 1.1, peak: 0.6 * a, to });
+      v.tone({ t, f: f * 2, a: 0.002, d: k ? 0.12 : 0.35, peak: (k ? 0.04 : 0.14) * a, to });
+    }
+    const g = v.gain(0, v.out), bp = v.filter('bandpass', 2400, 2, g);                                   // wave rolling outward
+    sweep(bp.frequency, T, 2400, 300, 1.6);
+    pts(g.gain, T, [[0, 0], [0.08, 0.22], [0.5, 0.14], [1.7, 0]]);
+    v.noise('pink', T, T + 1.72, bp);
+    bell(v, T, 1568 * p, 0.08, { d: 1.2, ratio: 2.01, index: 0.8 });
+  },
+});
+def('sonar_mark', {
+  gain: 0.235, max: 1, jitter: 0, reverb: 0.1, minGap: 0.3,
+  build(v, p) {
+    const lp = v.filter('lowpass', 3000, 0.8, v.out);
+    for (const [t, m] of [[0, 81], [0.1, 76]]) {
+      v.tone({ t, type: 'triangle', f: mtof(m) * p, a: 0.006, h: 0.035, d: 0.08, peak: 0.5, to: lp });
+      v.tone({ t, f: mtof(m) * 2 * p, a: 0.005, d: 0.06, peak: 0.12 });
+    }
+    v.tone({ t: 0.2, f: 523 * p, a: 0.006, d: 0.35, peak: 0.12 });                                     // faint sonar tail
+  },
+});
+def('strike_launch', {
+  gain: 0.55, max: 2, jitter: 0.04, reverb: 0.2,
+  build(v, p) {
+    const T = v.t;
+    v.tone({ f: 160 * p, f1: 55 * p, sw: 0.12, a: 0.002, d: 0.2, peak: 0.9 });                          // launch thoonk
+    v.nz({ kind: 'pink', ft: 'lowpass', f: 2500, f1: 400, sw: 0.15, q: 1, a: 0.002, d: 0.15, peak: 0.7 });
+    const g = v.gain(0, v.out), bp = v.filter('bandpass', 350 * p, 1.2, g), am = v.gain(0.75, bp);       // fluttering rocket roar
+    sweep(bp.frequency, T, 350 * p, 3200 * p, 1.0);
+    pts(g.gain, T, [[0, 0], [0.06, 0.9], [0.35, 0.7], [1.05, 0]]);
+    v.lfo(28, 0.25, am.gain, T, T + 1.08);
+    v.noise('pink', T, T + 1.08, am);
+    const cg = v.gain(0, v.out);                                                                          // exhaust crackle
+    pts(cg.gain, T, [[0, 0], [0.05, 0.4], [0.9, 0]]);
+    v.buffer(texture(v.ctx, 'sizzle'), T, T + 0.92, v.filter('bandpass', 2500, 0.8, cg));
+    v.tone({ t: 0.03, f: 500 * p, f1: 2000 * p, sw: 1.0, a: 0.1, h: 0.4, d: 0.45, peak: 0.08 });        // rising doppler whistle
+    v.nz({ t: 0.02, ft: 'highpass', f: 3500, a: 0.05, h: 0.2, d: 0.6, peak: 0.12 });
+  },
+});
+def('strike_whistle', {
+  gain: 0.134, max: 3, jitter: 0.03, reverb: 0.15,
+  build(v, p) {
+    const T = v.t, D = 1.4;
+    const g = v.gain(0, v.out);
+    pts(g.gain, T, [[0, 0], [0.3, 0.22], [1.2, 0.8], [1.36, 0.9], [D, 0]]);
+    const o = v.osc('sine', 1800 * p, T, T + D + 0.01, g);
+    sweep(o.frequency, T, 1800 * p, 500 * p, D);
+    v.lfo(6, 12, o.detune, T, T + D);
+    const o2 = v.osc('triangle', 1800 * p, T, T + D + 0.01, v.gain(0.12, g));
+    sweep(o2.frequency, T, 1800 * p, 500 * p, D);
+    const ng = v.gain(0, v.out), bp = v.filter('bandpass', 1800 * p, 6, ng);                             // air rush following the pitch
+    sweep(bp.frequency, T, 1800 * p, 500 * p, D);
+    pts(ng.gain, T, [[0, 0], [1.2, 0.5], [D, 0]]);
+    v.noise('white', T, T + D + 0.01, bp);
+    const rg = v.gain(0, v.out);                                                                          // approaching rumble
+    pts(rg.gain, T, [[0, 0], [0.5, 0], [1.35, 0.5], [D, 0]]);
+    v.noise('brown', T, T + D + 0.01, v.filter('lowpass', 300, 1, rg));
+  },
+});
+def('strike_impact', {
+  gain: 0.445, max: 3, jitter: 0.04, reverb: 0.32,
+  build(v, p) { inkBoom(v, 0, p, 1, { crack: 1, bright: 6000 }); },
+});
+def('tornado', {
+  gain: 0.32, max: 3, jitter: 0, reverb: 0.12, oneShot: 2,
+  loop(v, p) {
+    const T = v.t;
+    const g1 = v.gain(0.7, v.out), bp1 = v.filter('bandpass', 650 * p, 1.4, g1);                        // swirling wind
+    v.noise('pink', T, null, bp1);
+    const s1 = v.lfo(1.2 * p, 380 * p, bp1.frequency, T, null);
+    const s1a = v.gain(0.3, g1.gain); s1.osc.connect(s1a);                                               // louder as it brightens
+    const g2 = v.gain(0.18 * p, v.out), bp2 = v.filter('bandpass', 2200 * p, 2.2, g2);                  // airy counter-swirl
+    v.noise('white', T, null, bp2);
+    const s2 = v.lfo(1.9 * p, 1100 * p, bp2.frequency, T, null);
+    const s2a = v.gain(0.08 * p, g2.gain); s2.osc.connect(s2a);
+    const lg = v.gain(0.55, v.out), lp = v.filter('lowpass', 1300 * p, 0.8, lg);                        // churning liquid
+    const tex = v.buffer(texture(v.ctx, 'squelch'), T, null, lp, p);
+    v.lfo(0.63, 0.2, lg.gain, T, null);
+    const bg = v.gain(0.25, v.out);
+    const bub = v.buffer(texture(v.ctx, 'bubbles'), T, null, v.filter('lowpass', 1800, 0.7, bg), 0.8 * p);
+    const rlp = v.filter('lowpass', 170 * p, 1, v.gain(0.55, v.out));                                  // low rumble
+    v.noise('brown', T, null, rlp);
+    return {
+      pitch(q, now) {
+        const k = 0.08;
+        bp1.frequency.setTargetAtTime(650 * q, now, k); s1.osc.frequency.setTargetAtTime(1.2 * q, now, k); s1.depth.gain.setTargetAtTime(380 * q, now, k);
+        bp2.frequency.setTargetAtTime(2200 * q, now, k); s2.osc.frequency.setTargetAtTime(1.9 * q, now, k); s2.depth.gain.setTargetAtTime(1100 * q, now, k);
+        g2.gain.setTargetAtTime(0.18 * q, now, k); s2a.gain.setTargetAtTime(0.08 * q, now, k);
+        tex.playbackRate.setTargetAtTime(q, now, k); bub.playbackRate.setTargetAtTime(0.8 * q, now, k);
+        lp.frequency.setTargetAtTime(1300 * q, now, k); rlp.frequency.setTargetAtTime(170 * q, now, k);
+      },
+    };
+  },
+});
+def('zooka_fire', {
+  gain: 0.55, max: 3, jitter: 0.04, reverb: 0.2,
+  build(v, p) {
+    const T = v.t;
+    v.tone({ f: 130 * p, f1: 40 * p, sw: 0.18, a: 0.002, d: 0.3, peak: 1 });                            // thump
+    v.nz({ kind: 'pink', ft: 'lowpass', f: 1800, f1: 250, sw: 0.15, q: 1.5, a: 0.002, d: 0.16, peak: 0.9 });
+    v.nz({ ft: 'highpass', f: 2500, a: 0.0005, d: 0.03, peak: 0.5 });
+    const g = v.gain(0, v.out), am = v.gain(0.55, g), bp = v.filter('bandpass', 350 * p, 2, am);         // rising swirl, spinning faster
+    sweep(bp.frequency, T + 0.03, 350 * p, 2600 * p, 0.7);
+    pts(g.gain, T, [[0, 0], [0.08, 0.6], [0.45, 0.8], [0.9, 0]]);
+    const spin = v.lfo(7, 0.45, am.gain, T, T + 0.92);
+    sweep(spin.osc.frequency, T, 7, 22, 0.8);
+    v.noise('pink', T, T + 0.92, bp);
+    v.tone({ t: 0.04, type: 'triangle', f: 260 * p, f1: 1100 * p, sw: 0.7, a: 0.08, h: 0.3, d: 0.35, peak: 0.1 });
+    bloops(v, 0.03, 3, 0.1, [350, 650], 0.25, p);
+  },
+});
+def('wail_charge', {
+  gain: 0.22, max: 2, jitter: 0, reverb: 0.15,
+  build(v, p) {
+    const T = v.t, E = T + 1.24;
+    const g = v.gain(0, v.out);                                                                           // rising electrical whine
+    pts(g.gain, T, [[0, 0], [0.1, 0.12], [1.05, 0.45], [1.15, 0.45], [1.22, 0]]);
+    const lp = v.filter('lowpass', 900, 2, g);
+    sweep(lp.frequency, T, 900, 5000, 1.15);
+    for (const [r, dt, a] of [[1, -8, 1], [1, 8, 1], [2, 0, 0.3]]) {
+      const o = v.osc(r > 1 ? 'square' : 'sawtooth', 110 * r * p, T, E, a < 1 ? v.gain(a, lp) : lp);
+      o.detune.value = dt; sweep(o.frequency, T, 110 * r * p, 660 * r * p, 1.15);
+    }
+    const hg = v.gain(0, v.out);                                                                          // mains buzz
+    pts(hg.gain, T, [[0, 0], [0.2, 0.1], [1.2, 0.15], [1.22, 0]]);
+    v.osc('square', 60 * p, T, E, v.filter('lowpass', 400, 1, hg));
+    const sg = v.gain(0, v.out), sam = v.gain(0.8, sg);                                                  // throbbing sub
+    pts(sg.gain, T, [[0, 0], [1.1, 0.75], [1.22, 0]]);
+    const so = v.osc('sine', 38 * p, T, E, sam);
+    sweep(so.frequency, T, 38 * p, 55 * p, 1.2);
+    const th = v.lfo(4, 0.2, sam.gain, T, E);
+    sweep(th.osc.frequency, T, 4, 11, 1.2);
+    const cg = v.gain(0, v.out);                                                                          // arcing crackle
+    pts(cg.gain, T, [[0, 0], [0.3, 0.05], [1.1, 0.25], [1.2, 0]]);
+    v.buffer(texture(v.ctx, 'sizzle'), T, E, v.filter('bandpass', 3000, 0.8, cg));
+    v.tone({ t: 1.12, f: 140 * p, f1: 60 * p, sw: 0.08, a: 0.002, d: 0.12, peak: 0.5 });              // armed
+  },
+});
+def('wail_blast', {
+  gain: 0.16, max: 2, jitter: 0, reverb: 0.1, oneShot: 2,
+  loop(v, p) {
+    const T = v.t, W = 5.2;
+    const bg = v.gain(0.55, v.out), sh = v.shaper(2.2, bg), lp = v.filter('lowpass', 420, 5, sh);       // wub bass
+    const bass = [[1, -12, 'sawtooth'], [1, 12, 'sawtooth'], [0.5, 0, 'square']].map(([r, dt, type]) => {
+      const o = v.osc(type, 55 * r * p, T, null, r < 1 ? v.gain(0.5, lp) : lp); o.detune.value = dt; return [o, r];
+    });
+    const wub = v.lfo(W * p, 320, lp.frequency, T, null);
+    const sg = v.gain(0.6, v.out);                                                                        // sub throb
+    const sub = v.osc('sine', 55 * p, T, null, sg);
+    const sam = v.gain(0.5, sg.gain); wub.osc.connect(sam);
+    const rg = v.gain(0.22, v.out), rlp = v.filter('lowpass', 3200, 0.7, rg), rsh = v.shaper(4, rlp);   // distorted roar
+    const rbp = v.filter('bandpass', 700 * p, 0.9, v.gain(2.5, rsh));
+    v.noise('pink', T, null, rbp);
+    const ram = v.gain(0.12, rg.gain); wub.osc.connect(ram);
+    const wg = v.gain(0.07, v.out);                                                                       // wailing siren edge
+    const wo = v.osc('triangle', 220 * p, T, null, v.filter('lowpass', 1800, 0.7, wg));
+    const wv = v.lfo(W * p, 60, wo.detune, T, null);
+    return {
+      pitch(q, now) {
+        const k = 0.05;
+        for (const [o, r] of bass) o.frequency.setTargetAtTime(55 * r * q, now, k);
+        sub.frequency.setTargetAtTime(55 * q, now, k); wo.frequency.setTargetAtTime(220 * q, now, k);
+        wub.osc.frequency.setTargetAtTime(W * q, now, k); wv.osc.frequency.setTargetAtTime(W * q, now, k);
+        rbp.frequency.setTargetAtTime(700 * q, now, k);
+      },
+    };
+  },
+});
+def('kraken_on', {
+  gain: 0.38, max: 2, jitter: 0.02, reverb: 0.25,
+  build(v, p) {
+    const T = v.t, T0 = T + 0.2, D = 0.85;
+    v.nz({ f: 250, f1: 1800, sw: 0.22, q: 1.5, a: 0.2, d: 0.08, peak: 0.4 });                          // transform swell
+    v.tone({ t: 0.2, f: 110 * p, f1: 36 * p, sw: 0.3, a: 0.002, d: 0.4, peak: 0.9 });                  // whump
+    const g = v.gain(0, v.out);                                                                           // gargling growl
+    const end = pts(g.gain, T0, [[0, 0], [0.06, 0.8], [0.45, 0.65], [D, 0]]);
+    const sh = v.shaper(2.5, g), am = v.gain(0.6, sh);
+    v.lfo(27, 0.4, am.gain, T0, end);
+    const { srcs, fs } = vox(v, T0, end + 0.01, 70 * p, [[550, 4, 1.2], [1000, 5, 0.7], [250, 1, 0.5]], am, 14);
+    for (const o of srcs) { o.frequency.setValueAtTime(70 * p, T0); o.frequency.exponentialRampToValueAtTime(96 * p, T0 + 0.25); o.frequency.exponentialRampToValueAtTime(58 * p, T0 + D); }
+    fs[0].frequency.setValueAtTime(480, T0); fs[0].frequency.exponentialRampToValueAtTime(820, T0 + 0.25); fs[0].frequency.exponentialRampToValueAtTime(560, T0 + D);
+    fs[1].frequency.setValueAtTime(900, T0); fs[1].frequency.exponentialRampToValueAtTime(1250, T0 + 0.25); fs[1].frequency.exponentialRampToValueAtTime(950, T0 + D);
+    const bg = v.gain(0, v.out);                                                                          // gloop
+    pts(bg.gain, T0, [[0, 0], [0.05, 0.7], [0.7, 0.3], [0.95, 0]]);
+    v.buffer(texture(v.ctx, 'squelch'), T0, T0 + 0.97, v.filter('lowpass', 1500, 0.8, bg), 0.8 * p);
+    bloops(v, 0.22, 6, 0.6, [220, 480], 0.35, p);
+  },
+});
+def('kraken_jump', {
+  gain: 0.45, max: 2, jitter: 0.05, reverb: 0.1,
+  build(v, p) {
+    const T = v.t;
+    v.tone({ f: 120 * p, f1: 60 * p, sw: 0.06, a: 0.002, d: 0.1, peak: 0.7 });                         // push-off thud
+    const g = v.gain(0, v.out), end = perc(g.gain, T, 0.006, 0.8, 0.32);                                // boing
+    const o = v.osc('sine', 110 * p, T, end + 0.01, g);
+    sweep(o.frequency, T, 110 * p, 330 * p, 0.22);
+    const o2 = v.osc('triangle', 220 * p, T, end + 0.01, v.gain(0.3, g));
+    sweep(o2.frequency, T, 220 * p, 660 * p, 0.22);
+    const w = v.lfo(15, 0, o.detune, T, end);
+    w.depth.connect(o2.detune);
+    pts(w.depth.gain, T, [[0, 250], [0.3, 0]]);
+    v.nz({ f: 500 * p, f1: 1500 * p, sw: 0.15, q: 4, a: 0.004, d: 0.16, peak: 0.6 });                  // squelch
+    bloops(v, 0.02, 3, 0.1, [300, 550], 0.25, p);
+  },
+});
+def('kraken_slam', {
+  gain: 0.45, max: 2, jitter: 0.03, reverb: 0.3,
+  build(v, p) {
+    inkBoom(v, 0, p * 0.9, 1, { crack: 0.5, bright: 4000, bloops: 9, plips: 6 });
+    bigSplat(v, 0.018, p * 0.8, 0.6);
+    v.nz({ t: 0.02, f: 900 * p, f1: 260 * p, sw: 0.6, q: 4, a: 0.004, d: 0.6, peak: 0.5 });           // sloppy squelch tail
+  },
+});
+def('blower_inflate', {
+  gain: 0.24, max: 2, jitter: 0, reverb: 0.06, oneShot: 1.5,
+  loop(v, p) {
+    const T = v.t, f0 = 150;
+    const rg = v.gain(0.5, v.out), am = v.gain(0.75, rg), lp = v.filter('lowpass', 700 * p, 5, am);    // stretching rubber
+    const o1 = v.osc(pulseWave(v.ctx, 0.3), f0 * p, T, null, lp);
+    const o2 = v.osc('triangle', f0 * 2.01 * p, T, null, v.gain(0.4, lp));
+    const vib = v.lfo(5.7, 35, o1.detune, T, null); vib.depth.connect(o2.detune);
+    const vib2 = v.lfo(0.83, 60, o1.detune, T, null); vib2.depth.connect(o2.detune);
+    const trem = v.lfo(3.3 * p, 0.25, am.gain, T, null);
+    const wah = v.lfo(2.1, 250 * p, lp.frequency, T, null);
+    const ag = v.gain(0.12, v.out), abp = v.filter('bandpass', 1100 * p, 1.2, ag);                      // air blown in
+    v.noise('pink', T, null, abp);
+    const bg = v.gain(0.35, v.out);                                                                       // wet soap film
+    const tex = v.buffer(texture(v.ctx, 'bubbles'), T, null, v.filter('lowpass', 1600, 0.7, bg), 0.8 * p);
+    return {
+      pitch(q, now) {
+        const k = 0.05;
+        o1.frequency.setTargetAtTime(f0 * q, now, k); o2.frequency.setTargetAtTime(f0 * 2.01 * q, now, k);
+        lp.frequency.setTargetAtTime(700 * q, now, k); wah.depth.gain.setTargetAtTime(250 * q, now, k);
+        trem.osc.frequency.setTargetAtTime(3.3 * q, now, k); abp.frequency.setTargetAtTime(1100 * q, now, k);
+        tex.playbackRate.setTargetAtTime(0.8 * q, now, k);
+      },
+    };
+  },
+});
+def('bubble_release', {
+  gain: 0.5, max: 3, jitter: 0.08, reverb: 0.12,
+  build(v, p) {
+    v.tone({ f: 240 * p, f1: 520 * p, sw: 0.07, a: 0.003, d: 0.1, peak: 0.7 });                         // plop
+    v.tone({ f: 130 * p, f1: 80 * p, sw: 0.08, a: 0.003, d: 0.1, peak: 0.4 });
+    v.nz({ f: 900 * p, f1: 1600 * p, sw: 0.1, q: 3, a: 0.005, d: 0.08, peak: 0.2 });
+    v.tone({ t: 0.08, f: 700 * p, f1: 1300 * p, sw: 0.25, a: 0.05, d: 0.2, peak: 0.08 });              // airy lift-off
+    plips(v, 0.04, 2, 0.08, [900, 1400], 0.1, p);
+  },
+});
+def('bubble_pop', {
+  gain: 0.64, max: 4, jitter: 0.1, reverb: 0.1, minGap: 0.03,
+  build(v, p) {
+    v.nz({ ft: 'highpass', f: 2500, a: 0.0003, d: 0.012, peak: 0.7 });
+    v.tone({ f: 950 * p, f1: 420 * p, sw: 0.03, a: 0.0008, d: 0.04, peak: 0.6 });
+    plips(v, 0.01, 3, 0.07, [1100, 2200], 0.15, p);
+    v.nz({ t: 0.005, f: 2200 * p, f1: 900 * p, sw: 0.08, q: 2, a: 0.002, d: 0.08, peak: 0.25 });     // fizz
+  },
+});
+def('bubble_blast', {
+  gain: 0.42, max: 3, jitter: 0.04, reverb: 0.3,
+  build(v, p) {
+    v.nz({ ft: 'highpass', f: 3000, a: 0.0003, d: 0.02, peak: 0.8 });                                  // glassy pop
+    v.tone({ f: 1500 * p, f1: 500 * p, sw: 0.04, a: 0.0008, d: 0.05, peak: 0.6 });
+    for (const [f, a] of [[2637, 0.18], [3951, 0.12], [5274, 0.07]]) v.tone({ f: f * p, a: 0.0005, d: 0.18, peak: a });
+    inkBoom(v, 0.025, p, 0.95, { f: 95, f1: 28, crack: 0.4, bright: 5000 });                             // the blast
+  },
+});
+def('jet_loop', {
+  gain: 0.25, max: 2, jitter: 0, reverb: 0.05, oneShot: 1.5,
+  loop(v, p) {
+    const T = v.t;
+    const fl = v.gain(0.8, v.out), lp = v.filter('lowpass', 1400 * p, 0.9, fl);                         // roaring thrust
+    v.noise('pink', T, null, lp);
+    const flut = v.lfo(24 * p, 0.2, fl.gain, T, null);
+    const wander = v.lfo(0.37, 200, lp.frequency, T, null);
+    v.lfo(7.3, 0.06, fl.gain, T, null);
+    v.noise('brown', T, null, v.filter('lowpass', 260, 1, v.gain(0.7, v.out)));                        // body
+    const hg = v.gain(0.14, v.out), hbp = v.filter('bandpass', 4200 * p, 0.8, hg);                     // hiss
+    v.noise('white', T, null, hbp);
+    const gg = v.gain(0.2, v.out), gsh = v.shaper(3, v.filter('lowpass', 2500, 0.7, gg));              // burner grit
+    const gbp = v.filter('bandpass', 500 * p, 1.2, v.gain(3, gsh));
+    v.noise('pink', T, null, gbp);
+    return {
+      pitch(q, now) {
+        const k = 0.06;
+        lp.frequency.setTargetAtTime(1400 * q, now, k); flut.osc.frequency.setTargetAtTime(24 * q, now, k);
+        hbp.frequency.setTargetAtTime(4200 * q, now, k); gbp.frequency.setTargetAtTime(500 * q, now, k);
+        wander.depth.gain.setTargetAtTime(200 * q, now, k);
+      },
+    };
+  },
+});
+def('jet_fire', {
+  gain: 0.485, max: 3, jitter: 0.05, reverb: 0.16,
+  build(v, p) {
+    v.tone({ f: 140 * p, f1: 36 * p, sw: 0.2, a: 0.002, d: 0.38, peak: 1 });                            // THOOMP
+    v.tone({ type: 'triangle', f: 280 * p, f1: 80 * p, sw: 0.1, a: 0.002, d: 0.12, peak: 0.45 });
+    v.nz({ ft: 'highpass', f: 2200, a: 0.0004, d: 0.03, peak: 0.6 });
+    const sh = v.shaper(2, v.gain(0.8, v.out));
+    v.nz({ kind: 'pink', ft: 'lowpass', f: 2200, f1: 260, sw: 0.18, q: 1.5, a: 0.002, d: 0.2, peak: 1, to: sh });
+    v.nz({ f: 600 * p, f1: 2600 * p, sw: 0.25, q: 1.3, a: 0.03, d: 0.2, peak: 0.35 });                 // projectile whoosh
+    v.nz({ t: 0.01, f: 1300 * p, f1: 400 * p, sw: 0.18, q: 4, a: 0.003, d: 0.2, peak: 0.6 });
+    bloops(v, 0.02, 3, 0.08, [380, 650], 0.25, p);
+  },
+});
+def('jet_end', {
+  gain: 0.6, max: 2, jitter: 0.03, reverb: 0.1,
+  build(v, p) {
+    let t = 0, a = 0.8;
+    for (let i = 0; i < 7; i++) {                                                                         // sputters, slowing down
+      v.nz({ t, kind: 'pink', ft: 'lowpass', f: 1600 * (1 - i * 0.09), q: 1.2, a: 0.008, d: 0.04 + i * 0.008, peak: a });
+      v.tone({ t, f: 110 * p * (1 - i * 0.05), f1: 70 * p, sw: 0.04, a: 0.005, d: 0.05, peak: a * 0.5 });
+      t += 0.055 + i * 0.022 + v.r(0, 0.02); a *= 0.8;
+    }
+    const g = v.gain(0, v.out), end = pts(g.gain, v.t, [[0, 0], [0.02, 0.12], [0.6, 0.04], [0.8, 0]]); // dying whine
+    const o = v.osc('triangle', 520 * p, v.t, end + 0.01, v.filter('lowpass', 1500, 1, g));
+    sweep(o.frequency, v.t, 520 * p, 110 * p, 0.8);
+    v.nz({ t: t + 0.02, f: 900, f1: 400, sw: 0.2, q: 1, a: 0.02, d: 0.18, peak: 0.3 });               // last puff
+  },
+});
+def('stamp_swing', {
+  gain: 0.47, max: 3, jitter: 0.05, reverb: 0.08,
+  build(v, p) {
+    const T = v.t;
+    whoosh(v, 0, 0.46, 220 * p, 900 * p, 300 * p, 0.9, { q: 1.4, mid: 0.48, env: [[0, 0], [0.45, 1], [0.6, 0.75], [1, 0]] });
+    whoosh(v, 0.03, 0.4, 1200 * p, 2800 * p, 1400 * p, 0.2, { q: 2, kind: 'white' });
+    const g = v.gain(0, v.out), end = pts(g.gain, T, [[0, 0], [0.2, 0.4], [0.46, 0]]);                // heavy "vwoom"
+    const o = v.osc('sine', 60 * p, T, end + 0.01, g);
+    o.frequency.setValueAtTime(60 * p, T); o.frequency.exponentialRampToValueAtTime(95 * p, T + 0.2); o.frequency.exponentialRampToValueAtTime(60 * p, T + 0.46);
+  },
+});
+def('stamp_slam', {
+  gain: 0.63, max: 2, jitter: 0.04, reverb: 0.26,
+  build(v, p) {
+    const T = v.t;
+    const g = v.gain(0, v.out), end = perc(g.gain, T, 0.002, 1, 0.5);                                   // rubbery THWUMP
+    const o = v.osc('sine', 170 * p, T, end + 0.01, g);
+    o.frequency.setValueAtTime(170 * p, T); o.frequency.exponentialRampToValueAtTime(48 * p, T + 0.09);
+    o.frequency.exponentialRampToValueAtTime(62 * p, T + 0.2); o.frequency.exponentialRampToValueAtTime(44 * p, T + 0.5);
+    const w = v.lfo(11, 0, o.detune, T, end);
+    pts(w.depth.gain, T, [[0, 0], [0.05, 120], [0.4, 0]]);
+    v.tone({ type: 'triangle', f: 240 * p, f1: 90 * p, sw: 0.08, a: 0.001, d: 0.14, peak: 0.55 });    // rubber smack
+    v.nz({ kind: 'pink', ft: 'lowpass', f: 1400, f1: 200, sw: 0.18, q: 2.5, a: 0.001, d: 0.2, peak: 1 });
+    v.nz({ ft: 'highpass', f: 2000, a: 0.0004, d: 0.025, peak: 0.6 });
+    bigSplat(v, 0.015, p, 0.8);                                                                           // ink splash
+    bloops(v, 0.05, 5, 0.3, [300, 650], 0.3, p);
+    plips(v, 0.12, 4, 0.35, [800, 1600], 0.1, p);
+  },
+});
+def('stamp_throw', {
+  gain: 1.0, max: 3, jitter: 0.05, reverb: 0.1,
+  build(v, p) {
+    const T = v.t, D = 0.65;
+    const g = v.gain(0, v.out), am = v.gain(0.5, g), bp = v.filter('bandpass', 420 * p, 1.6, am);        // spinning whoosh
+    pts(g.gain, T, [[0, 0], [0.12, 0.8], [0.4, 0.6], [D, 0]]);
+    v.lfo(9 * p, 0.5, am.gain, T, T + D + 0.02);
+    bp.frequency.setValueAtTime(420 * p, T); bp.frequency.exponentialRampToValueAtTime(1300 * p, T + 0.25); bp.frequency.exponentialRampToValueAtTime(600 * p, T + D);
+    v.noise('pink', T, T + D + 0.02, bp);
+    v.tone({ type: 'triangle', f: 330 * p, f1: 210 * p, sw: 0.04, a: 0.001, d: 0.05, peak: 0.3 });    // release
+    v.tone({ f: 110 * p, f1: 70 * p, sw: 0.06, a: 0.002, d: 0.08, peak: 0.4 });
+  },
+});
+def('booyah_charge', {
+  gain: 0.25, max: 2, jitter: 0, reverb: 0.25, oneShot: 1.5,
+  loop(v, p) {
+    const T = v.t, notes = [48, 55, 60, 64, 67];
+    const lp = v.filter('lowpass', 2400 * p, 0.7, v.out);
+    const lvl = v.gain(0.75 + 0.25 * p, lp), am = v.gain(0.8, lvl);                                     // swells with charge
+    const trem = v.lfo(4 * p, 0.2, am.gain, T, null);                                                    // energy pulse, faster with charge
+    const mix = v.gain(0.35);                                                                             // "ah" choir: saws through formants
+    for (const [f, q, a] of [[750, 5, 1], [1150, 6, 0.55], [2600, 8, 0.25]]) mix.connect(v.filter('bandpass', f, q, v.gain(a, am)));
+    const vib = v.gain(12); v.osc('sine', 5.2, T, null, vib);
+    const oscs = [];
+    for (const m of notes) for (const dt of [-9, 9]) {
+      const o = v.osc('sawtooth', mtof(m) * p, T, null, mix); o.detune.value = dt; vib.connect(o.detune); oscs.push([o, mtof(m)]);
+    }
+    const hg = v.gain(0.3, am);                                                                           // hum
+    for (const m of [36, 48]) oscs.push([v.osc('sine', mtof(m) * p, T, null, hg), mtof(m)]);
+    const sg = v.gain(0.025 * p, v.out), shp = v.filter('highpass', 6000, 0.7, sg);                     // shimmer
+    v.noise('white', T, null, shp);
+    const sl = v.lfo(9 * p, 0.012, sg.gain, T, null);
+    return {
+      pitch(q, now) {
+        const k = 0.06;
+        for (const [o, f] of oscs) o.frequency.setTargetAtTime(f * q, now, k);
+        lp.frequency.setTargetAtTime(2400 * q, now, k); trem.osc.frequency.setTargetAtTime(4 * q, now, k); lvl.gain.setTargetAtTime(0.75 + 0.25 * q, now, k);
+        sg.gain.setTargetAtTime(0.025 * q, now, k); sl.osc.frequency.setTargetAtTime(9 * q, now, k);
+      },
+    };
+  },
+});
+def('booyah_cheer', {
+  gain: 0.27, max: 3, jitter: 0.04, reverb: 0.12, minGap: 0.06,
+  build(v, p) {
+    const T = v.t, D = 0.34, f0 = 330 * p;
+    const g = v.gain(0, v.out), end = pts(g.gain, T, [[0, 0], [0.025, 1], [0.2, 0.85], [D, 0]]);
+    const { srcs, fs } = vox(v, T, end + 0.01, f0, [[350, 6, 1], [2100, 8, 0.7], [2900, 10, 0.25]], g);
+    for (const o of srcs) { o.frequency.setValueAtTime(f0 * 0.85, T); o.frequency.exponentialRampToValueAtTime(f0 * 1.25, T + 0.1); o.frequency.exponentialRampToValueAtTime(f0 * 1.12, T + D); }
+    [[350, 800], [2100, 1250], [2900, 2700]].forEach(([a, b], i) => {                                    // "ye" → "ah"
+      fs[i].frequency.setValueAtTime(a, T + 0.03); fs[i].frequency.exponentialRampToValueAtTime(b, T + 0.14);
+    });
+    bell(v, T + 0.02, mtof(88) * p, 0.08, { d: 0.25 });
+  },
+});
+def('booyah_throw', {
+  gain: 0.55, max: 2, jitter: 0.03, reverb: 0.2,
+  build(v, p) {
+    const T = v.t;
+    v.tone({ f: 150 * p, f1: 60 * p, sw: 0.1, a: 0.002, d: 0.15, peak: 0.7 });
+    whoosh(v, 0, 0.45, 300 * p, 1500 * p, 2400 * p, 0.7, { q: 1.5, env: [[0, 0], [0.22, 1], [0.5, 0.6], [1, 0]] });
+    const g = v.gain(0, v.out), end = pts(g.gain, T, [[0, 0], [0.04, 0.2], [0.3, 0.15], [0.45, 0]]);   // energy streak
+    const o = v.osc('triangle', 220 * p, T, end + 0.01, g);
+    sweep(o.frequency, T, 220 * p, 880 * p, 0.4);
+    v.lfo(11, 30, o.detune, T, end);
+    [79, 84, 88].forEach((m, i) => bell(v, T + 0.04 + i * 0.05, mtof(m) * p, 0.08, { d: 0.35 }));
+  },
+});
+def('booyah_blast', {
+  gain: 0.4, max: 2, jitter: 0.02, reverb: 0.38,
+  build(v, p) {
+    const T = v.t;
+    inkBoom(v, 0, p, 1, { f: 65, f1: 20, len: 1.6, bright: 7000, bloops: 12, plips: 8 });
+    const g = v.gain(0, v.out);                                                                           // long rolling rumble
+    pts(g.gain, T, [[0, 0], [0.15, 0.9], [0.6, 0.6], [1.2, 0.35], [2.1, 0]]);
+    v.noise('brown', T, T + 2.15, v.filter('lowpass', 260, 1, g));
+    [84, 88, 91].forEach((m) => bell(v, T + 0.05, mtof(m) * p, 0.06, { d: 1.0 }));                      // victorious glint
+  },
+});
+def('zip_fire', {
+  gain: 0.58, max: 3, jitter: 0.05, reverb: 0.08,
+  build(v, p) {
+    const T = v.t;
+    const lp = v.filter('lowpass', 5000, 0.8, v.out);                                                    // zip
+    v.tone({ type: 'sawtooth', f: 300 * p, f1: 1800 * p, sw: 0.12, a: 0.002, d: 0.14, peak: 0.22, to: lp });
+    v.nz({ f: 1200 * p, f1: 5000 * p, sw: 0.14, q: 3, a: 0.003, d: 0.14, peak: 0.5 });
+    const g = v.gain(0, v.out), end = perc(g.gain, T + 0.01, 0.002, 0.6, 0.3);                         // twang of the taut line
+    const flp = v.filter('lowpass', 4000, 3, g);
+    sweep(flp.frequency, T + 0.01, 4000, 500, 0.2);
+    const o = v.osc('sawtooth', 210 * p, T + 0.01, end + 0.01, flp);
+    sweep(o.frequency, T + 0.01, 210 * p, 160 * p, 0.25);
+    v.lfo(14, 18, o.detune, T + 0.01, end);
+    v.nz({ ft: 'highpass', f: 4000, a: 0.0004, d: 0.01, peak: 0.4 });
+  },
+});
+def('zip_latch', {
+  gain: 0.48, max: 3, jitter: 0.05, reverb: 0.12,
+  build(v, p) {
+    clank(v, 0, 620, 0.5, 0.25, p);
+    v.tone({ f: 180 * p, f1: 80 * p, sw: 0.05, a: 0.001, d: 0.07, peak: 0.6 });
+    v.nz({ t: 0.008, f: 2200 * p, f1: 800 * p, sw: 0.1, q: 2.5, a: 0.001, d: 0.12, peak: 0.7 });       // splat
+    bloops(v, 0.015, 2, 0.05, [500, 750], 0.3, p);
+    plips(v, 0.04, 2, 0.06, [900, 1500], 0.12, p);
+  },
+});
+def('zip_pull', {
+  gain: 0.55, max: 2, jitter: 0.04, reverb: 0.08,
+  build(v, p) {
+    const T = v.t, D = 0.5;
+    const g = v.gain(0, v.out), bp = v.filter('bandpass', 300 * p, 1.5, g);                            // rushing air, rising
+    sweep(bp.frequency, T, 300 * p, 3500 * p, D);
+    pts(g.gain, T, [[0, 0], [0.3, 0.7], [0.44, 0.8], [D, 0]]);
+    v.noise('pink', T, T + D + 0.02, bp);
+    const wg = v.gain(0, v.out), am = v.gain(0.6, wg), lp = v.filter('lowpass', 2500, 1, am);          // line whirr
+    pts(wg.gain, T, [[0, 0], [0.05, 0.12], [0.4, 0.16], [D, 0]]);
+    const o = v.osc('sawtooth', 160 * p, T, T + D + 0.02, lp);
+    sweep(o.frequency, T, 160 * p, 700 * p, D);
+    const r = v.lfo(30, 0.4, am.gain, T, T + D + 0.02);
+    sweep(r.osc.frequency, T, 30, 80, D);
+    v.nz({ t: 0.05, ft: 'highpass', f: 5000, a: 0.3, d: 0.15, peak: 0.12 });
+  },
+});
+def('crab_move', {
+  gain: 0.39, max: 3, jitter: 0, reverb: 0.05, oneShot: 1.5,
+  loop(v, p) {
+    const T = v.t, step = 4.4;
+    const sg = v.gain(0.25, v.out), sbp = v.filter('bandpass', 900 * p, 2.5, sg);                       // servo whirr
+    const s1 = v.osc('sawtooth', 115 * p, T, null, sbp);
+    const s2 = v.osc('triangle', 231 * p, T, null, v.gain(0.5, sg));
+    const sv = v.lfo(step * p, 60, s1.detune, T, null); sv.depth.connect(s2.detune);
+    const legs = [[0, [640, 1730, 2980]], [0.5, [540, 1490, 2610]]].map(([ph, fs]) => {                 // clanky legs, alternating
+      const lg = v.gain(0.12, v.out);
+      const st = v.osc(strokeWave(v.ctx, 9), step * p, T + ph / (step * p), null);
+      const dp = v.gain(0.9); st.connect(dp); dp.connect(lg.gain);
+      const mg = v.gain(0.06, lg);
+      for (const f of fs) v.osc('sine', f, T, null, mg);
+      v.noise('white', T, null, v.filter('bandpass', 2500, 2, v.gain(0.35, lg)));
+      v.osc('sine', 85, T, null, v.gain(0.45, lg));
+      return st;
+    });
+    return {
+      pitch(q, now) {
+        const k = 0.05;
+        s1.frequency.setTargetAtTime(115 * q, now, k); s2.frequency.setTargetAtTime(231 * q, now, k); sbp.frequency.setTargetAtTime(900 * q, now, k);
+        sv.osc.frequency.setTargetAtTime(step * q, now, k);
+        for (const st of legs) st.frequency.setTargetAtTime(step * q, now, k);
+      },
+    };
+  },
+});
+def('crab_gatling', {
+  gain: 0.51, max: 4, jitter: 0.08, reverb: 0.04, minGap: 0.03,
+  build(v, p) {
+    v.tone({ f: 190 * p, f1: 85 * p, sw: 0.03, a: 0.0008, d: 0.035, peak: 0.7 });
+    v.nz({ f: v.r(2000, 2800) * p, f1: 900 * p, sw: 0.03, q: 1.5, a: 0.0006, d: 0.03, peak: 0.6 });
+    v.tone({ f: v.r(650, 800) * p, f1: 300 * p, sw: 0.025, a: 0.001, d: 0.03, peak: 0.2 });
+  },
+});
+def('crab_cannon', {
+  gain: 0.55, max: 3, jitter: 0.04, reverb: 0.18,
+  build(v, p) {
+    v.tone({ f: 105 * p, f1: 42 * p, sw: 0.14, a: 0.002, d: 0.32, peak: 1 });                          // thoo-
+    v.tone({ f: 260 * p, f1: 150 * p, sw: 0.06, a: 0.001, d: 0.09, peak: 0.45 });                       // -onk
+    v.nz({ f: 320 * p, q: 7, a: 0.001, d: 0.14, peak: 0.9 });
+    v.nz({ kind: 'pink', ft: 'lowpass', f: 1500, f1: 250, sw: 0.15, q: 1.2, a: 0.002, d: 0.18, peak: 0.7 });
+    v.nz({ t: 0.03, f: 500 * p, f1: 1800 * p, sw: 0.3, q: 1.4, a: 0.05, d: 0.25, peak: 0.2 });         // shell leaving
+    clank(v, 0, 900, 0.12, 0.15, p);
+    bloops(v, 0.02, 2, 0.06, [380, 600], 0.2, p);
+  },
+});
+def('crab_roll', {
+  gain: 0.27, max: 3, jitter: 0, reverb: 0.04, oneShot: 1.5,
+  loop(v, p) {
+    const T = v.t, rev = 3;
+    const rlp = v.filter('lowpass', 200 * p, 1, v.gain(0.7, v.out));                                  // rumble
+    v.noise('brown', T, null, rlp);
+    const am = v.gain(0.6, v.gain(0.35, v.out));                                                        // hum throbbing once per turn
+    const o = v.osc('triangle', 62 * p, T, null, v.filter('lowpass', 400, 0.8, am));
+    const rl = v.lfo(rev * p, 0.4, am.gain, T, null);
+    const cbp = v.filter('bandpass', 900 * p, 1.2, v.gain(0.3, v.out));                                // gravel crunch
+    const tex = v.buffer(texture(v.ctx, 'sizzle'), T, null, cbp, 0.6 * p);
+    const pg = v.gain(0.1, v.out);                                                                       // armour plates clacking
+    const st = v.osc(strokeWave(v.ctx, 9), 2 * rev * p, T, null);
+    const dp = v.gain(0.9); st.connect(dp); dp.connect(pg.gain);
+    const mg = v.gain(0.05, pg);
+    for (const f of [410, 1130, 2210]) v.osc('sine', f, T, null, mg);
+    v.noise('pink', T, null, v.filter('bandpass', 1800, 2, v.gain(0.3, pg)));
+    return {
+      pitch(q, now) {
+        const k = 0.05;
+        rlp.frequency.setTargetAtTime(200 * q, now, k); o.frequency.setTargetAtTime(62 * q, now, k); rl.osc.frequency.setTargetAtTime(rev * q, now, k);
+        cbp.frequency.setTargetAtTime(900 * q, now, k); tex.playbackRate.setTargetAtTime(0.6 * q, now, k); st.frequency.setTargetAtTime(2 * rev * q, now, k);
+      },
+    };
+  },
+});
+def('crab_hit', {
+  gain: 0.38, max: 4, jitter: 0.1, reverb: 0.06, minGap: 0.04,
+  build(v, p) {
+    clank(v, 0, v.r(1500, 1900), 0.45, 0.12, p, 3);
+    v.nz({ f: 2600 * p, f1: 1200 * p, sw: 0.04, q: 2, a: 0.001, d: 0.04, peak: 0.3 });                 // ink spatter
+  },
+});
+def('crab_break', {
+  gain: 0.45, max: 2, jitter: 0.02, reverb: 0.25,
+  build(v, p) {
+    const T = v.t;
+    const g = v.gain(0, v.out), end = pts(g.gain, T, [[0, 0], [0.02, 0.3], [0.5, 0.2], [0.75, 0]]);    // servo power-down
+    const lp = v.filter('lowpass', 2500, 2, g);
+    sweep(lp.frequency, T, 2500, 300, 0.75);
+    const o = v.osc('sawtooth', 320 * p, T, end + 0.01, lp);
+    sweep(o.frequency, T, 320 * p, 55 * p, 0.75);
+    [[0, 1], [0.16, 0.8], [0.34, 0.6]].forEach(([t, a], i) => {                                          // clunks
+      clank(v, t, 520 - i * 90, 0.35 * a, 0.2, p);
+      v.tone({ t, f: 150 * p, f1: 60 * p, sw: 0.06, a: 0.001, d: 0.12, peak: 0.7 * a });
+      v.nz({ t, kind: 'pink', ft: 'lowpass', f: 900, a: 0.001, d: 0.06, peak: 0.5 * a });
+    });
+    bigSplat(v, 0.42, p, 0.9);                                                                            // ink burst
+    bloops(v, 0.45, 5, 0.3, [300, 650], 0.3, p);
+    v.nz({ t: 0.42, ft: 'highpass', f: 3000, a: 0.02, d: 0.5, peak: 0.2 });
+  },
+});
+
 /* ---- Match flow ---- */
 def('ready', {
   gain: 0.4, max: 1, jitter: 0, reverb: 0.25,
@@ -1101,6 +1810,234 @@ def('times_up', {
     const t2 = T + 0.72;                                                                                 // stinger
     for (const [m, pan] of [[58, -0.3], [62, 0.3], [65, -0.1], [70, 0.2]]) brass(v, t2, mtof(m) * p, 0.14, 0.38, { to: v.pan(pan, v.out), bright: 3800, a: 0.01, r: 0.45 });
     crash(v, t2, 0.4); tom(v, t2, 70, 0.8); kick(v, t2, 0.7);
+  },
+});
+/* ---- Zone Control (src/ui/hud.js plays the control / penalty / shift / overtime cues on the zones:* events;
+ *      src/fx/zoneMarks.js plays the zones' own positional sounds: the hum, the flood / wipe, the contested warnings) ---- */
+// shared: a wet ink-flood burst (low slosh swelling into a bright spray) under the control cues
+function floodBurst(v, T, p, s) {
+  const g = v.gain(0, v.out), lp = v.filter('lowpass', 500, 1.2, g);
+  sweep(lp.frequency, T, 420 * p, 3600 * p, 0.2); lp.frequency.exponentialRampToValueAtTime(900 * p, T + 0.55);
+  pts(g.gain, T, [[0, 0], [0.03, 0.75 * s], [0.22, 0.5 * s], [0.6, 0]]);
+  v.noise('pink', T, T + 0.62, lp);
+  bloops(v, T - v.t + 0.04, 4, 0.2, [320, 620], 0.3 * s, p);
+  v.tone({ at: T, f: 95 * p, f1: 44 * p, sw: 0.2, a: 0.003, d: 0.3, peak: 0.75 * s });
+}
+// glass-and-ink crack: a hard transient with inharmonic, falling metal partials (a hold breaking)
+function crack(v, T, p, s, dir = -1) {
+  v.nz({ at: T, ft: 'highpass', f: 2200, a: 0.0006, d: 0.05, peak: 0.8 * s });
+  v.nz({ at: T, f: 4200 * p, f1: (dir < 0 ? 1400 : 7000) * p, sw: 0.18, q: 6, a: 0.001, d: 0.2, peak: 0.45 * s });
+  for (const [r, a, d] of [[1, 0.3, 0.3], [2.43, 0.18, 0.2], [3.87, 0.11, 0.14], [5.61, 0.07, 0.09]]) {
+    const f = 1150 * p * r;
+    v.tone({ at: T + 0.004, f, f1: f * (dir < 0 ? 0.82 : 1.12), sw: d, a: 0.0008, d, peak: a * s });
+  }
+}
+// WE take control: an ink splash + a quick 8-bit climb landing on a bright brass C major with a sub and a sparkle
+def('zone_ours', {
+  gain: 0.33, max: 1, jitter: 0, reverb: 0.22, minGap: 0.25,
+  build(v, p) {
+    const T = v.t, lp = v.filter('lowpass', 4600, 0.8, v.out), pw = pulseWave(v.ctx, 0.25);
+    floodBurst(v, T, p, 0.55);
+    kick(v, T, 0.75);
+    [67, 72, 76, 79].forEach((m, i) => v.tone({ t: i * 0.055, type: pw, f: mtof(m) * p, a: 0.002, h: 0.04, d: 0.13, peak: 0.26, to: lp }));
+    for (const [m, pan] of [[72, -0.3], [76, 0.3], [79, 0], [84, 0.12]]) brass(v, T + 0.22, mtof(m) * p, 0.42, m === 84 ? 0.2 : 0.34, { to: v.pan(pan, v.out), bright: 4600, a: 0.01, r: 0.36 });
+    bass(v, T + 0.22, mtof(48) * p, 0.4, 0.55, { style: 'sub' });
+    crash(v, T + 0.22, 0.28, { d: 0.9 });
+    [91, 96].forEach((m, i) => bell(v, T + 0.26 + i * 0.07, mtof(m) * p, 0.16, { d: 0.7 }));
+    v.nz({ t: 0.08, f: 900, f1: 5200, sw: 0.2, q: 1.5, a: 0.12, d: 0.14, peak: 0.26 });
+  },
+});
+// THEY take control: a low boom, a falling diminished figure and a dark, clustered brass stab over a sagging saw —
+// an alarm, clearly not ours
+def('zone_theirs', {
+  gain: 0.33, max: 1, jitter: 0, reverb: 0.2, minGap: 0.25,
+  build(v, p) {
+    const T = v.t, lp = v.filter('lowpass', 2600, 0.9, v.out), pw = pulseWave(v.ctx, 0.3);
+    kick(v, T, 0.95, { f0: 120, f1: 38, d: 0.5 }); tom(v, T + 0.02, 55, 0.7);
+    [70, 66, 63, 58].forEach((m, i) => v.tone({ t: i * 0.06, type: pw, f: mtof(m) * p, a: 0.002, h: 0.045, d: 0.12, peak: 0.24, to: lp }));
+    for (const [m, pan] of [[51, -0.3], [54, 0.3], [57, -0.1], [58, 0.15]]) brass(v, T + 0.24, mtof(m) * p, 0.5, 0.32, { to: v.pan(pan, v.out), bright: 1700, a: 0.02, r: 0.4 });
+    bass(v, T + 0.24, mtof(39) * p, 0.5, 0.6, { style: 'sub' });
+    v.tone({ t: 0.24, type: 'sawtooth', f: 233 * p, f1: 98 * p, sw: 0.6, a: 0.01, d: 0.6, peak: 0.16, to: v.filter('lowpass', 1000, 2.5, v.out) });
+    // two-tone warning horn
+    const hl = v.filter('lowpass', 1800, 1.4, v.out);
+    v.tone({ t: 0.26, type: 'square', f: 466 * p, a: 0.01, h: 0.12, d: 0.05, peak: 0.12, to: hl });
+    v.tone({ t: 0.44, type: 'square', f: 415 * p, a: 0.01, h: 0.16, d: 0.12, peak: 0.12, to: hl });
+  },
+});
+// our hold is broken (the zone goes neutral while we held it): a crack, a falling zap and a thud, a minor drop
+def('zone_lost', {
+  gain: 0.58, max: 1, jitter: 0, reverb: 0.2, minGap: 0.25,
+  build(v, p) {
+    const T = v.t, lp = v.filter('lowpass', 2800, 0.9, v.out), pw = pulseWave(v.ctx, 0.25);
+    crack(v, T, p, 0.9, -1);
+    v.tone({ type: 'sawtooth', f: 980 * p, f1: 150 * p, sw: 0.38, a: 0.002, d: 0.4, peak: 0.2, to: v.filter('lowpass', 2400, 3, v.out) });
+    tom(v, T + 0.02, 82, 0.7);
+    [74, 69].forEach((m, i) => v.tone({ t: 0.1 + i * 0.12, type: pw, f: mtof(m) * p, a: 0.002, h: 0.07, d: 0.18, peak: 0.22, to: lp }));
+    for (const [m, pan] of [[57, -0.2], [60, 0.2], [64, 0]]) brass(v, T + 0.24, mtof(m) * p, 0.3, 0.2, { to: v.pan(pan, v.out), bright: 1900, a: 0.02, r: 0.3 });
+  },
+});
+// we break THEIR hold (their zone goes neutral): a crack that rings upward and a bright two-note lift — good news,
+// but smaller than a capture
+def('zone_broken', {
+  gain: 0.58, max: 1, jitter: 0, reverb: 0.2, minGap: 0.25,
+  build(v, p) {
+    const T = v.t, lp = v.filter('lowpass', 4200, 0.8, v.out), pw = pulseWave(v.ctx, 0.25);
+    crack(v, T, p, 0.8, 1);
+    v.nz({ f: 700, f1: 4800, sw: 0.25, q: 1.6, a: 0.08, d: 0.14, peak: 0.24 });
+    [76, 83].forEach((m, i) => v.tone({ t: 0.08 + i * 0.08, type: pw, f: mtof(m) * p, a: 0.002, h: 0.05, d: 0.16, peak: 0.24, to: lp }));
+    bell(v, T + 0.16, mtof(88) * p, 0.2, { d: 0.6 });
+    kick(v, T, 0.45);
+  },
+});
+// our held zone is being inked back (≈ 30 %, the hold breaks at 40 %): an urgent, clipped double-beep alarm
+def('zone_warn', {
+  gain: 0.42, max: 1, jitter: 0, reverb: 0.06, minGap: 1.5,
+  build(v, p) {
+    const bp = v.filter('bandpass', 1500, 1.1, v.out);
+    for (const t of [0, 0.13, 0.36, 0.49]) {
+      v.tone({ t, type: 'square', f: 1245 * p, f1: 1175 * p, sw: 0.08, a: 0.002, h: 0.06, d: 0.03, peak: 0.34, to: bp });
+      v.tone({ t, f: 622 * p, a: 0.002, h: 0.06, d: 0.04, peak: 0.2 });
+    }
+    v.tone({ type: 'sawtooth', f: 110 * p, a: 0.01, h: 0.5, d: 0.1, peak: 0.1, to: v.filter('lowpass', 500, 1, v.out) });
+  },
+});
+// THEIR held zone is nearly broken (we've inked ≈ 30 % back): rising, bubbly chirps — go, go
+def('zone_chance', {
+  gain: 0.55, max: 1, jitter: 0, reverb: 0.1, minGap: 1.5,
+  build(v, p) {
+    const lp = v.filter('lowpass', 3600, 0.8, v.out), pw = pulseWave(v.ctx, 0.2);
+    [[0, 67, 74], [0.16, 71, 79]].forEach(([t, a, b]) => v.tone({ t, type: pw, f: mtof(a) * p, f1: mtof(b) * p, sw: 0.1, a: 0.002, h: 0.07, d: 0.12, peak: 0.45, to: lp }));
+    v.tone({ t: 0.16, type: 'triangle', f: mtof(83) * p, a: 0.002, d: 0.25, peak: 0.16 });
+    plips(v, 0.04, 4, 0.3, [900, 1900], 0.22, p);
+  },
+});
+// the flood (positional, at the zone): a big wet surge rolling out as the zone fills with the taker's ink
+def('zone_flood', {
+  gain: 0.7, max: 3, jitter: 0.03, reverb: 0.2, minGap: 0.1,
+  build(v, p) {
+    const T = v.t;
+    floodBurst(v, T, p, 1);
+    const g = v.gain(0, v.out), bp = v.filter('bandpass', 700 * p, 1.4, g);
+    sweep(bp.frequency, T, 700 * p, 2600 * p, 0.45);
+    pts(g.gain, T, [[0, 0], [0.12, 0.45], [0.5, 0]]);
+    v.noise('white', T, T + 0.52, bp);
+    let t = 0.12;
+    for (let i = 0; i < 8; i++) { t += v.r(0.03, 0.07); v.bub(T + t, v.r(500, 1500) * p, 0.2 * (1 - i / 10), v.r(0.018, 0.035), v.r(1.4, 2)); }
+  },
+});
+// the wipe (positional, at a zone becoming the objective): the old ink draining away — a falling hiss and a suck
+def('zone_wipe', {
+  gain: 0.7, max: 3, jitter: 0.03, reverb: 0.25, minGap: 0.1,
+  build(v, p) {
+    const T = v.t, g = v.gain(0, v.out), hp = v.filter('bandpass', 5000, 0.9, g);
+    sweep(hp.frequency, T, 6500 * p, 700 * p, 0.6);
+    pts(g.gain, T, [[0, 0], [0.08, 0.5], [0.45, 0.35], [0.7, 0]]);
+    v.noise('pink', T, T + 0.72, hp);
+    v.tone({ t: 0.35, f: 140 * p, f1: 420 * p, sw: 0.22, a: 0.01, d: 0.22, peak: 0.3 });
+  },
+});
+// the last 30 s: centre only — a snare swell into three rising brass hits and a crash
+def('zone_final', {
+  gain: 0.4, max: 1, jitter: 0, reverb: 0.25, minGap: 1,
+  build(v, p) {
+    const T = v.t, c = v.gain(0, v.out);
+    pts(c.gain, T, [[0, 0], [0.05, 0.12], [0.55, 0.7], [0.6, 0]]);
+    snareRoll(v, T, T + 0.62, p, c);
+    [[0.62, [62, 69]], [0.8, [64, 71]], [0.98, [67, 74, 79]]].forEach(([t, ms]) => {
+      for (const m of ms) brass(v, T + t, mtof(m) * p, t > 0.9 ? 0.6 : 0.12, 0.3, { to: v.pan(m % 2 ? 0.25 : -0.25, v.out), bright: 4200, a: 0.008, r: t > 0.9 ? 0.45 : 0.08 });
+      tom(v, T + t, mtof(ms[0] - 24) * p, 0.6);
+    });
+    crash(v, T + 0.98, 0.4, { d: 1.4 }); kick(v, T + 0.98, 0.8);
+  },
+});
+// the zones' own sound (positional loop, one per live zone): a soft pulsing tone whose timbre says who holds it —
+// neutral: an open fifth, airy; ours: a warm major third, brighter; theirs: a buzzy, beating tritone, darker — and
+// tension (0..1, a flip coming) quickens the pulse, lifts the pitch and opens the filter.
+//   h = audio.loop('zone_hum', { pos, volume }); h.set({ pos, volume, params: { mode: 'neutral'|'ours'|'theirs', tension } })
+const HUM = {
+  neutral: { f: 196, iv: 1.5, hard: 0, det: 4, cut: 1300, rate: 0.7, depth: 0.18, air: 0.05 },
+  ours: { f: 220, iv: 1.26, hard: 0.1, det: 5, cut: 2300, rate: 1.1, depth: 0.2, air: 0.02 },
+  theirs: { f: 185, iv: 1.414, hard: 0.26, det: 24, cut: 950, rate: 1.1, depth: 0.28, air: 0.02 },
+};
+def('zone_hum', {
+  gain: 0.14, max: 4, jitter: 0, reverb: 0.12, oneShot: 2.5,
+  loop(v, p) {
+    const T = v.t, H = HUM.neutral;
+    const lp = v.filter('lowpass', H.cut, 0.9, v.out);
+    const amp = v.gain(0.72, lp);
+    const pulse = v.lfo(H.rate, H.depth, amp.gain, T, null);
+    const soft = v.gain(0.62, amp), iv = v.gain(0.42, soft), hard = v.gain(H.hard, amp);
+    const o1 = v.osc('triangle', H.f * p, T, null, soft);
+    const o2 = v.osc('triangle', H.f * H.iv * p, T, null, iv);
+    const o3 = v.osc('sawtooth', H.f * 0.5 * p, T, null, hard);
+    const o4 = v.osc('sawtooth', H.f * 0.5 * p, T, null, hard);
+    o4.detune.value = H.det;
+    const air = v.gain(H.air, v.out);
+    v.noise('pink', T, null, v.filter('bandpass', 2600, 1.1, air));
+    let q = p, st = { mode: 'neutral', tension: 0 };
+    const apply = (now, k = 0.22) => {
+      const S = HUM[st.mode] || H, x = Math.min(1, Math.max(0, +st.tension || 0));
+      const f = S.f * q * Math.pow(2, (2.5 * x) / 12);
+      o1.frequency.setTargetAtTime(f, now, k); o2.frequency.setTargetAtTime(f * S.iv, now, k);
+      o3.frequency.setTargetAtTime(f * 0.5, now, k); o4.frequency.setTargetAtTime(f * 0.5, now, k);
+      o4.detune.setTargetAtTime(S.det, now, k);
+      hard.gain.setTargetAtTime(S.hard * (1 + 0.6 * x), now, k);
+      lp.frequency.setTargetAtTime(Math.min(9000, S.cut * (1 + 1.3 * x)), now, k);
+      pulse.osc.frequency.setTargetAtTime(S.rate * (1 + 4.5 * x), now, k);
+      pulse.depth.gain.setTargetAtTime(Math.min(0.55, S.depth + 0.3 * x), now, k);
+      air.gain.setTargetAtTime(S.air + 0.06 * x, now, k);
+    };
+    return {
+      pitch(np, now) { q = np; apply(now); },
+      params(o, now) { if (!o) return; if (o.mode) st.mode = o.mode; if (o.tension != null) st.tension = o.tension; apply(now); },
+    };
+  },
+});
+// a penalty lands: a two-step buzzer and a thump
+def('zone_penalty', {
+  gain: 0.3, max: 2, jitter: 0, reverb: 0.1, minGap: 0.2,
+  build(v, p) {
+    const lp = v.filter('lowpass', 2400, 1, v.out);
+    v.tone({ type: 'square', f: 330 * p, a: 0.002, h: 0.07, d: 0.05, peak: 0.26, to: lp });
+    v.tone({ t: 0.11, type: 'square', f: 247 * p, a: 0.002, h: 0.14, d: 0.12, peak: 0.28, to: lp });
+    v.tone({ t: 0.11, type: 'sawtooth', f: 123.5 * p, a: 0.004, h: 0.12, d: 0.14, peak: 0.15, to: lp });
+    tom(v, v.t + 0.1, 70, 0.55);
+  },
+});
+// the objective moves: an air sweep and a two-note announcement chime
+def('zone_shift', {
+  gain: 0.38, max: 1, jitter: 0, reverb: 0.3, minGap: 0.4,
+  build(v, p) {
+    const T = v.t;
+    const g = v.gain(0, v.out), bp = v.filter('bandpass', 400, 1.6, g);
+    sweep(bp.frequency, T, 400, 3200, 0.35);
+    pts(g.gain, T, [[0, 0], [0.25, 0.28], [0.42, 0]]);
+    v.noise('white', T, T + 0.44, bp);
+    bell(v, T + 0.12, mtof(84) * p, 0.3, { d: 0.9, index: 1.4 });
+    bell(v, T + 0.36, mtof(79) * p, 0.3, { d: 1.1, index: 1.4 });
+    pad(v, T + 0.12, mtof(72) * p, 0.5, 0.08, { a: 0.02, r: 0.5, cut: 2200 });
+  },
+});
+// overtime begins: a two-tone siren under a brass stab
+def('zone_overtime', {
+  gain: 0.32, max: 1, jitter: 0, reverb: 0.25,
+  build(v, p) {
+    const T = v.t;
+    const g = v.gain(0, v.out);
+    ahr(g.gain, T, 0.03, 0.2, 0.8, 0.25);
+    const o = v.osc('square', 700 * p, T, T + 1.12, v.filter('lowpass', 2600, 1, g));
+    v.lfo(5, 180 * p, o.frequency, T, T + 1.12, 'square');
+    for (const [m, pan] of [[62, -0.3], [65, 0.3], [69, -0.1], [74, 0.15]]) brass(v, T + 0.05, mtof(m) * p, 0.5, 0.3, { to: v.pan(pan, v.out), bright: 4000, a: 0.01, r: 0.4 });
+    crash(v, T + 0.05, 0.4); kick(v, T + 0.05, 0.7);
+  },
+});
+// last ten counts of either team: a small, dry tick (higher for ours)
+def('zone_tick', {
+  gain: 0.2, max: 2, jitter: 0, reverb: 0.04, minGap: 0.12,
+  build(v, p) {
+    v.tone({ type: 'triangle', f: 1760 * p, a: 0.0008, d: 0.05, peak: 0.45 });
+    v.tone({ f: 880 * p, a: 0.001, d: 0.07, peak: 0.22 });
+    v.nz({ ft: 'highpass', f: 6000, a: 0.0003, d: 0.008, peak: 0.22 });
   },
 });
 // snare roll: noise + body amplitude-modulated by a decaying-stroke waveform (~22 strokes/s), hand accents at half rate
@@ -1277,6 +2214,267 @@ def('harbor_ambience', {
   },
 });
 
+/* ---- Boss mode: HULLBREAKER (played by src/audio/bossAudio.js from the boss:* events; `ref` = reference distance,
+ * so a 6 m crab stays loud across the arena) ---- */
+def('boss_roar', {
+  gain: 0.37, max: 2, jitter: 0.04, reverb: 0.34, ref: 16,
+  build(v, p) {
+    const T = v.t, D = 1.9;
+    // throat: detuned saws + a square through a driven formant pair; pitch swells then sags, growl flutter on top
+    const env = v.gain(0, v.out);
+    pts(env.gain, T, [[0, 0], [0.12, 0.75], [0.5, 1], [1.3, 0.85], [D, 0]]);
+    const flutter = v.gain(1, env);
+    v.lfo(24, 0.4, flutter.gain, T, T + D);
+    const drive = v.shaper(3, flutter);
+    const f1 = v.filter('bandpass', 380, 2.4, drive), f2 = v.filter('bandpass', 1050, 3.2, v.gain(0.7, drive));
+    sweep(f1.frequency, T, 300, 720, 0.5); f1.frequency.exponentialRampToValueAtTime(240, T + D);
+    sweep(f2.frequency, T, 900, 1500, 0.5); f2.frequency.exponentialRampToValueAtTime(700, T + D);
+    const mix = v.gain(1); mix.connect(f1); mix.connect(f2);
+    const lp = v.filter('lowpass', 2600, 0.8, mix);
+    for (const [det, type, lv] of [[-14, 'sawtooth', 0.5], [9, 'sawtooth', 0.5], [0, 'square', 0.3]]) {
+      const o = v.osc(type, 52 * p, T, T + D + 0.05, v.gain(lv, lp));
+      o.detune.value = det;
+      o.frequency.setValueAtTime(50 * p, T); o.frequency.linearRampToValueAtTime(80 * p, T + 0.45);
+      o.frequency.linearRampToValueAtTime(58 * p, T + 1.3); o.frequency.linearRampToValueAtTime(38 * p, T + D);
+    }
+    v.nz({ kind: 'pink', f: 950, f1: 420, sw: D, q: 0.9, a: 0.1, h: 1.1, d: 0.6, peak: 0.5 });          // breath
+    v.tone({ f: 46 * p, f1: 30 * p, sw: D, a: 0.1, h: 1.0, d: 0.7, peak: 0.75 });                       // chest
+    bloops(v, 0.25, 6, 1.2, [170, 420], 0.22, p);                                                        // wet gurgle
+  },
+});
+def('boss_step', {
+  gain: 0.62, max: 6, jitter: 0.08, reverb: 0.12, ref: 10, minGap: 0.05,
+  build(v, p) {
+    v.tone({ f: 72 * p, f1: 32 * p, sw: 0.18, a: 0.002, d: 0.32, peak: 1 });
+    v.nz({ kind: 'brown', ft: 'lowpass', f: 700, f1: 110, sw: 0.25, a: 0.002, d: 0.3, peak: 0.8 });
+    v.nz({ t: 0.004, f: 380 * p, q: 6, a: 0.001, d: 0.12, peak: 0.32 });                              // the container clanks
+    v.tone({ t: 0.01, type: 'triangle', f: 233 * p, a: 0.001, d: 0.2, peak: 0.12 });
+    v.tone({ t: 0.01, type: 'triangle', f: 347 * p, a: 0.001, d: 0.15, peak: 0.08 });
+    plips(v, 0.02, 2, 0.06, [260, 520], 0.1, p);
+  },
+});
+def('boss_slam', {
+  gain: 0.4, max: 2, jitter: 0.04, reverb: 0.3, ref: 16,
+  build(v, p) {
+    v.tone({ f: 82 * p, f1: 25 * p, sw: 0.9, a: 0.002, d: 1.25, peak: 1 });
+    v.nz({ ft: 'highpass', f: 1600, a: 0.0003, d: 0.06, peak: 1 });
+    const sh = v.shaper(3, v.gain(0.7, v.out));
+    v.nz({ kind: 'pink', ft: 'lowpass', f: 5200, f1: 120, sw: 0.9, q: 0.8, a: 0.002, d: 1.1, peak: 1, to: sh });
+    for (const [f, pk, d] of [[183, 0.26, 0.95], [497, 0.18, 0.6], [1130, 0.1, 0.42], [1720, 0.06, 0.3]]) v.tone({ type: 'triangle', f: f * p, a: 0.001, d, peak: pk });   // claw armour rings
+    bigSplat(v, 0.03, p * 0.8, 0.9);
+    v.nz({ t: 0.12, f: 700, f1: 190, sw: 1.0, q: 1.4, a: 0.02, d: 1.0, peak: 0.5 });                   // the shockwave ring rolling out
+  },
+});
+def('boss_tele', {
+  gain: 0.34, max: 2, jitter: 0.02, reverb: 0.25, ref: 16, minGap: 0.25,
+  build(v, p) {
+    // ominous low horn "bwaamp" + a metal creak: something big is winding up
+    const T = v.t;
+    for (const [m, pan] of [[38, -0.2], [45, 0.2], [50, 0]]) brass(v, T, mtof(m) * p, 0.34, 0.4, { to: v.pan(pan, v.out), bright: 1400, a: 0.03, r: 0.3 });
+    const g = v.gain(0, v.out); pts(g.gain, T, [[0, 0], [0.05, 0.25], [0.45, 0.18], [0.6, 0]]);
+    const bp = v.filter('bandpass', 700 * p, 9, g); sweep(bp.frequency, T, 700 * p, 1100 * p, 0.55);
+    v.noise('pink', T, T + 0.62, bp);
+  },
+});
+def('boss_whistle', {
+  gain: 0.21, max: 6, jitter: 0.06, reverb: 0.1, ref: 8,
+  build(v, p) {
+    const T = v.t, D = 0.95;
+    const g = v.gain(0, v.out); pts(g.gain, T, [[0, 0], [0.08, 0.5], [D - 0.1, 0.75], [D, 0]]);
+    const o = v.osc('sine', 2100 * p, T, T + D + 0.02, g);
+    o.frequency.exponentialRampToValueAtTime(640 * p, T + D);
+    v.lfo(9, 38, o.frequency, T, T + D);
+    v.nz({ f: 2000 * p, f1: 700 * p, sw: D, q: 4, a: 0.1, h: D - 0.2, d: 0.1, peak: 0.12 });
+  },
+});
+def('boss_barrel', {
+  gain: 0.6, max: 6, jitter: 0.07, reverb: 0.18, ref: 9, minGap: 0.04,
+  build(v, p) {
+    v.nz({ ft: 'highpass', f: 1200, a: 0.0005, d: 0.05, peak: 0.9 });
+    for (let i = 0; i < 3; i++) v.nz({ t: v.r(0, 0.04), f: v.r(500, 1400) * p, q: 8, a: 0.001, d: v.r(0.04, 0.09), peak: 0.4 });   // staves crack
+    v.tone({ f: 140 * p, f1: 58 * p, sw: 0.2, a: 0.002, d: 0.3, peak: 0.7 });
+    bigSplat(v, 0.01, p, 1.1);
+  },
+});
+def('boss_cannon_charge', {
+  gain: 0.23, max: 2, jitter: 0.02, reverb: 0.15, ref: 14,
+  build(v, p) {
+    const T = v.t, D = 1.25;
+    const g = v.gain(0, v.out); pts(g.gain, T, [[0, 0], [0.2, 0.35], [D - 0.08, 1], [D, 0]]);
+    const trem = v.gain(1, g); v.lfo(14, 0.3, trem.gain, T, T + D);
+    const lp = v.filter('lowpass', 600, 5, trem); sweep(lp.frequency, T, 500, 5200, D);
+    const o = v.osc('sawtooth', 110 * p, T, T + D + 0.02, lp); o.frequency.exponentialRampToValueAtTime(640 * p, T + D);
+    const o2 = v.osc('sine', 220 * p, T, T + D + 0.02, v.gain(0.5, trem)); o2.frequency.exponentialRampToValueAtTime(1280 * p, T + D);
+    const bub = v.gain(0, v.out); pts(bub.gain, T, [[0, 0], [0.3, 0.3], [D, 0.65], [D + 0.05, 0]]);
+    v.buffer(texture(v.ctx, 'bubbles_bright'), T, T + D + 0.05, bub, 1.2 * p);
+  },
+});
+def('boss_cannon_sweep', {
+  gain: 0.27, max: 2, jitter: 0, reverb: 0.12, ref: 14, oneShot: 2.4,
+  loop(v, p) {
+    const T = v.t;
+    const hs = v.gain(0.5, v.out);
+    v.noise('white', T, null, v.filter('bandpass', 1800 * p, 0.8, hs));
+    v.lfo(6, 0.12, hs.gain, T, null);
+    v.noise('brown', T, null, v.filter('lowpass', 260, 1, v.gain(0.6, v.out)));
+    const tex = v.buffer(texture(v.ctx, 'squelch'), T, null, v.gain(0.7, v.filter('lowpass', 1400, 0.8, v.out)), p);
+    const o = v.osc('sawtooth', 55 * p, T, null, v.gain(0.12, v.filter('lowpass', 300, 1, v.out)));
+    return { pitch(q, now) { tex.playbackRate.setTargetAtTime(q, now, 0.05); o.frequency.setTargetAtTime(55 * q, now, 0.05); } };
+  },
+});
+def('boss_gallop', {
+  gain: 0.42, max: 2, jitter: 0, reverb: 0.1, ref: 12, oneShot: 1.8,
+  loop(v, p) {
+    // eight legs pounding: a stroke-shaped AM (~9 thuds/s) on a sub thump, dirt and a container rattle, plus scrape
+    const T = v.t, am = v.gain(0, v.out);
+    const st = v.osc(strokeWave(v.ctx, 9), 8.5 * p, T, null);
+    const dep = v.gain(1); st.connect(dep); dep.connect(am.gain);
+    v.osc('sine', 58 * p, T, null, v.gain(0.9, am));
+    v.noise('brown', T, null, v.filter('lowpass', 500, 1, v.gain(1.2, am)));
+    v.noise('white', T, null, v.filter('bandpass', 420 * p, 5, v.gain(0.35, am)));
+    v.noise('pink', T, null, v.filter('bandpass', 900, 0.7, v.gain(0.12, v.out)));
+    return { pitch(q, now) { st.frequency.setTargetAtTime(8.5 * q, now, 0.05); } };
+  },
+});
+def('boss_crash', {
+  gain: 0.49, max: 2, jitter: 0.04, reverb: 0.32, ref: 16,
+  build(v, p) {
+    v.tone({ f: 96 * p, f1: 30 * p, sw: 0.7, a: 0.002, d: 1.0, peak: 1 });
+    v.nz({ ft: 'highpass', f: 1500, a: 0.0003, d: 0.08, peak: 1 });
+    const sh = v.shaper(4, v.gain(0.6, v.out));
+    v.nz({ kind: 'pink', ft: 'lowpass', f: 7000, f1: 300, sw: 0.6, q: 0.8, a: 0.002, d: 0.85, peak: 1, to: sh });
+    for (const [f, pk, d] of [[151, 0.3, 1.3], [412, 0.22, 0.9], [867, 0.16, 0.7], [1391, 0.1, 0.5], [2210, 0.06, 0.35]]) v.tone({ type: 'triangle', f: f * p, f1: f * p * 0.96, sw: d, a: 0.001, d, peak: pk });
+    for (let i = 0; i < 9; i++) v.nz({ t: 0.08 + v.r(0, 0.6), f: v.r(900, 3500), q: 6, a: 0.001, d: v.r(0.02, 0.06), peak: v.r(0.1, 0.3) });   // debris
+  },
+});
+def('boss_dizzy', {
+  gain: 0.1, max: 1, jitter: 0, reverb: 0.2, ref: 10, oneShot: 2.5,
+  loop(v, p) {
+    // cartoon birdies circling its eye stalks: chirping sines on a sawtooth sweep, gated by a slow square
+    const T = v.t;
+    const gate = v.gain(0, v.out), am = v.gain(0.5); am.connect(gate.gain);
+    v.osc('square', 3.2, T, null, am);
+    gate.gain.value = 0.5;
+    const o = v.osc('sine', 1700 * p, T, null, gate);
+    v.lfo(7, 480 * p, o.frequency, T, null, 'sawtooth'); v.lfo(0.8, 260 * p, o.frequency, T, null);
+    const o2 = v.osc('triangle', 2500 * p, T, null, v.gain(0.07, v.out));
+    v.lfo(5.3, 650 * p, o2.frequency, T, null, 'sawtooth');
+    return { pitch() {} };
+  },
+});
+def('boss_frenzy', {
+  gain: 0.26, max: 1, jitter: 0, reverb: 0.12, ref: 14, oneShot: 3,
+  loop(v, p) {
+    const T = v.t;
+    const bp = v.filter('bandpass', 900, 1.2, v.gain(0.8, v.out));
+    v.noise('pink', T, null, bp);
+    const l = v.lfo(3.2 * p, 650, bp.frequency, T, null);                                            // whoosh per turn
+    const hs = v.gain(0.35, v.out);
+    v.noise('white', T, null, v.filter('highpass', 2500, 0.7, hs));
+    v.lfo(3.2 * p, 0.2, hs.gain, T, null);
+    v.buffer(texture(v.ctx, 'squelch'), T, null, v.gain(0.5, v.out), 1.3 * p);
+    v.osc('sawtooth', 70 * p, T, null, v.gain(0.1, v.filter('lowpass', 240, 1, v.out)));
+    return { pitch(q, now) { l.osc.frequency.setTargetAtTime(3.2 * q, now, 0.1); } };
+  },
+});
+def('crablet_chitter', {
+  gain: 1.0, max: 4, jitter: 0.1, reverb: 0.05, ref: 5, minGap: 0.08,
+  build(v, p) {
+    for (let i = 0; i < 9; i++) v.nz({ t: i * 0.035 + v.r(0, 0.012), ft: 'highpass', f: v.r(2500, 4500), a: 0.0005, d: v.r(0.008, 0.02), peak: v.r(0.3, 0.6) });
+    v.tone({ t: 0.05, type: 'square', f: 1300 * p, f1: 1900 * p, sw: 0.06, a: 0.002, d: 0.07, peak: 0.1 });
+    v.tone({ t: 0.18, type: 'square', f: 1500 * p, f1: 1100 * p, sw: 0.06, a: 0.002, d: 0.06, peak: 0.08 });
+  },
+});
+def('crablet_pop', {
+  gain: 0.45, max: 5, jitter: 0.08, reverb: 0.08, ref: 5, minGap: 0.03,
+  build(v, p) {
+    v.tone({ f: 900 * p, f1: 170 * p, sw: 0.07, a: 0.001, d: 0.09, peak: 0.8 });
+    v.nz({ ft: 'highpass', f: 2500, a: 0.0005, d: 0.03, peak: 0.6 });
+    bloops(v, 0.01, 3, 0.08, [500, 900], 0.35, p);
+    plips(v, 0.03, 3, 0.1, [900, 1500], 0.15, p);
+  },
+});
+def('boss_hit', {
+  gain: 0.56, max: 4, jitter: 0.06, reverb: 0.04, minGap: 0.05,
+  build(v, p) {
+    v.tone({ f: 190 * p, f1: 88 * p, sw: 0.06, a: 0.001, d: 0.09, peak: 0.8 });                        // armoured thunk
+    v.tone({ type: 'triangle', f: 640 * p, a: 0.001, d: 0.06, peak: 0.18 });
+    v.nz({ f: 1800 * p, q: 2, a: 0.0005, d: 0.04, peak: 0.4 });
+  },
+});
+def('boss_crit', {
+  gain: 0.46, max: 3, jitter: 0.03, reverb: 0.1, minGap: 0.06,
+  build(v, p) {
+    v.nz({ ft: 'highpass', f: 2200, a: 0.0003, d: 0.05, peak: 0.8 });
+    v.tone({ f: 260 * p, f1: 105 * p, sw: 0.08, a: 0.001, d: 0.12, peak: 0.8 });
+    bell(v, v.t, mtof(91) * p, 0.34, { d: 0.35 });
+    bell(v, v.t + 0.028, mtof(98) * p, 0.2, { d: 0.3 });
+    v.tone({ type: 'square', f: 1760 * p, f1: 2640 * p, sw: 0.05, a: 0.001, d: 0.06, peak: 0.07 });
+    bloops(v, 0.01, 2, 0.05, [500, 800], 0.22, p);
+  },
+});
+def('boss_phase', {
+  gain: 0.42, max: 1, jitter: 0, reverb: 0.34,
+  build(v, p) {
+    const T = v.t;
+    crash(v, T, 0.7, { d: 2 }); kick(v, T, 0.9);
+    tom(v, T, 55, 0.8); tom(v, T + 0.17, 49, 0.7); tom(v, T + 0.34, 43, 0.85);
+    // a diminished stab over a low D: the fight just got worse
+    for (const [m, pan] of [[38, 0], [50, -0.3], [53, 0.3], [56, -0.15], [62, 0.2]]) brass(v, T, mtof(m) * p, 0.95, 0.34, { to: v.pan(pan, v.out), bright: 3000, a: 0.02, r: 0.7 });
+    v.tone({ f: 44 * p, f1: 30 * p, sw: 1.2, a: 0.01, d: 1.3, peak: 0.6 });
+  },
+});
+def('boss_title', {
+  gain: 0.31, max: 1, jitter: 0, reverb: 0.32,
+  build(v, p) {
+    const T = v.t;
+    kick(v, T, 1); crash(v, T, 0.8, { d: 2.2 }); tom(v, T, 48, 0.9);
+    v.tone({ f: 55 * p, f1: 29 * p, sw: 1.2, a: 0.002, d: 1.4, peak: 0.8 });
+    for (const [m, pan] of [[38, 0], [50, -0.3], [53, 0.3], [57, -0.15], [62, 0.2], [65, 0]]) brass(v, T, mtof(m) * p, 0.62, 0.32, { to: v.pan(pan, v.out), bright: 3400, a: 0.015, r: 0.7 });
+    const t2 = T + 0.72;
+    tom(v, t2, 43, 0.85); kick(v, t2, 0.85);
+    for (const [m, pan] of [[34, 0], [46, -0.25], [50, 0.25], [53, -0.1], [58, 0.1]]) brass(v, t2, mtof(m) * p, 1.0, 0.3, { to: v.pan(pan, v.out), bright: 2800, a: 0.02, r: 1.0 });
+  },
+});
+def('boss_defeat', {
+  gain: 0.36, max: 1, jitter: 0, reverb: 0.36, ref: 20,
+  build(v, p) {
+    const T = v.t;
+    // a last groan, sagging down
+    const g = v.gain(0, v.out); pts(g.gain, T, [[0, 0], [0.1, 0.7], [1.0, 0.5], [1.6, 0]]);
+    const lp = v.filter('lowpass', 1500, 1.5, g); sweep(lp.frequency, T, 1500, 280, 1.6);
+    for (const d of [-12, 7]) { const o = v.osc('sawtooth', 92 * p, T, T + 1.65, lp); o.detune.value = d; o.frequency.exponentialRampToValueAtTime(30 * p, T + 1.6); }
+    // the container crumples
+    for (let i = 0; i < 6; i++) {
+      const t = 0.2 + i * 0.16 + v.r(0, 0.08);
+      v.tone({ t, type: 'triangle', f: v.r(180, 900) * p, a: 0.001, d: v.r(0.2, 0.5), peak: v.r(0.08, 0.2) });
+      v.nz({ t, f: v.r(700, 2400), q: 5, a: 0.001, d: 0.06, peak: 0.25 });
+    }
+    // it hits the deck
+    v.tone({ t: 1.1, f: 76 * p, f1: 24 * p, sw: 1.0, a: 0.002, d: 1.3, peak: 1 });
+    const sh = v.shaper(3, v.gain(0.6, v.out));
+    v.nz({ t: 1.1, kind: 'pink', ft: 'lowpass', f: 4500, f1: 120, sw: 1.0, q: 0.8, a: 0.002, d: 1.2, peak: 1, to: sh });
+    // ink geyser: a rushing column, bubbling, then big splats raining back down
+    v.nz({ t: 1.35, f: 300, f1: 2600, sw: 1.2, q: 0.9, a: 0.25, h: 0.6, d: 1.0, peak: 0.7 });
+    const bg = v.gain(0, v.out); pts(bg.gain, T + 1.35, [[0, 0], [0.3, 0.7], [1.6, 0.5], [2.3, 0]]);
+    v.buffer(texture(v.ctx, 'bubbles'), T + 1.35, T + 3.7, bg, 1.1);
+    for (let i = 0; i < 5; i++) bigSplat(v, 2.0 + i * 0.28 + v.r(0, 0.1), p * v.r(0.8, 1.2), 0.45);
+  },
+});
+def('boss_sunk', {
+  gain: 0.3, max: 1, jitter: 0, reverb: 0.3,
+  build(v, p) {
+    const T = v.t, b = 60 / 140;
+    // short triumphant brass flourish (major), the squad won
+    for (const [bt, ms, len] of [[0, [62, 66, 69, 74], 0.4], [0.5, [64, 67, 71, 76], 0.4], [1, [66, 69, 74, 78], 2.2]]) {
+      ms.forEach((m, i) => brass(v, T + bt * b, mtof(m) * p, len * b, i === ms.length - 1 ? 0.5 : 0.24, { to: v.pan((i - 1.5) * 0.25, v.out), bright: 4200, a: 0.012, r: 0.4 }));
+    }
+    kick(v, T, 0.7); snare(v, T + 0.5 * b, 0.5); kick(v, T + b, 0.9); crash(v, T + b, 0.7, { d: 2 });
+    bass(v, T + b, mtof(38) * p, 2 * b, 0.7, { style: 'sub' });
+    [86, 90, 93, 98].forEach((m, i) => bell(v, T + (1.3 + i * 0.18) * b, mtof(m) * p, 0.12, { d: 0.8 }));
+  },
+});
+
 /* ------------------------------------------------------------------------------------------------------------ */
 export const SFX_GROUPS = {
   UI: ['ui_hover', 'ui_click', 'ui_back', 'ui_confirm', 'ui_toggle', 'ui_slider', 'ui_error'],
@@ -1287,7 +2485,18 @@ export const SFX_GROUPS = {
   World: ['gull', 'harbor_ambience', 'ferry_horn', 'halyard_clink'],
   Combat: ['hit_marker', 'ink_hit_body', 'hurt', 'splat_enemy', 'splatted_self', 'ally_splatted', 'enemy_ink_sizzle'],
   Status: ['low_ink', 'empty_click', 'refill_full', 'special_ready', 'special_activate', 'special_slam', 'storm_rain', 'storm_thunder', 'respawn', 'super_jump'],
+  Specials: ['special_ending', 
+    'special_end', 'shield_up', 'shield_hit', 'shield_pop', 'sonar_ping', 'sonar_mark', 'strike_launch', 'strike_whistle', 'strike_impact',
+    'tornado', 'zooka_fire', 'wail_charge', 'wail_blast', 'kraken_on', 'kraken_jump', 'kraken_slam', 'blower_inflate', 'bubble_release',
+    'bubble_pop', 'bubble_blast', 'jet_loop', 'jet_fire', 'jet_end', 'stamp_swing', 'stamp_slam', 'stamp_throw', 'booyah_charge',
+    'booyah_cheer', 'booyah_throw', 'booyah_blast', 'zip_fire', 'zip_latch', 'zip_pull', 'crab_move', 'crab_gatling', 'crab_cannon',
+    'crab_roll', 'crab_hit', 'crab_break',
+  ],
   Match: ['ready', 'go_horn', 'countdown_tick', 'one_minute', 'final_count', 'times_up', 'judge_drumroll', 'judge_reveal', 'victory_fanfare', 'defeat_jingle', 'xp_tick', 'level_up'],
+  Zones: ['zone_ours', 'zone_theirs', 'zone_lost', 'zone_broken', 'zone_warn', 'zone_chance', 'zone_penalty', 'zone_shift', 'zone_final',
+    'zone_overtime', 'zone_tick', 'zone_flood', 'zone_wipe', 'zone_hum'],
+  Boss: ['boss_roar', 'boss_step', 'boss_slam', 'boss_tele', 'boss_whistle', 'boss_barrel', 'boss_cannon_charge', 'boss_cannon_sweep', 'boss_gallop', 'boss_crash',
+    'boss_dizzy', 'boss_frenzy', 'crablet_chitter', 'crablet_pop', 'boss_hit', 'boss_crit', 'boss_phase', 'boss_title', 'boss_defeat', 'boss_sunk'],
 };
 export const SFX_NAMES = Object.values(SFX_GROUPS).flat();
 export const LOOP_NAMES = SFX_NAMES.filter((n) => SFX[n] && SFX[n].loop);

@@ -9,6 +9,7 @@
 //            colour = strand data (t, suckers, sinA) | cap flag (b ≥ 1.5) | gear rgb (r < 0 → team × g).
 //  • weapon plastic: aMat = material class (0 satin, 1 gloss, 2 rubber, 3 metal, 4 lens, 5 LED, 6 print).
 import * as THREE from 'three';
+import { FACE_SHADER } from './character-face.js';
 
 const NOISE = /* glsl */`
 float iwHash(vec3 p){ p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3)); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
@@ -96,6 +97,11 @@ export function makeCharUniforms() {
     uOpacity: { value: 1 },
     uMouth: { value: new THREE.Vector4(0.75, 1, 0, 0) },
     uFreckle: { value: 0 },
+    // Face hooks (driven per frame by character.js). All additive to the legacy drivers (eye-bone Y scale, uLook, uMouth).
+    uLid: { value: new THREE.Vector4(0, 0, 0, 0) },    // lid close 0…1: upper L, upper R, lower L, lower R
+    uGaze: { value: new THREE.Vector4(0, 0, 0, 0) },   // eyeball yaw/pitch (rad): L.x L.y R.x R.y (+x = kid's left, +y = up)
+    uPupil: { value: 0.5 },                             // pupil dilation 0…1
+    uMouth2: { value: new THREE.Vector4(0, 0, 0, 0) }, // x smile (unused by the shader: cheek bones) · y sneer · z pucker · w blush
   };
 }
 
@@ -115,10 +121,15 @@ ${BUMP}
 `;
 
 // ================================================================================================
-// SKIN — face decals live in the skin shader: the goggle visor (analytic SDF in the head's az/el
-// parametrisation, with a height field for a bevelled, raised lip) and the mouth (smile line / frown /
-// open "D" with teeth + tongue) driven by uMouth = (curve, width, open, tilt). Pixel-crisp at any
-// distance and zero extra triangles. Sub-materials via aEx: 1 nail, 2 inner ear, 3 knuckle crease.
+// SKIN — stylised subsurface skin + the face. Geometry does the sculpt (character-face.js); this shader adds:
+//  • lighting: per-channel wrapped diffuse (red scatters past the terminator, blue stays tight), translucent ears
+//    against back light, soft spec + sheen, baked vertex AO (aFace.w) on indirect light, a little cavity in direct.
+//  • animation (vertex): the lids rotate about each eyeball's axis in eye space (exact slide over the ball; closure from
+//    the eye bones' Y scale — character.js' blink/squint — and/or uLid), the mouth deforms from uMouth / uMouth2
+//    (smile/frown corners, width, smirk tilt, upper-lip lift, pucker); the jaw + cheek bones do the rest.
+//  • pigment: the Inkling mask (recessed in geometry, glossy lacquer here), painted hairline, freckles, blush, lip tint,
+//    wet lid margins, mouth cavity / teeth / tongue.
+// Sub-materials (aEx): 0 skin · 1 nail · 2 ear cup · 8 ear shell · 9 lid margin · 10 inner lip / cavity · 11 teeth · 12 tongue.
 // ================================================================================================
 const FACE_GLSL = /* glsl */`
 float iwSmax(float a, float b, float k){ float h = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0); return mix(b, a, h) + k * h * (1.0 - h); }
@@ -134,145 +145,226 @@ float iwVisorSD(float az, float el){
 }
 float iwHairline(float az){ float a = abs(az) / 3.14159265; float h = mix(0.58, 0.3, smoothstep(0.1, 0.42, a)); return mix(h, -0.8, smoothstep(0.5, 0.96, a)); }
 `;
+// eye-space constants shared by the skin (lids) and eye (ball, lid shadow) shaders
+function faceUniforms() {
+  const S = FACE_SHADER;
+  return {
+    uEyeC: { value: S.eyeC }, uEyeM: { value: S.eyeM }, uEyeMi: { value: S.eyeMi },
+    uEyeAp: { value: S.ap }, uEyeLid: { value: S.lid },
+    uMouthC: { value: S.mouthC }, uMouthU: { value: S.mouthU }, uMouthF: { value: S.mouthF }, uMouthHW: { value: S.mouthHW },
+  };
+}
+// lid closure from the eye bones (character.js blinks/squints by scaling eyeL/eyeR Y): 0 open … 1 shut
+const LID_BONE_GLSL = /* glsl */`
+#ifdef USE_SKINNING
+float iwBoneClose(float bi){ mat4 bE = getBoneMatrix(bi); mat4 bH = getBoneMatrix(${FACE_SHADER.bones.head.toFixed(1)}); float open = length(bE[1].xyz) / max(length(bH[1].xyz), 1e-5); return clamp((1.0 - open) / 0.93, 0.0, 1.0); }
+#else
+float iwBoneClose(float bi){ return 0.0; }
+#endif
+vec2 iwLidClose(int si, vec4 lid){
+  float b = iwBoneClose(si == 0 ? ${FACE_SHADER.bones.eyeL.toFixed(1)} : ${FACE_SHADER.bones.eyeR.toFixed(1)});
+  return vec2(max(b, si == 0 ? lid.x : lid.y), max(b, si == 0 ? lid.z : lid.w));
+}
+`;
 
 export function makeSkinMaterial(u, skinHex) {
   const m = new THREE.MeshPhysicalMaterial({
-    color: skinHex, roughness: 0.52, metalness: 0, vertexColors: true,
-    sheen: 1, sheenRoughness: 0.55, sheenColor: new THREE.Color('#ffc2a8'),
-    clearcoat: 0.06, clearcoatRoughness: 0.45,
+    color: skinHex, roughness: 0.6, metalness: 0, vertexColors: true, specularIntensity: 0.32,
+    sheen: 1, sheenRoughness: 0.85, sheenColor: new THREE.Color('#ffd2c0'),
+    clearcoat: 0.01, clearcoatRoughness: 0.5,   // > 0 keeps USE_CLEARCOAT (wet line, nails, teeth set it per fragment)
   });
   const tone = new THREE.Color(skinHex);
   const lum = tone.r * 0.3 + tone.g * 0.59 + tone.b * 0.11;
   // freckles on the second-lightest tone only (a character trait, not noise on everyone)
   if (u.uFreckle && Math.abs(lum - 0.5) < 0.2 && tone.r > 0.8) u.uFreckle.value = 1;
   m.userData.iwLum = lum;
+  // scatter: how far each channel wraps past the terminator, and the colour light picks up inside the skin
+  const sssW = new THREE.Vector3(0.46, 0.22, 0.15).multiplyScalar(lerpN(1.0, 0.75, clampN((0.62 - lum) / 0.45)));
+  const sssTint = new THREE.Color(1.0, 0.38, 0.26).lerp(new THREE.Color(0.75, 0.3, 0.2), clampN((0.6 - lum) / 0.4));
   m.onBeforeCompile = (shader) => {
     for (const k of ['uHurt', 'uHurtSeed', 'uFlash', 'uMouth', 'uTeam', 'uFreckle']) shader.uniforms[k] = u[k];
+    shader.uniforms.uLid = u.uLid || { value: new THREE.Vector4() };
+    shader.uniforms.uMouth2 = u.uMouth2 || { value: new THREE.Vector4() };
     shader.uniforms.uSkinLum = { value: lum };
+    shader.uniforms.uSSSW = { value: sssW }; shader.uniforms.uSSSTint = { value: sssTint };
+    Object.assign(shader.uniforms, faceUniforms());
     inject(shader, {
-      vPars: bodyVPars + 'attribute vec3 aHead; varying vec3 vHead;', vBegin: bodyVBegin + 'vHead = aHead;',
-      fPars: bodyFPars + 'uniform vec4 uMouth; uniform vec3 uTeam; uniform float uFreckle; uniform float uSkinLum; varying vec3 vHead;' + FACE_GLSL,
+      vPars: bodyVPars + /* glsl */`
+        attribute vec3 aHead; attribute vec4 aFace; varying vec3 vHead; varying vec4 vFace; varying vec2 vIwUv;
+        uniform vec4 uLid; uniform vec4 uMouth; uniform vec4 uMouth2;
+        uniform vec3 uEyeC[2]; uniform mat3 uEyeM[2]; uniform mat3 uEyeMi[2];
+        uniform vec3 uMouthC; uniform vec3 uMouthU; uniform vec3 uMouthF; uniform float uMouthHW;`,
+      vBegin: bodyVBegin + 'vHead = aHead; vFace = aFace; vIwUv = uv; transformed = iwPos;',
+      fPars: bodyFPars + /* glsl */`
+        uniform vec4 uMouth; uniform vec4 uMouth2; uniform vec3 uTeam; uniform float uFreckle; uniform float uSkinLum;
+        uniform vec3 uSSSW; uniform vec3 uSSSTint; uniform vec3 uMouthC; uniform vec3 uMouthF;
+        varying vec3 vHead; varying vec4 vFace; varying vec2 vIwUv;
+        float iwSSS = 1.0; float iwThin = 0.0;` + FACE_GLSL,
       fColor: /* glsl */`
-        float iwVisor = 0.0; float iwVisorH = 0.0; float iwHairP = 0.0; float iwH = 0.0; float iwNail = 0.0; float iwMouthIn = 0.0; float iwAO = 1.0;
+        float iwVisor = 0.0; float iwHairP = 0.0; float iwH = 0.0; float iwNail = 0.0; float iwWet = 0.0; float iwTooth = 0.0; float iwAO = vFace.w; float iwInner = 0.0;
         float iwSub = floor(vEx + 0.5);
         // subtle skin mottling (breaks the plastic look up close; invisible at range)
         {
           float mott = iwFbm(vBindPos * 60.0);
           diffuseColor.rgb *= 1.0 + (mott - 0.5) * 0.06 * iwLod(vBindPos.y * 60.0, 1.0);
         }
-        if (iwSub > 0.5 && iwSub < 1.5) {        // fingernail
-          iwNail = 1.0;
+        if (iwSub > 0.5 && iwSub < 1.5) {                 // fingernail
+          iwNail = 1.0; iwSSS = 0.3;
           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(1.0, 0.86, 0.84), 0.45);
-        } else if (iwSub > 1.5 && iwSub < 2.5) { // inner ear: warmer, darker
-          diffuseColor.rgb *= vec3(1.0, 0.8, 0.78);
-          iwAO = 0.72;
+        } else if (iwSub > 1.5 && iwSub < 2.5) {          // (legacy) inner ear
+          diffuseColor.rgb *= vec3(1.0, 0.8, 0.76); iwThin = 1.0;
+        } else if (iwSub > 7.5 && iwSub < 8.5) {          // ear: thin → translucent against back light; the cup (uv.x) is flushed
+          diffuseColor.rgb *= mix(vec3(1.0, 0.95, 0.93), vec3(1.0, 0.8, 0.76), vIwUv.x); iwThin = mix(0.75, 1.0, vIwUv.x);
+        } else if (iwSub > 10.5 && iwSub < 11.5) {        // teeth: one smooth band, gaps drawn here
+          float g = abs(fract(vIwUv.x * 3.3 + 0.5) - 0.5);
+          float gap = (1.0 - smoothstep(0.015, 0.05, g)) * step(0.2, abs(vIwUv.x) * 3.3);
+          diffuseColor.rgb = vec3(0.96, 0.95, 0.92) * (1.0 - 0.18 * gap) * mix(0.82, 1.0, smoothstep(1.0, 0.6, abs(vIwUv.x)));
+          iwTooth = 1.0; iwSSS = 0.25;
+        } else if (iwSub > 11.5 && iwSub < 12.5) {        // tongue
+          float groove = exp(-pow(vIwUv.x / 0.12, 2.0));
+          diffuseColor.rgb = vec3(0.96, 0.44, 0.42) * (1.0 - 0.2 * groove) * (0.94 + 0.12 * iwNoise(vBindPos * 900.0));
+          iwWet = 0.7;
         }
-        {
-          float hl = length(vHead);
-          if (hl > 0.5) {
-            vec3 d = vHead / hl;
-            float az = atan(d.x, d.z), el = asin(clamp(d.y, -1.0, 1.0));
-            // ---- painted hairline under the cap edge (hides the cap/skin seam), soft shadow just below it
-            float hs = el - iwHairline(az) + 0.004;
-            float hw = max(fwidth(hs), 1e-4);
-            iwHairP = smoothstep(-hw, hw, hs);
-            float capShadow = smoothstep(-0.09, 0.0, hs) * (1.0 - iwHairP);
-            diffuseColor.rgb *= 1.0 - 0.22 * capShadow;
-            diffuseColor.rgb = mix(diffuseColor.rgb, uTeam * 0.55, iwHairP);
-            // ---- freckles across the nose bridge + cheeks
-            if (uFreckle > 0.5) {
-              vec2 fp = vec2(az, el + 0.12) * 42.0;
-              vec2 cell = floor(fp); vec2 fr = fract(fp) - 0.5;
-              float rnd = iwHash2(cell);
-              vec2 off = vec2(iwHash2(cell + 3.1), iwHash2(cell + 7.7)) - 0.5;
-              float region = exp(-pow((abs(az) - 0.3) / 0.28, 2.0) - pow((el + 0.14) / 0.1, 2.0));
-              float fd = length(fr - off * 0.5) - 0.13 * rnd;
-              float fk = iwFill(fd) * step(0.45, rnd) * region;
-              diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(0.78, 0.6, 0.5), fk * 0.7);
-            }
-            // ---- nose tip: slightly warmer
-            float nose = exp(-pow(az / 0.06, 2.0) - pow((el + 0.125) / 0.06, 2.0));
-            diffuseColor.rgb *= mix(vec3(1.0), vec3(1.0, 0.9, 0.88), nose * 0.6);
-            // ---- visor: raised, bevelled goggle mask
-            float sd = iwVisorSD(az, el);
-            float w = max(fwidth(sd), 1e-4);
-            iwVisor = smoothstep(-w, w, sd);
-            iwVisorH = smoothstep(0.0, 0.03, sd);
-            vec3 vc = mix(vec3(0.012, 0.014, 0.024), vec3(0.035, 0.042, 0.07), smoothstep(-0.1, 0.5, el));
-            float lip = smoothstep(0.034, 0.008, sd) * iwVisor;                  // rim band
-            float inner = smoothstep(0.05, 0.036, sd) * smoothstep(0.024, 0.036, sd); // fine inner groove
-            vc += vec3(0.075, 0.08, 0.11) * lip;
-            vc *= 1.0 - 0.45 * inner;
-            diffuseColor.rgb = mix(diffuseColor.rgb, vc, iwVisor);
-            // contact shadow on the skin right outside the mask edge
-            float ms = smoothstep(-0.035, 0.0, sd) * (1.0 - iwVisor);
-            diffuseColor.rgb *= 1.0 - 0.25 * ms;
-            iwH += iwVisorH * 0.0022 - inner * 0.0004;
-            // ---- mouth
-            float curve = uMouth.x, width = uMouth.y, open = uMouth.z, tilt = uMouth.w;
-            float ca = cos(tilt), sa = sin(tilt);
-            float mx = az * ca + (el + 0.45) * sa;
-            float my = -az * sa + (el + 0.45) * ca;
-            float mhw = 0.11 * width;
-            // closed mouth: tapered smile line with tucked corners and a soft lower-lip shadow
-            float xn = mx / max(mhw, 1e-3);
-            float ly = curve * 0.05 * (mx / 0.11) * (mx / 0.11);
-            float along = max(abs(mx) - mhw, 0.0);
-            float dl = length(vec2(along * 1.3, my - ly));
-            float taper = mix(1.0, 0.45, smoothstep(0.55, 1.05, abs(xn)));
-            float lw = max(fwidth(dl), 1e-4);
-            float closedK = 1.0 - smoothstep(0.15, 0.4, open);
-            float line = (1.0 - smoothstep(0.0105 * taper - lw, 0.0105 * taper + lw, dl)) * closedK * step(0.001, width);
-            // corner tucks (short upward ticks when smiling)
-            float tuckK = clamp(curve, 0.0, 1.2) * closedK;
-            for (int s = -1; s <= 1; s += 2) {
-              vec2 c0 = vec2(float(s) * mhw, ly * 0.0 + curve * 0.05 * (mhw / 0.11) * (mhw / 0.11));
-              float dt = iwSdSeg(vec2(mx, my), c0, c0 + vec2(float(s) * 0.018, 0.016));
-              line = max(line, (1.0 - smoothstep(0.0055 - lw, 0.0055 + lw, dt)) * tuckK);
-            }
-            float lowerLip = exp(-pow(mx / (mhw * 0.7), 2.0) - pow((my - ly + 0.03) / 0.014, 2.0)) * closedK;
-            diffuseColor.rgb *= 1.0 - 0.08 * lowerLip;
-            // open mouth: D shape (flat-ish top, round bottom), throat gradient, teeth, tongue
-            float ow = 0.13 * width * (0.85 + 0.15 * open);
-            float u2 = mx / max(ow, 1e-3);
-            float top = 0.012 + max(curve, 0.0) * 0.03 * u2 * u2;
-            float bot = -open * 0.13 * sqrt(max(0.0, 1.0 - u2 * u2)) * (curve < 0.0 ? 0.7 : 1.0) + top;
-            float inside = step(abs(u2), 1.0) * smoothstep(bot - lw, bot + lw, my) * (1.0 - smoothstep(top - lw, top + lw, my)) * step(0.02, open);
-            float depth = clamp((top - my) / max(top - bot, 1e-3), 0.0, 1.0);
-            vec3 mcol = mix(vec3(0.34, 0.05, 0.08), vec3(0.16, 0.02, 0.05), smoothstep(0.1, 0.6, depth) * (1.0 - abs(u2) * 0.5));
-            float tongue = 1.0 - smoothstep(0.8, 1.0, length(vec2(u2 / 0.62, (my - bot - 0.022) / 0.034)));
-            float groove = exp(-pow(u2 / 0.06, 2.0)) * tongue;
-            mcol = mix(mcol, vec3(0.93, 0.42, 0.47) * (1.0 - 0.18 * groove), tongue * step(0.3, open));
-            float teeth = smoothstep(top - 0.02 - lw, top - 0.02 + lw, my) * step(abs(u2), 0.78);
-            float gap = iwStroke(fract(u2 * 2.2 + 0.5) - 0.5, 0.012) * 0.25;
-            mcol = mix(mcol, vec3(0.97, 0.96, 0.94) * (1.0 - gap), teeth);
-            float edge = (1.0 - smoothstep(0.0, 0.012, min(my - bot, top - my))) * inside;
-            mcol *= 1.0 - 0.35 * edge;
-            iwMouthIn = inside;
-            diffuseColor.rgb = mix(diffuseColor.rgb, min(vec3(0.24, 0.05, 0.07), diffuseColor.rgb * vec3(0.42, 0.3, 0.3)), line);
-            diffuseColor.rgb = mix(diffuseColor.rgb, mcol, inside);
-            iwH -= inside * 0.0012 + line * 0.0003;
+        float hl = length(vHead);
+        if (hl > 0.5 && iwSub < 0.5) {
+          vec3 d = vHead / hl;
+          float az = atan(d.x, d.z), el = asin(clamp(d.y, -1.0, 1.0));
+          float fw = max(fwidth(el), 1e-4);
+          // ---- painted hairline under the cap edge (hides the cap/skin seam), soft shadow just below it
+          float hs = el - iwHairline(az) + 0.004;
+          float hw = max(fwidth(hs), 1e-4);
+          iwHairP = smoothstep(-hw, hw, hs);
+          float capShadow = smoothstep(-0.09, 0.0, hs) * (1.0 - iwHairP);
+          diffuseColor.rgb *= 1.0 - 0.22 * capShadow;
+          diffuseColor.rgb = mix(diffuseColor.rgb, uTeam * 0.55, iwHairP);
+          // ---- blush: soft warm gradient over the cheek apples (+ uMouth2.w flush), stronger on fair skin
+          float bl = exp(-pow((abs(az) - 0.6) / 0.2, 2.0) - pow((el + 0.3) / 0.13, 2.0));
+          float blushK = bl * mix(0.3, 0.12, smoothstep(0.35, 0.8, 1.0 - uSkinLum)) * (1.0 + 1.5 * clamp(uMouth2.w, 0.0, 1.0));
+          diffuseColor.rgb *= mix(vec3(1.0), vec3(1.0, 0.72, 0.72), blushK);
+          // ---- freckles across the nose bridge + cheeks
+          if (uFreckle > 0.5) {
+            vec2 fp = vec2(az, el + 0.12) * 42.0;
+            vec2 cell = floor(fp); vec2 fr = fract(fp) - 0.5;
+            float rnd = iwHash2(cell);
+            vec2 off = vec2(iwHash2(cell + 3.1), iwHash2(cell + 7.7)) - 0.5;
+            float region = exp(-pow((abs(az) - 0.3) / 0.28, 2.0) - pow((el + 0.14) / 0.1, 2.0));
+            float fd = length(fr - off * 0.5) - 0.13 * rnd;
+            float fk = iwFill(fd) * step(0.45, rnd) * region;
+            diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(0.78, 0.6, 0.5), fk * 0.7);
+          }
+          // ---- nose tip + nostril rims: slightly warmer
+          float nose = exp(-pow(az / 0.06, 2.0) - pow((el + 0.13) / 0.06, 2.0)) + 0.6 * exp(-pow((abs(az) - 0.045) / 0.03, 2.0) - pow((el + 0.165) / 0.025, 2.0));
+          diffuseColor.rgb *= mix(vec3(1.0), vec3(1.0, 0.88, 0.86), nose * 0.5);
+          // ---- lips: a faint rosy tint, darker at the line and in the corners
+          float mEl = ${FACE_SHADER.mouthEl.toFixed(4)}, mAz = ${FACE_SHADER.mouthAz.toFixed(4)};
+          float lipX = 1.0 - smoothstep(mAz * 0.64, mAz * 1.14, abs(az));
+          float lip = lipX * smoothstep(mEl - 0.06, mEl - 0.032, el) * (1.0 - smoothstep(mEl + 0.012, mEl + 0.032, el));
+          diffuseColor.rgb *= mix(vec3(1.0), mix(vec3(0.95, 0.8, 0.8), vec3(0.98, 0.88, 0.85), smoothstep(0.35, 0.8, 1.0 - uSkinLum)), lip * 0.8);
+          // lip line: a thin dark stroke on both lip edges (rest-space, so it rides the smile/frown and parts when open)
+          float lx = abs(az) / mAz;
+          float lineW = 0.0038 * mix(1.0, 0.5, smoothstep(0.6, 1.05, lx));
+          float lineK = iwStroke(el - mEl + 0.002, lineW) * (1.0 - smoothstep(0.98, 1.12, lx)) * (1.0 - smoothstep(0.04, 0.2, uMouth.z)); // the opening takes over
+          diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(0.42, 0.26, 0.28), lineK * 0.85);
+          // ---- mask: pigment in the skin (not a lacquered band): near-black with a faint cool tint, satin, a soft
+          //      ~1.5 mm feathered edge (plus AA), a whisper of a recess in the geometry, and a little of the skin's scatter
+          float sd = iwVisorSD(az, el);
+          float w = max(fwidth(sd), 1e-4);
+          iwVisor = smoothstep(-0.008 - w, 0.008 + w, sd);
+          vec3 vc = mix(vec3(0.012, 0.0135, 0.02), vec3(0.018, 0.021, 0.032), smoothstep(-0.1, 0.5, el));
+          diffuseColor.rgb = mix(diffuseColor.rgb, vc, iwVisor);
+          iwSSS *= 1.0 - 0.88 * iwVisor;
+          // ---- lid margin (uv.x: rolls under the eyeball): wet, a touch warmer than the lacquer
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.06, 0.035, 0.045), vIwUv.x);
+          iwWet = max(iwWet, vIwUv.x);
+          // ---- inner lip → mouth cavity (uv.y), darkening with depth behind the lips
+          if (vIwUv.y > 0.001) {
+            float dz = dot(uMouthC - vBindPos, uMouthF);
+            vec3 c = mix(vec3(0.8, 0.36, 0.38), vec3(0.3, 0.04, 0.05), smoothstep(0.003, 0.011, dz));
+            c *= mix(1.0, 0.45, smoothstep(0.011, 0.026, dz));
+            diffuseColor.rgb = mix(diffuseColor.rgb, c, vIwUv.y);
+            iwWet = max(iwWet, smoothstep(0.55, 1.0, vIwUv.y) * 0.7 * smoothstep(0.04, 0.25, uMouth.z)); // matte seam when closed
+            iwSSS *= 1.0 - 0.4 * vIwUv.y; iwVisor *= 1.0 - vIwUv.y; iwInner = vIwUv.y;
           }
         }
       ` + HURT_FRAG,
-      fRough: 'roughnessFactor = mix(roughnessFactor, 0.16, iwHurtM); roughnessFactor = mix(roughnessFactor, 0.1, iwVisor); roughnessFactor = mix(roughnessFactor, 0.35, iwHairP); roughnessFactor = mix(roughnessFactor, 0.22, iwNail); roughnessFactor = mix(roughnessFactor, 0.3, iwMouthIn);',
+      fRough: 'roughnessFactor = mix(roughnessFactor, 0.16, iwHurtM); roughnessFactor = mix(roughnessFactor, 0.48, iwVisor); roughnessFactor = mix(roughnessFactor, 0.35, iwHairP); roughnessFactor = mix(roughnessFactor, 0.22, iwNail); roughnessFactor = mix(roughnessFactor, 0.14, iwWet); roughnessFactor = mix(roughnessFactor, 0.28, iwTooth);',
       fNormal: 'normal = iwBumpN(normal, iwH, -vViewPosition);',
       fEmissive: 'totalEmissiveRadiance += uFlash;',
       fLights: /* glsl */`
         #ifdef USE_CLEARCOAT
-          material.clearcoat = mix(material.clearcoat, 1.0, max(iwVisor, iwNail * 0.6));
-          material.clearcoatRoughness = mix(material.clearcoatRoughness, 0.03, iwVisor);
+          material.clearcoat = max(iwNail * 0.6, max(iwWet * 0.8, iwTooth * 0.5));  // wet line, nails, teeth only (mask is satin)
+          material.clearcoat *= mix(1.0, iwAO * iwAO, max(iwInner, iwTooth));   // no sky mirrored inside the mouth
+          material.clearcoatRoughness = mix(0.45, 0.06, iwWet);
         #endif
         #ifdef USE_SHEEN
-          material.sheenColor *= (1.0 - iwVisor) * (1.0 - iwHairP) * mix(0.55, 0.3, uSkinLum);
+          material.sheenColor *= (1.0 - 0.85 * iwVisor) * (1.0 - iwHairP) * (1.0 - iwWet) * (1.0 - iwTooth) * mix(0.4, 0.22, uSkinLum);
         #endif`,
-      fAO: 'reflectedLight.indirectDiffuse *= iwAO;',
+      fAO: 'reflectedLight.indirectDiffuse *= iwAO; reflectedLight.indirectSpecular *= mix(1.0, iwAO, 0.8);',
     });
-    shader.fragmentShader = shader.fragmentShader.replace('#include <clearcoat_normal_fragment_maps>', '#include <clearcoat_normal_fragment_maps>\n clearcoatNormal = normal;');
+    // vertex: lids + mouth (before skinning; normals too, so the lids shade as they slide)
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <skinning_pars_vertex>', '#include <skinning_pars_vertex>\n' + LID_BONE_GLSL)
+      .replace('#include <beginnormal_vertex>', /* glsl */`#include <beginnormal_vertex>
+        vec3 iwPos = position;
+        if (aFace.x + aFace.y > 1e-4) {
+          int si = position.x >= 0.0 ? 0 : 1;
+          vec2 cl = iwLidClose(si, uLid);
+          float a = aFace.x * cl.x - aFace.y * cl.y;             // + rotates down (upper lid), − up (lower lid)
+          mat3 M = uEyeM[si], Mi = uEyeMi[si]; vec3 C = uEyeC[si];
+          vec3 s = Mi * (position - C);
+          float ca = cos(a), sa = sin(a);
+          iwPos = C + M * vec3(s.x, ca * s.y - sa * s.z, sa * s.y + ca * s.z);
+          vec3 nu = transpose(M) * objectNormal;
+          objectNormal = normalize(transpose(Mi) * vec3(nu.x, ca * nu.y - sa * nu.z, sa * nu.y + ca * nu.z));
+        }
+        if (abs(aFace.z) > 1e-4) {
+          float w = abs(aFace.z), up = aFace.z > 0.0 ? 1.0 : 0.0;
+          vec3 d = iwPos - uMouthC;
+          float mx = d.x, my = dot(d, uMouthU);
+          float xn = clamp(mx / uMouthHW, -1.35, 1.35), xw = min(xn * xn, 1.3);
+          float band = exp(-my * my / 1.6e-4);
+          float curve = clamp(uMouth.x, -1.3, 1.3), width = clamp(uMouth.y, 0.2, 1.5), open = clamp(uMouth.z, 0.0, 1.0);
+          float pucker = clamp(uMouth2.z, 0.0, 1.0) + clamp((0.8 - width) * 1.2, 0.0, 0.6) * step(curve, -0.6);
+          vec3 dp = vec3(mx * ((width - 1.0) * 0.75 - 0.3 * pucker + 0.2 * open), 0.0, 0.0);   // open → a wider D
+          dp += uMouthU * (curve * 0.0062 * xw * mix(0.4, 1.0, band) + uMouth.w * mx * 0.45);   // smile / frown, smirk
+          dp -= uMouthF * max(curve, 0.0) * 0.0017 * xw * band;                                // smiling corners dig in
+          dp += uMouthU * up * open * 0.0024 * max(0.0, 1.0 - xw) * band;                     // upper lip lifts when open
+          dp += uMouthU * up * clamp(uMouth2.y, 0.0, 1.0) * 0.003 * smoothstep(0.1, 0.8, xn) * band; // sneer (left side)
+          dp += uMouthF * pucker * 0.005 * max(0.0, 1.0 - xw) * band;                           // lips push forward
+          iwPos += dp * w;
+        }`);
+    // stylised SSS: replace the Lambert lobe of the direct light with a per-channel wrapped profile + ear translucency
+    shader.fragmentShader = shader.fragmentShader.replace('#include <lights_physical_pars_fragment>', /* glsl */`#include <lights_physical_pars_fragment>
+      void RE_Direct_IwSkin(const in IncidentLight directLight, const in vec3 geometryPosition, const in vec3 geometryNormal, const in vec3 geometryViewDir, const in vec3 geometryClearcoatNormal, const in PhysicalMaterial material, inout ReflectedLight reflectedLight) {
+        vec3 dd = reflectedLight.directDiffuse;
+        RE_Direct_Physical(directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight);
+        if (iwSSS > 0.001) {
+          float ndl = dot(geometryNormal, directLight.direction);
+          vec3 w = uSSSW * iwSSS;
+          vec3 lam = vec3(clamp(ndl, 0.0, 1.0));
+          vec3 wrapD = clamp((vec3(ndl) + w) / (1.0 + w), 0.0, 1.0);
+          wrapD = lam + max(wrapD - lam, 0.0) * (1.0 - smoothstep(0.05, 0.55, ndl));  // lit side stays neutral
+          vec3 halfDir = normalize(directLight.direction + geometryViewDir);
+          vec3 F = F_Schlick(material.specularColor, material.specularF90, clamp(dot(geometryViewDir, halfDir), 0.0, 1.0));
+          vec3 base = directLight.color * BRDF_Lambert(material.diffuseContribution) * (1.0 - F);
+          // terminator band picks up the scatter tint (red light that travelled under the skin)
+          float band = clamp(1.0 - abs(ndl) * 3.2, 0.0, 1.0) * iwSSS;
+          vec3 sss = wrapD * mix(vec3(1.0), uSSSTint * 1.6, band * 0.4);
+          reflectedLight.directDiffuse = dd + base * mix(lam, sss, 0.85);
+          // thin parts glow when lit from behind
+          float back = pow(clamp(dot(geometryViewDir, -directLight.direction), 0.0, 1.0), 2.5);
+          reflectedLight.directDiffuse += directLight.color * material.diffuseContribution * uSSSTint * (iwThin * back * 0.55 + iwThin * 0.12 * clamp(-ndl + 0.3, 0.0, 1.0));
+        }
+      }
+      #undef RE_Direct
+      #define RE_Direct RE_Direct_IwSkin`)
+      .replace('#include <clearcoat_normal_fragment_maps>', '#include <clearcoat_normal_fragment_maps>\n#ifdef USE_CLEARCOAT\n clearcoatNormal = normal;\n#endif');   // clearcoat 0 → no USE_CLEARCOAT (LIFE fix)
   };
-  m.customProgramCacheKey = () => 'iw-skin3';
+  m.customProgramCacheKey = () => 'iw-skin4';
   return m;
 }
+const clampN = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const lerpN = (a, b, t) => a + (b - a) * t;
 
 // ================================================================================================
 // CLOTH — tee, shorts, socks, sneakers, tank harness. One program; per-vertex colour source (aEx),
@@ -319,9 +411,21 @@ vec2 iwEmblem(vec2 q, float R) {
 
 const CLOTH_GLSL = /* glsl */`
 uniform vec3 uTeam; uniform vec3 uShirt; uniform vec3 uShorts; uniform vec3 uShoe; uniform vec3 uSole; uniform vec3 uSock; uniform vec3 uStrap; uniform float uPattern;
-varying vec3 vCloth; varying vec2 vIwUv;
+varying vec3 vCloth; varying vec2 vIwUv; varying float vOcc;
 float iwLum(vec3 c){ return dot(c, vec3(0.299, 0.587, 0.114)); }
 vec3 iwContrast(vec3 c){ return iwLum(c) > 0.42 ? c * 0.74 : c * 1.55 + 0.05; }
+// ---- tee fine creases: complements the sculpted fold field of character-outfit.js ------------------------
+float iwTeeCrease(vec3 p, float th) {
+  float ax = abs(p.x), h = 0.0;
+  float side = pow(abs(sin(th * 6.2831)), 2.0);
+  float wy = (p.y - 0.705) / 0.0105 + 0.6 * sin(th * 6.2831 * 9.0 + p.y * 40.0);
+  h += 0.00032 * side * exp(-pow((p.y - 0.765) / 0.035, 2.0)) * (0.5 + 0.5 * sin(wy * 6.2831));
+  vec2 q = vec2(ax - 0.114, p.y - 0.884);
+  float r = length(q), ang = atan(q.y, -q.x);
+  h += 0.00011 * sin(ang * 17.0 + 1.3 + (p.z > 0.0 ? 0.0 : 2.1) + 2.5 * iwNoise(vec3(ang * 3.0, r * 60.0, p.z * 20.0))) * exp(-pow(r / 0.045, 2.0)) * smoothstep(0.006, 0.02, r) * (0.4 + 0.6 * iwNoise(p * 90.0));
+  h += 0.00028 * sin(th * 6.2831 * 23.0 + 2.0 * sin(th * 30.0)) * (1.0 - smoothstep(0.698, 0.726, p.y));
+  return h;
+}
 // ---- tee graphics -------------------------------------------------------------------------------
 float iwShirtPattern(vec3 p) {
   float ax = abs(p.x);
@@ -490,11 +594,11 @@ export function makeClothMaterial(u) {
   m.onBeforeCompile = (shader) => {
     for (const k of ['uHurt', 'uHurtSeed', 'uFlash', 'uTeam', 'uShirt', 'uShorts', 'uShoe', 'uSole', 'uSock', 'uStrap', 'uPattern']) shader.uniforms[k] = u[k];
     inject(shader, {
-      vPars: bodyVPars + 'attribute vec3 aCloth; varying vec3 vCloth; varying vec2 vIwUv;',
-      vBegin: bodyVBegin + 'vCloth = aCloth; vIwUv = uv;',
+      vPars: bodyVPars + 'attribute vec3 aCloth; varying vec3 vCloth; varying vec2 vIwUv; attribute float aOcc; varying float vOcc;',
+      vBegin: bodyVBegin + 'vCloth = aCloth; vIwUv = uv; vOcc = aOcc;',
       fPars: bodyFPars + CLOTH_GLSL,
       fColor: /* glsl */`
-        float iwH = 0.0; float iwAO = 1.0; float iwCls = floor(vCloth.y + 0.5); float iwPart = floor(vCloth.x + 0.5);
+        float iwH = 0.0; float iwAO = 1.0 - clamp(vOcc, 0.0, 0.95); float iwCls = floor(vCloth.y + 0.5); float iwPart = floor(vCloth.x + 0.5);
         float iwGloss = 0.0; float iwShine = 0.0; // extra clearcoat / sheen tweaks from decorations
         {
           float slot = floor(vEx + 0.5);
@@ -535,10 +639,9 @@ export function makeClothMaterial(u) {
             float st2 = (iwStroke(hy - 0.013, 0.0005) + iwStroke(hy - 0.019, 0.0005)) * iwDash(th * circ, 0.0055, 0.62);
             base = mix(base, base * 0.8, st2 * iwLod(th * circ, 0.0055));
             iwH += 0.0003 * st2 - 0.0006 * exp(-pow((hy - 0.024) / 0.002, 2.0));
-            // gentle drape folds toward the hem + fabric slack at the waist
-            float drape = sin(th * 6.2831 * 7.0 + 1.3 * sin(th * 6.2831 * 3.0)) * smoothstep(0.8, 0.705, p.y);
-            iwH += 0.0016 * drape;
-            iwH += 0.0009 * sin(p.y * 180.0 + 3.0 * sin(th * 25.0)) * smoothstep(0.8, 0.76, p.y) * smoothstep(0.7, 0.74, p.y);
+            // fine creases riding on the sculpted folds (geometry carries the big ones): waist compression, underarm
+            // crease fans, short vertical hem creases — per pixel, faded with footprint
+            iwH += iwTeeCrease(p, th) * iwLod(p.y, 0.012);
             // chest emblem (pattern-dependent placement)
             if (p.z > 0.0) {
               vec2 q; float R; float on = 1.0;
@@ -614,7 +717,7 @@ export function makeClothMaterial(u) {
             float th = uv.x;
             // side seams + a team side stripe on some outfits
             float dx0 = (th - 0.25) * circ, dx1 = (th - 0.75) * circ;
-            float dxs = iwPart == 4.0 ? min(abs(dx0), abs(dx1)) : abs(dx0);   // legs: outer seam only (0.75 = inseam)
+            float dxs = iwPart == 4.0 ? min(abs(dx0), abs(dx1)) : abs(th - 0.5) * circ;   // legs: uv.x 0 = inseam, 0.5 = outer seam
             iwH -= 0.0005 * exp(-pow(dxs / 0.0016, 2.0));
             float stripe = 0.0; vec3 stripeC = uTeam;
             if (uPattern > 0.5 && uPattern < 2.5) stripe = iwStroke(dxs, 0.0065);
@@ -659,7 +762,7 @@ export function makeClothMaterial(u) {
               base = mix(base, base * 0.75, ws);
             } else {
               // leg: inseam
-              float dxi = abs((th - 0.75) * circ);
+              float dxi = min(th, 1.0 - th) * circ;
               iwH -= 0.0004 * exp(-pow(dxi / 0.0015, 2.0));
               // hem stitch above the cuff
               float L = vCloth.z;
@@ -675,61 +778,66 @@ export function makeClothMaterial(u) {
             float stripes = iwBand(s, 0.018, 0.026) + iwBand(s, 0.033, 0.041);
             base = mix(base, uTeam, stripes);
             iwH += 0.0012 * sin(s * 190.0 + uv.x * 18.0) * smoothstep(0.05, 0.1, s) * smoothstep(0.14, 0.1, s); // scrunch
-          } else if (iwPart == 7.0 || iwPart == 20.0) { // SHOE UPPER: uv = (phi/2pi from toe, t sole->collar); p = bind pos
+          } else if (iwPart == 7.0) { // SHOE UPPER (base layer): uv = (phi/2pi from the toe, t sole->collar, > 1 = lining)
             float phi = uv.x, t = uv.y;
-            float lat = vCloth.z; // +1 lateral side is +x for the left shoe
-            float front = cos(phi * 6.2831);   // 1 at the toe, -1 at the heel
-            float side = sin(phi * 6.2831);    // +-1 at the sides
-            // overlay panels: toe cap + heel counter in the contrast colour, stitched edges
-            float toeCapD = (0.62 - front) - 0.18 * t;           // < 0 inside
-            float heelD = (front + 0.55) + 0.25 * (t - 0.2);     // < 0 inside
-            vec3 c2 = iwContrast(uShoe);
-            float toeM = iwFill(toeCapD * 0.05), heelM = iwFill(heelD * 0.05);
-            base = mix(base, c2, max(toeM, heelM));
-            float edgeS = iwStroke(toeCapD * 0.05 + 0.0025, 0.0004) + iwStroke(heelD * 0.05 + 0.0025, 0.0004);
-            base = mix(base, base * 0.7, edgeS * iwDash(phi * 0.62, 0.004, 0.62) * iwLod(phi * 0.62, 0.004));
-            iwH += 0.0006 * (toeM + heelM) - 0.0004 * (iwStroke(toeCapD * 0.05, 0.0006) + iwStroke(heelD * 0.05, 0.0006));
-            // side logo: a team-colour wave stripe (both sides)
-            float wx = front * 0.5 + 0.12;                       // along the shoe
-            float wy = t - 0.42 - 0.12 * sin(wx * 9.0);
-            float logo = step(0.2, abs(side)) * iwFill((abs(wy) - 0.075 * (1.0 - smoothstep(-0.2, 0.45, abs(wx - 0.06)))) * 0.06);
-            base = mix(base, uTeam, logo);
-            iwH += 0.00045 * logo;
-            iwShine += 0.5 * logo;
-            // perforations on the toe box (vamp top)
-            float perfZ = step(0.55, front) * step(0.3, t);
-            vec2 pp = vec2(p.x, p.z) * 260.0; vec2 pc = fract(pp) - 0.5;
-            float perf = iwFill(length(pc) - 0.18) * perfZ * (1.0 - toeM) * iwLod(p.z * 260.0, 1.0);
-            iwAO *= 1.0 - 0.5 * perf; iwH -= 0.0002 * perf;
-            // leather grain
-            iwH += 0.00012 * (iwNoise(p * 900.0) - 0.5) * iwLod(p.z * 900.0, 1.0);
-            // creasing across the vamp
-            iwH += 0.0005 * sin(t * 70.0) * smoothstep(0.2, 0.42, front) * smoothstep(0.78, 0.55, front) * smoothstep(0.3, 0.45, t) * smoothstep(0.9, 0.7, t);
-            iwAO *= mix(0.72, 1.0, smoothstep(0.0, 0.16, t));   // contact darkening at the sole line
-          } else if (iwPart == 8.0) { // MIDSOLE: uv = (phi, h 0..1)
-            float phi = uv.x, h = uv.y;
             float front = cos(phi * 6.2831);
-            // sculpted groove line + team accent pinstripe
-            iwH -= 0.0009 * exp(-pow((h - 0.46 - 0.12 * front) / 0.07, 2.0));
-            float pin = iwStroke(h - 0.72, 0.06) * step(abs(front), 0.95);
+            // perforated toe box (vamp top, between the mudguard and the throat)
+            float perfZ = smoothstep(0.72, 0.82, front) * smoothstep(0.47, 0.51, t) * smoothstep(0.62, 0.58, t);
+            vec2 pp = vec2(p.x, p.z) * 260.0; pp.x += 0.5 * step(0.5, fract(pp.y * 0.5)); vec2 pc = fract(pp) - 0.5;
+            float perf = iwFill(length(pc) - 0.16) * perfZ * iwLod(p.z * 260.0, 1.0) * iwLod(p.x * 260.0, 1.0);
+            iwAO *= 1.0 - 0.55 * perf; iwH -= 0.00018 * perf;
+            // fine pebbled grain, faded with pixel footprint (no shimmer)
+            iwH += 0.00005 * (iwNoise(p * 1400.0) - 0.5) * iwLod(p.z * 1400.0, 2.0);
+            iwAO *= mix(0.7, 1.0, smoothstep(0.0, 0.14, t));   // contact darkening at the sole line
+            if (t > 1.001) iwAO *= 0.55;                       // lining inside the collar
+          } else if (iwPart == 20.0) { // SHOE OVERLAYS (vCloth.z: 0 mudguard, 1 heel counter, 2 eyestay, 3 side panel); uv = patch (u, v)
+            float ov = floor(vCloth.z + 0.5);
+            vec2 q = uv;
+            // twin-needle stitching inset from the free edges
+            float st = 0.0;
+            if (ov < 0.5) st = (iwStroke(q.y - 0.86, 0.018) + iwStroke(q.y - 0.79, 0.018)) * iwDash(q.x * 0.14, 0.0035, 0.6);
+            else if (ov < 1.5) st = iwStroke(q.y - 0.88, 0.02) * iwDash(q.x * 0.12, 0.0035, 0.6);
+            else if (ov < 2.5) st = (iwStroke(q.x - 0.84, 0.03) + iwStroke(q.x - 0.15, 0.03)) * iwDash(q.y * 0.06, 0.0035, 0.6);
+            else st = (iwStroke(q.y - 0.8, 0.045) + iwStroke(q.y - 0.2, 0.045)) * iwDash(q.x * 0.1, 0.0035, 0.6) * step(0.06, q.x) * step(q.x, 0.97);
+            st = clamp(st, 0.0, 1.0) * step(0.05, q.y) * iwLod(q.x * 0.1, 0.0035);
+            base = mix(base, base * 0.62 + 0.04, st * 0.9);
+            iwH += 0.00018 * st;
+            iwH += 0.00004 * (iwNoise(p * 1600.0) - 0.5) * iwLod(p.z * 1600.0, 2.0);
+            if (ov > 2.5) iwShine += 0.45;                     // glossy synthetic side panel
+          } else if (iwPart == 8.0) { // MIDSOLE / cupsole wall: uv = (phi, h 0..1)
+            float phi = uv.x, h = uv.y;
+            float front = cos(phi * 6.2831), side = sin(phi * 6.2831);
+            // thread in the sculpted stitch channel (h = 0.64)
+            float st = iwStroke(h - 0.64, 0.035) * iwDash(phi * 0.62, 0.0042, 0.62) * iwLod(phi * 0.62, 0.0042);
+            base = mix(base, base * 0.62 + vec3(0.02), st);
+            iwH += 0.00018 * st;
+            // team pinstripe near the top edge
+            float pin = iwStroke(h - 0.82, 0.035) * step(abs(front), 0.96);
             base = mix(base, uTeam, pin * 0.95);
+            // fine horizontal sidewall ribs (cupsole texture) below the channel
+            iwH += 0.00016 * sin(h * 6.2831 * 9.0) * smoothstep(0.08, 0.2, h) * smoothstep(0.58, 0.5, h);
             // heel window (team) on both sides
-            float side = sin(phi * 6.2831);
-            float win = iwSdBox(vec2(front + 0.62, h - 0.4), vec2(0.18, 0.2), 0.09);
+            float win = iwSdBox(vec2(front + 0.64, h - 0.34), vec2(0.16, 0.14), 0.08);
             float wm = iwFill(win * 0.05) * step(0.3, abs(side));
             base = mix(base, uTeam * 0.85, wm);
-            iwH -= 0.0006 * wm; iwShine += wm;
-            // foam micro texture
-            iwH += 0.0001 * (iwNoise(p * 700.0) - 0.5) * iwLod(p.z * 700.0, 1.0);
-          } else if (iwPart == 9.0) { // OUTSOLE: uv = foot-local (x, z) ; tread on the bottom
+            iwH -= 0.0005 * wm; iwShine += wm;
+            // foam micro texture + grime near the ground and scuffs on the toe
+            iwH += 0.00008 * (iwNoise(p * 700.0) - 0.5) * iwLod(p.z * 700.0, 1.0);
+            float grime = (1.0 - smoothstep(0.0, 0.35, h)) * (0.55 + 0.45 * iwFbm(p * 90.0));
+            float scuff = smoothstep(0.62, 0.8, iwFbm(p * 140.0 + 3.0)) * smoothstep(0.3, 0.9, front);
+            base *= 1.0 - 0.13 * grime - 0.1 * scuff;
+          } else if (iwPart == 9.0) { // OUTSOLE: uv = foot-local (x, z)
             vec2 f = uv;
+            float edgeZone = step(0.5, vCloth.z);
+            // herringbone traction pattern on the bottom
             float herr = abs(fract(f.y * 55.0 + abs(f.x) * 22.0) - 0.5);
             float lug = smoothstep(0.18, 0.26, herr);
-            float edgeZone = step(0.5, vCloth.z);
             iwH += 0.0012 * lug * (1.0 - edgeZone) * iwLod(f.y * 55.0, 1.0);
-            iwAO *= mix(0.6, 1.0, lug);
-            // siping on the side wall
-            iwH += 0.0005 * edgeZone * step(0.5, fract(atan(f.x, f.y) * 12.0));
+            iwAO *= mix(0.6, 1.0, mix(lug, 1.0, edgeZone));
+            // worn rubber: glazed at the toe + heel strike, dust on the wall
+            float wear = smoothstep(0.05, 0.11, f.y) + smoothstep(-0.03, -0.07, f.y);
+            base = mix(base, base * 1.35 + 0.04, 0.35 * wear * (1.0 - edgeZone) * lug);
+            base = mix(base, base * 0.8 + vec3(0.03, 0.028, 0.025), edgeZone * (0.4 + 0.6 * iwFbm(p * 120.0)) * 0.5);
           } else if (iwPart == 10.0) { // STRAP webbing: uv = (along m, across -1..1)
             float edge = abs(uv.y);
             float st = iwStroke(edge - 0.72, 0.035) * iwDash(uv.x, 0.005, 0.62);
@@ -772,13 +880,16 @@ export function makeClothMaterial(u) {
           }
 
           // ---------------- material-class micro detail ----------------
-          if (iwCls == 0.0) {        // jersey knit: fine interlocked loops
-            vec3 q = p * 1100.0;
-            float k = sin(q.x + q.z) * sin(q.y * 1.4);
-            iwH += 0.00006 * k * iwLod(p.y * 1100.0, 6.2831);
-          } else if (iwCls == 1.0) { // twill: diagonal wales
-            float k = sin((p.y * 0.9 + (p.x + p.z) * 0.6) * 1500.0);
-            iwH += 0.00007 * k * iwLod(p.y * 1500.0, 6.2831);
+          if (iwCls == 0.0) {        // jersey knit: columns of tiny V loops (~1.1 mm wales), gone before it can shimmer
+            float wale = (atan(p.x, p.z + 0.012) * 0.105 + p.x * 0.0) * 900.0, course = p.y * 1150.0;
+            float v = abs(fract(wale) - 0.5) * 2.0;
+            float k = sin((course + v * 0.9) * 6.2831);
+            iwH += 0.000028 * k * iwLod(course, 1.0) * iwLod(wale, 1.0);
+          } else if (iwCls == 1.0) { // twill: fine 45-degree wales (~1 mm) over a slubby yarn, faded with footprint
+            float w = (p.y * 0.8 + (p.x + p.z) * 0.6) * 6400.0;
+            float k = sin(w + 1.3 * iwNoise(p * 420.0));
+            iwH += 0.000035 * k * iwLod(w, 6.2831);
+            iwH += 0.00004 * (iwNoise(p * 260.0) - 0.5) * iwLod(p.y * 260.0, 1.0);
           } else if (iwCls == 8.0) { // webbing: cross ribs
             float k = sin(uv.x * 2600.0);
             iwH += 0.00004 * k * iwLod(uv.x * 2600.0, 6.2831);
@@ -826,10 +937,10 @@ export function makeClothMaterial(u) {
           #endif
         }
       `,
-      fAO: 'reflectedLight.indirectDiffuse *= iwAO; reflectedLight.directDiffuse *= mix(1.0, iwAO, 0.5);',
+      fAO: 'reflectedLight.indirectDiffuse *= iwAO; reflectedLight.directDiffuse *= mix(1.0, iwAO, 0.35); reflectedLight.indirectSpecular *= mix(1.0, iwAO, 0.7);',
     });
   };
-  m.customProgramCacheKey = () => 'iw-cloth3';
+  m.customProgramCacheKey = () => 'iw-cloth4';
   return m;
 }
 
@@ -908,24 +1019,68 @@ void iwHatShade(float cls, vec2 uv, vec3 bp, inout vec3 col, inout float h, inou
 }
 `;
 
+// ================================================================================================
+// GUMMY INK — the tentacle hair + squid form: glossy, translucent ink jelly without a transmission pass.
+//  • light bleeds through thin parts (tips, ribbon edges, cup rims) when back-lit, and soaks round the terminator, in a
+//    saturated team tint (a per-light term added to three's RE_Direct, so it follows every key / rim / neon light);
+//  • a deeper, more saturated core where the view ray crosses more jelly; a lighter, wetter skin where it crosses little;
+//  • sharp clearcoat highlight over a soft base-layer lobe, baked contact occlusion in crevices and at the roots.
+// Per fragment the colour stage fills iwGumOn (0 = opaque gear), iwGumThin (0 thick … 1 thin), iwGumTrans (bleed tint).
+// ================================================================================================
+const GUMMY_PARS = /* glsl */`
+vec3 iwGumTrans = vec3(0.0); float iwGumThin = 0.0; float iwGumOn = 0.0;
+vec3 iwSat(vec3 c, float k){ float l = dot(c, vec3(0.2126, 0.7152, 0.0722)); return max(mix(vec3(l), c, k), 0.0); }
+`;
+const GUMMY_LIGHT = /* glsl */`
+void iwRE_Direct( const in IncidentLight directLight, const in vec3 geometryPosition, const in vec3 geometryNormal, const in vec3 geometryViewDir, const in vec3 geometryClearcoatNormal, const in PhysicalMaterial material, inout ReflectedLight reflectedLight ) {
+  RE_Direct_Physical( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );
+  if ( iwGumOn > 0.001 ) {
+    vec3 L = directLight.direction, N = geometryNormal, V = geometryViewDir;
+    float ndl = dot( N, L );
+    float wrap = clamp( ( ndl + 0.6 ) / 1.6, 0.0, 1.0 );
+    float soak = max( wrap * wrap - max( ndl, 0.0 ), 0.0 );               // light soaking round the shadow edge
+    vec3 Lb = normalize( L + N * 0.45 );
+    float back = pow( clamp( dot( V, -Lb ), 0.0, 1.0 ), 3.0 );             // looking through the jelly toward the light
+    vec3 tr = pow( max( iwGumTrans, vec3( 1e-4 ) ), vec3( mix( 2.1, 0.85, iwGumThin ) ) );   // Beer–Lambert: longer path → deeper
+    vec3 bleed = tr * back * ( 0.12 + 2.6 * iwGumThin * iwGumThin + 0.35 * iwGumThin ) + pow( max( iwGumTrans, vec3( 1e-4 ) ), vec3( 1.8 ) ) * soak * 0.4;
+    reflectedLight.directDiffuse += iwGumOn * directLight.color * bleed * RECIPROCAL_PI;
+  }
+}
+#undef RE_Direct
+#define RE_Direct iwRE_Direct
+`;
+const GUMMY_AMBIENT = /* glsl */`
+#if defined( RE_IndirectDiffuse )
+  // sky / bounce light glowing through the thin parts (inner glow), occluded in crevices
+  reflectedLight.indirectDiffuse += iwGumOn * iwGumTrans * RECIPROCAL_PI * ( irradiance + iblIrradiance ) * ( 0.015 + 0.14 * iwGumThin * iwGumThin ) * iwAO;
+#endif
+`;
+function injectGummy(shader) {
+  shader.fragmentShader = shader.fragmentShader.replace('#include <lights_physical_pars_fragment>', '#include <lights_physical_pars_fragment>\n' + GUMMY_LIGHT);
+}
+
 export function makeHairMaterial(u) {
-  const m = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.3, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.08, sheen: 1, sheenRoughness: 0.4, sheenColor: new THREE.Color(1, 1, 1) });
+  const m = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.34, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.05, sheen: 1, sheenRoughness: 0.4, sheenColor: new THREE.Color(1, 1, 1), specularIntensity: 1 });
   m.onBeforeCompile = (shader) => {
     for (const k of ['uHurt', 'uHurtSeed', 'uFlash', 'uTeam', 'uGlow', 'uShirt', 'uShorts', 'uStrap']) shader.uniforms[k] = u[k];
     inject(shader, {
       vPars: `varying vec3 vBindPos; attribute float aTint; varying float vTint; varying vec4 vStrand; varying float vSinA; varying vec3 vGearCol;
+        attribute vec3 aHair; varying vec3 vHair;
         #ifndef USE_COLOR
         attribute vec3 color;
         #endif`,
-      vBegin: 'vBindPos = position; vTint = aTint; vStrand = vec4(color.r, color.g, uv.x, uv.y); vSinA = color.b * 2.0 - 1.0; vGearCol = color;',
-      fPars: bodyFPars.replace('varying float vEx;', '') + 'uniform vec3 uTeam; uniform vec3 uGlow; uniform vec3 uShirt; uniform vec3 uShorts; uniform vec3 uStrap; varying float vTint; varying vec4 vStrand; varying float vSinA; varying vec3 vGearCol;' + EMBLEM + HAT_GLSL,
+      vBegin: 'vBindPos = position; vTint = aTint; vStrand = vec4(color.r, color.g, uv.x, uv.y); vSinA = color.b * 2.0 - 1.0; vGearCol = color; vHair = aHair;',
+      fPars: bodyFPars.replace('varying float vEx;', '') + 'uniform vec3 uTeam; uniform vec3 uGlow; uniform vec3 uShirt; uniform vec3 uShorts; uniform vec3 uStrap; varying float vTint; varying vec4 vStrand; varying float vSinA; varying vec3 vGearCol; varying vec3 vHair;' + EMBLEM + HAT_GLSL + GUMMY_PARS,
       fColor: /* glsl */`
-        float iwSuck = 0.0; float iwGear = 0.0; float iwGearCls = 0.0; float iwH = 0.0; float iwTipK = 0.0; float iwAO = 1.0;
+        float iwSuck = 0.0; float iwGear = 0.0; float iwGearCls = 0.0; float iwH = 0.0; float iwTipK = 0.0; float iwAO = 1.0; float iwCup = 0.0;
         {
           vec3 tc = uTeam;
           float lum = dot(tc, vec3(0.299, 0.587, 0.114));
           vec3 light = mix(tc, vec3(1.0), 0.55);
           vec3 dark = tc * mix(1.0, 0.45, clamp(lum * 1.4, 0.0, 1.0));
+          vec3 tsat = iwSat(tc, 1.4);                                   // the jelly's own (saturated) tint
+          vec3 core = pow(max(tc, vec3(1e-4)), vec3(1.35)) * mix(0.8, 0.9, clamp(lum * 1.2, 0.0, 1.0));  // deep interior (dye over a long path)
+          float nv = clamp(dot(normalize(vNormal), normalize(vViewPosition)), 0.0, 1.0);
           if (vTint <= -1.5) {
             // ---------------- gear accessory ----------------
             iwGear = 1.0; iwGearCls = floor(-vTint - 2.0 + 0.5);
@@ -944,31 +1099,56 @@ export function makeHairMaterial(u) {
             float spr = dot(vStrand.zw, vStrand.zw);
             float az = atan(vStrand.z, vStrand.w), el = asin(clamp((1.0 - spr) / (1.0 + spr), -1.0, 1.0));
             float crown = smoothstep(1.45, 0.9, el);
-            float bundles = sin(az * 9.0 + 0.35 * sin(el * 5.0)) ;
+            float bundles = sin(az * 9.0 + 0.35 * sin(el * 5.0));
             float groove = pow(1.0 - abs(bundles), 6.0) * crown;
             iwH -= 0.0016 * groove;
-            iwAO *= 1.0 - 0.3 * groove;
+            iwAO *= (1.0 - 0.3 * groove) * vHair.z;
             float edge = smoothstep(0.0, 0.25, vGearCol.g); // g = distance above the hairline (0 at the rolled lip)
-            diffuseColor.rgb = mix(dark, tc, 0.55 + 0.45 * edge);
-            diffuseColor.rgb = mix(diffuseColor.rgb, light, 0.18 * smoothstep(0.8, 1.5, el));
+            diffuseColor.rgb = mix(mix(core, tc, 0.5), tc, 0.45 + 0.55 * edge);
+            diffuseColor.rgb = mix(diffuseColor.rgb, mix(tc, light, 0.3), 0.3 * smoothstep(0.8, 1.5, el) * (1.0 - groove));
+            diffuseColor.rgb *= mix(0.62, 1.0, vHair.z);
+            iwGumOn = 1.0; iwGumThin = 0.12 * (1.0 - edge) + 0.05; iwGumTrans = tsat * 1.05;
           } else {
-            // ---------------- strand ----------------
+            // ---------------- strand / sculpted lock / modelled cup ----------------
             float t = vStrand.x, on = vStrand.y, dist = vStrand.z, cs = vStrand.w;
-            diffuseColor.rgb = vTint >= 0.0 ? mix(tc, light, vTint) : mix(tc, dark, -vTint);
-            // root → tip: deeper at the root, brighter toward the tip
-            diffuseColor.rgb = mix(diffuseColor.rgb * mix(0.78, 1.0, smoothstep(0.0, 0.35, t)), mix(diffuseColor.rgb, light, 0.22), smoothstep(0.55, 1.0, t));
-            iwTipK = smoothstep(0.6, 1.0, t);
-            // defined strand edges: a darker crease where neighbouring strands meet, a highlight ridge along the top
-            float edgeK = smoothstep(0.66, 0.97, abs(vSinA)) * smoothstep(0.02, 0.12, t);
-            diffuseColor.rgb *= 1.0 - 0.26 * edgeK;
-            iwAO *= 1.0 - 0.4 * edgeK;
-            iwH -= 0.0009 * edgeK;
+            float thick = vHair.x; iwCup = vHair.y;
+            vec3 base = vTint >= 0.0 ? mix(tc, light, vTint) : mix(tc, dark, -vTint);
+            // how much jelly the view ray crosses: deep, saturated core facing the viewer, lighter wet skin at grazing
+            float path = thick * (0.25 + 0.75 * nv);
+            float deep = smoothstep(0.002, 0.012, path);
+            diffuseColor.rgb = mix(base, mix(base, core, 0.62), deep);
+            // root → tip: denser at the root (in the cap's shade), clearer and brighter toward the tip
+            iwTipK = smoothstep(0.55, 1.0, t);
+            diffuseColor.rgb *= mix(0.8, 1.0, smoothstep(0.0, 0.3, t));
+            diffuseColor.rgb = mix(diffuseColor.rgb, mix(base, light, 0.22), 0.4 * iwTipK);
+            // defined strand edges: a slightly darker crease where the ribbon turns under
+            float edgeK = smoothstep(0.7, 0.98, abs(vSinA)) * smoothstep(0.02, 0.12, t) * step(iwCup, 0.5);
+            diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * mix(vec3(0.8), core / max(tc, vec3(1e-3)), 0.5), edgeK * 0.7);
+            iwAO *= 1.0 - 0.25 * edgeK;
+            // soft highlight ridge along the top, a slightly paler sucker side underneath
             float ridge = smoothstep(0.75, 1.0, cs) * (1.0 - smoothstep(0.2, 0.5, abs(vSinA)));
-            diffuseColor.rgb = mix(diffuseColor.rgb, mix(diffuseColor.rgb, light, 0.35), ridge * 0.5);
-            // underside darker (occluded by the head), top brighter
-            diffuseColor.rgb *= mix(0.82, 1.0, smoothstep(-0.8, 0.3, cs));
-            // suction cups: two staggered rows along the underside toward the tip (raised rim + cupped centre)
-            if (on > 0.5 && t > 0.3 && t < 0.97 && cs < -0.15) {
+            diffuseColor.rgb = mix(diffuseColor.rgb, mix(diffuseColor.rgb, light, 0.3), ridge * 0.45);
+            diffuseColor.rgb = mix(diffuseColor.rgb, mix(base, light, 0.2), 0.22 * smoothstep(-0.3, -0.85, cs) * step(iwCup, 0.5));
+            // faint wet unevenness so the reflections wobble instead of sliding like on a pipe
+            iwH += 0.00009 * (iwNoise(vBindPos * vec3(55.0, 70.0, 55.0)) - 0.5);
+            iwAO *= vHair.z;
+            iwGumOn = 1.0;
+            iwGumThin = 1.0 - smoothstep(0.0015, 0.013, thick);
+            iwGumTrans = mix(tsat, mix(tsat, vec3(1.0), 0.15), iwTipK);
+            if (iwCup > 0.5) {
+              // modelled suction cup: ring 0 = dish centre, 1 = rim top, → 1.4 = foot on the skin
+              float ring = iwCup - 1.0;
+              vec3 rimC = mix(tc, vec3(1.0), 0.42);
+              vec3 dish = mix(core * 0.38, core * 0.8, smoothstep(0.15, 0.6, ring));   // dark mouth → deep dish wall
+              vec3 cupC = ring < 1.0 ? mix(dish, rimC, smoothstep(0.55, 0.9, ring)) : mix(rimC, diffuseColor.rgb, smoothstep(1.02, 1.3, ring));
+              // cups only a few pixels wide melt into the arm (no shimmering rims at mid distance)
+              float cupLod = 1.0 - smoothstep(0.3, 0.7, fwidth(ring));
+              diffuseColor.rgb = mix(mix(diffuseColor.rgb, rimC, 0.35), cupC, cupLod);
+              iwAO *= mix(1.0, ring < 1.0 ? mix(0.55, 1.0, smoothstep(0.1, 0.8, ring)) : mix(1.0, 0.5, smoothstep(1.12, 1.4, ring)), cupLod);
+              iwGumThin = ring < 1.0 ? 0.35 + 0.5 * smoothstep(0.4, 1.0, ring) : 0.6;
+              iwSuck = 1.0;
+            } else if (on > 0.75 && t > 0.3 && t < 0.97 && cs < -0.15) {
+              // printed suction cups (low detail tiers only): two staggered rows along the underside
               float side = vSinA;
               float row = side > 0.0 ? 0.5 : 0.0;
               float fa = fract(dist / 0.021 + row) - 0.5;
@@ -984,27 +1164,32 @@ export function makeHairMaterial(u) {
               diffuseColor.rgb *= 1.0 - cup * 0.22;
               iwH += 0.0009 * ring - 0.0006 * cup;
             }
+            // crevices: the baked occlusion also darkens the direct light a little (shadow maps miss them)
+            diffuseColor.rgb *= mix(0.66, 1.0, vHair.z);
           }
         }
       ` + HURT_FRAG,
-      fRough: 'roughnessFactor = iwGear > 0.5 ? (iwGearCls == 1.0 ? 0.26 : iwGearCls == 2.0 ? 0.85 : iwGearCls == 3.0 ? 0.7 : iwGearCls > 3.5 ? 0.84 : 0.3) : roughnessFactor; roughnessFactor = mix(roughnessFactor, 0.2, iwHurtM); roughnessFactor = mix(roughnessFactor, 0.42, iwSuck);',
+      fRough: 'roughnessFactor = iwGear > 0.5 ? (iwGearCls == 1.0 ? 0.26 : iwGearCls == 2.0 ? 0.85 : iwGearCls == 3.0 ? 0.7 : iwGearCls > 3.5 ? 0.84 : 0.3) : roughnessFactor; roughnessFactor = mix(roughnessFactor, 0.2, iwHurtM); roughnessFactor = mix(roughnessFactor, 0.42, iwSuck * (1.0 - step(0.5, iwCup)));',
       fMetal: 'metalnessFactor = (iwGear > 0.5 && iwGearCls == 1.0) ? 1.0 : 0.0;',
       fNormal: 'normal = iwBumpN(normal, iwH, -vViewPosition);',
-      fEmissive: 'totalEmissiveRadiance += uFlash + (1.0 - iwGear) * uGlow * (0.6 + 0.4 * clamp(vTint + 0.5, 0.0, 1.0));',
+      fEmissive: 'totalEmissiveRadiance += uFlash + (1.0 - iwGear) * uGlow * (0.6 + 0.4 * clamp(vTint + 0.5, 0.0, 1.0)) * (0.7 + 0.6 * iwGumThin);',
       fLights: /* glsl */`
         #ifdef USE_CLEARCOAT
           if (iwGear > 0.5) { material.clearcoat = iwGearCls == 0.0 ? 1.0 : iwGearCls == 1.0 ? 0.3 : 0.0; material.clearcoatRoughness = 0.12; }
-          else { material.clearcoat = mix(1.0, 0.55, iwSuck); }
+          else { material.clearcoat = mix(1.0, 0.55, iwSuck * (1.0 - step(0.5, iwCup))) * mix(0.35, 1.0, iwAO); material.clearcoatRoughness = min((iwCup > 0.5 ? 0.09 : 0.06) + geometryRoughness, 1.0); }
         #endif
+        // the soft base-layer lobe is light scattered back out of the jelly: tinted by it (the clearcoat stays white)
+        if (iwGumOn > 0.5) { vec3 iwST = mix(vec3(1.0), iwGumTrans / max(max(iwGumTrans.r, max(iwGumTrans.g, iwGumTrans.b)), 1e-3), 0.6); material.specularColor *= iwST; material.specularColorBlended *= iwST; }
         #ifdef USE_SHEEN
-          material.sheenColor = iwGear > 0.5 ? (iwGearCls == 2.0 ? vec3(0.6) : iwGearCls > 3.5 ? mix(vec3(1.0), diffuseColor.rgb, 0.5) * 0.45 : vec3(0.0)) : mix(vec3(0.16), mix(uTeam, vec3(1.0), 0.5) * 0.5, iwTipK);
+          material.sheenColor = iwGear > 0.5 ? (iwGearCls == 2.0 ? vec3(0.6) : iwGearCls > 3.5 ? mix(vec3(1.0), diffuseColor.rgb, 0.5) * 0.45 : vec3(0.0)) : mix(vec3(0.1), mix(uTeam, vec3(1.0), 0.6) * 0.22, iwTipK) * iwAO;
           material.sheenRoughness = 0.35;
         #endif
       `,
-      fAO: 'reflectedLight.indirectDiffuse *= iwAO;',
+      fAO: 'reflectedLight.indirectDiffuse *= iwAO; reflectedLight.indirectSpecular *= mix(0.4, 1.0, iwAO);' + GUMMY_AMBIENT,
     });
+    injectGummy(shader);
   };
-  m.customProgramCacheKey = () => 'iw-hair3';
+  m.customProgramCacheKey = () => 'iw-hair4';
   return m;
 }
 
@@ -1018,60 +1203,136 @@ export function getDarkMaterial() {
 }
 
 // ================================================================================================
-// EYES — sclera, layered iris (gradient, striations, limbal ring, inner glow), vertical pupil,
-// catch-lights, heavy top lid line with outer-corner lash flicks. uv = polar patch coords, aEx = side.
+// EYES — socketed eyeballs (character-face.js → aEx = ±2, aEyeS = eye-space position). The vertex shader turns the ball
+// in eye space for the gaze (uLook as driven by character.js, plus uGaze), so the iris slides under the lids. Fragment:
+// sclera with lid contact shadow, parallax iris under a refracting cornea (radial fibres, collarette, limbal ring, lower
+// glow), pupil (uPupil), clearcoat cornea + a view-anchored catch-light that stays crisp up close and widens with
+// distance. Legacy flat eye patches (aEx = ±1, e.g. the squid form) keep the painted look.
 // ================================================================================================
 export function makeEyeMaterial(u) {
-  const m = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.14, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.04 });
+  const m = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.14, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.03, specularIntensity: 0.5 });
   m.onBeforeCompile = (shader) => {
     for (const k of ['uLook', 'uIris', 'uIris2', 'uFlash']) shader.uniforms[k] = u[k];
+    shader.uniforms.uGaze = u.uGaze || { value: new THREE.Vector4() };
+    shader.uniforms.uLid = u.uLid || { value: new THREE.Vector4() };
+    shader.uniforms.uPupil = u.uPupil || { value: 0.5 };
+    shader.uniforms.uEyeRest = { value: FACE_SHADER.rest }; shader.uniforms.uIrisR = { value: FACE_SHADER.iris };
+    Object.assign(shader.uniforms, faceUniforms());
     inject(shader, {
-      vPars: 'varying vec2 vEyeUv; attribute float aEx; varying float vSide;',
-      vBegin: 'vEyeUv = uv; vSide = aEx;',
-      fPars: /* glsl */`
-        uniform vec2 uLook; uniform vec3 uIris; uniform vec3 uIris2; uniform vec3 uFlash;
+      vPars: /* glsl */`
+        varying vec2 vEyeUv; attribute float aEx; varying float vSide; attribute vec3 aEyeS;
+        uniform vec2 uLook; uniform vec4 uGaze; uniform vec4 uLid; uniform float uEyeRest;
+        uniform vec3 uEyeC[2]; uniform mat3 uEyeM[2]; uniform mat3 uEyeMi[2];
+        varying vec3 vEyeS; varying vec3 vEyeSock; varying vec3 vAi0; varying vec3 vAi1; varying vec3 vAi2; varying vec2 vLidC;`,
+      vBegin: 'vEyeUv = uv; vSide = aEx; transformed = iwEP;',
+      fPars: NOISE + /* glsl */`
+        uniform vec2 uLook; uniform vec3 uIris; uniform vec3 uIris2; uniform vec3 uFlash; uniform float uPupil; uniform float uIrisR;
+        uniform vec4 uEyeAp; uniform vec4 uEyeLid;
         varying vec2 vEyeUv; varying float vSide;
+        varying vec3 vEyeS; varying vec3 vEyeSock; varying vec3 vAi0; varying vec3 vAi1; varying vec3 vAi2; varying vec2 vLidC;
         float iwCircle(vec2 p, vec2 c, float r){ float d = length(p - c) - r; float w = max(fwidth(d), 1e-4); return 1.0 - smoothstep(-w, w, d); }
-        float iwHashE(float n){ return fract(sin(n) * 43758.5453); }
       `,
       fColor: /* glsl */`
-        vec3 iwEyeEmit = vec3(0.0); float iwEyeRim = 0.0;
-        {
+        vec3 iwEyeEmit = vec3(0.0); float iwEyeRim = 0.0; float iwCat = 0.0;
+        if (abs(vSide) > 1.5) {
+          // ---------------- socketed eyeball ----------------
+          vec3 dS = normalize(vEyeS);
+          vec3 V = normalize(mat3(vAi0, vAi1, vAi2) * normalize(vViewPosition));   // view dir in eye space
+          // lid positions in the socket frame (same curves as the skin's lids) → contact shadow + corner shade
+          vec3 sk = normalize(vEyeSock);
+          float lam = atan(sk.y, sk.z), xu = sk.x / uEyeAp.x, q = sqrt(max(1.0 - xu * xu, 0.0));
+          float lU0 = uEyeAp.w + uEyeAp.y * q, lL0 = uEyeAp.w - uEyeAp.z * q, lC = lL0 + uEyeLid.x * (lU0 - lL0);
+          float lU = lU0 - vLidC.x * (lU0 - lC + uEyeLid.y), lL = lL0 + vLidC.y * (lC - lL0);
+          float dU = lU - lam, dL = lam - lL;
+          float shade = mix(0.3, 1.0, smoothstep(0.0, 0.2, dU)) * mix(0.55, 1.0, smoothstep(0.0, 0.12, dL));
+          shade *= mix(0.7, 1.0, smoothstep(1.0, 0.72, abs(xu)));
+          // soft contact shadow under the two lash tabs (they ride the upper lid)
+          {
+            float lnS = (lam - uEyeAp.w) / (lam >= uEyeAp.w ? uEyeAp.y : uEyeAp.z);
+            for (int k = 0; k < 2; k++) {
+              vec3 L = k == 0 ? vec3(${(0.91 * Math.cos(0.58)).toFixed(4)}, ${(0.91 * Math.sin(0.58)).toFixed(4)}, 0.155) : vec3(${(0.93 * Math.cos(0.24)).toFixed(4)}, ${(0.93 * Math.sin(0.24)).toFixed(4)}, 0.115);
+              float tipA = k == 0 ? -1.2 : -0.7;
+              float xl = L.x * uEyeAp.x, ql = sqrt(max(1.0 - L.x * L.x, 0.0));
+              float lU0l = uEyeAp.w + uEyeAp.y * ql, lCl = uEyeAp.w - uEyeAp.z * ql + uEyeLid.x * (uEyeAp.y + uEyeAp.z) * ql;
+              float yl = L.y - vLidC.x * (lU0l - lCl + uEyeLid.y) / uEyeAp.y;
+              vec2 dv = vec2(xu - L.x, lnS - yl);
+              float dl = length(dv) - L.z * (1.0 + 0.9 * pow(max(0.0, cos(atan(dv.y, dv.x) - tipA)), 5.0));
+              shade *= mix(0.45, 1.0, smoothstep(-0.02, 0.07, dl));
+            }
+          }
+          // sclera: warm white, cooler toward the rim, a hint of pink in the corners
+          vec3 sclera = mix(vec3(0.95, 0.94, 0.92), vec3(0.8, 0.82, 0.88), smoothstep(0.35, 1.1, acos(clamp(dS.z, -1.0, 1.0))));
+          sclera = mix(sclera, vec3(0.95, 0.8, 0.8), smoothstep(0.75, 1.05, abs(xu)) * 0.45);
+          // iris seen through the cornea: refract the view ray onto a plane just under the limbus
+          float zI = cos(uIrisR) - 0.03;
+          vec3 rd = refract(-V, dS, 0.75);
+          float tI = (vEyeS.z - zI) / max(-rd.z, 0.12);
+          vec3 ip = vEyeS + rd * max(tI, 0.0);
+          vec2 iq = ip.xy / sin(uIrisR);
+          float r = length(iq), ang = atan(iq.y, iq.x);
+          float iw = max(fwidth(r), 1e-3);
+          float irisM = 1.0 - smoothstep(1.0 - iw, 1.0 + iw, r);
+          vec3 ic = mix(uIris2, uIris, smoothstep(0.55, -0.8, iq.y));
+          float fl = iwLod(r * 24.0, 1.0);
+          vec2 idr = iq / max(r, 1e-4);                                   // seam-free angular coordinate
+          float fib = iwNoise(vec3(idr * 11.0, r * 4.0 + vSide * 7.0)) * 0.6 + iwNoise(vec3(idr * 27.0, r * 1.5 + vSide)) * 0.4;
+          ic *= mix(1.0, mix(0.76, 1.2, fib), smoothstep(0.3, 0.7, r) * fl);
+          float coll = 1.0 - smoothstep(0.0, 0.07, abs(r - 0.47 - 0.035 * sin(ang * 9.0 + vSide)));
+          ic = mix(ic, ic * 1.3 + 0.04, coll * 0.55 * fl);
+          ic = mix(ic, ic * 1.45 + 0.07, smoothstep(0.3, 0.95, r) * smoothstep(0.15, -0.7, iq.y) * 0.85);  // lower glow
+          ic *= mix(1.0, 0.22, smoothstep(0.78, 0.99, r));                                                  // limbal ring
+          float pr = 0.34 * (0.8 + 0.45 * clamp(uPupil, 0.0, 1.0));
+          float pd = length(iq * vec2(1.0, 0.86) - vec2(0.0, 0.03)) - pr;
+          float pw = max(fwidth(pd), 1e-4);
+          float pupil = (1.0 - smoothstep(-pw, pw, pd)) * irisM;
+          ic = mix(ic, ic * 0.55, (1.0 - smoothstep(0.0, 0.08, pd)) * (1.0 - pupil));                        // pupil rim
+          vec3 col = mix(sclera, ic, irisM);
+          col = mix(col, vec3(0.01, 0.009, 0.022), pupil);
+          col *= shade;
+          iwEyeRim = 1.0 - shade;
+          diffuseColor.rgb = col;
+          iwEyeEmit = ic * irisM * (1.0 - pupil) * 0.07 * shade;
+          // catch-light: a virtual key from the camera's upper left, on the cornea's true (bulged) normal
+          vec3 nV = normalize(vNormal);
+          float spread = clamp(length(fwidth(nV)) * 6.0, 0.0, 1.0);
+          vec3 Vv = normalize(vViewPosition);
+          float e1 = mix(1100.0, 90.0, spread), e2 = mix(1800.0, 160.0, spread);
+          float c1 = pow(max(dot(nV, normalize(normalize(vec3(-0.42, 0.55, 0.72)) + Vv)), 0.0), e1);
+          float c2 = pow(max(dot(nV, normalize(normalize(vec3(0.5, -0.35, 0.8)) + Vv)), 0.0), e2);
+          iwCat = (c1 * 1.6 + c2 * 0.7) * mix(1.0, 0.35, spread) * smoothstep(0.02, 0.12, dU);
+          iwEyeEmit += vec3(iwCat);
+        } else {
+          // ---------------- legacy painted eye patch (squid form) ----------------
           vec2 p = vEyeUv;
           float r = length(p);
-          float outer = p.x * sign(vSide + 1e-3);           // + toward the outer corner
+          float outer = p.x * sign(vSide + 1e-3);
           vec2 q = p - uLook;
-          // sclera: cool white, shaded under the top lid and toward the rim
           vec3 sclera = mix(vec3(0.93, 0.94, 0.97), vec3(0.78, 0.8, 0.88), smoothstep(0.35, 1.0, r));
           sclera *= mix(0.72, 1.0, smoothstep(0.98, 0.3, p.y));
-          // iris
           vec2 iq = q * vec2(1.0, 0.94);
           float ir = length(iq) / 0.66;
           float iris = iwCircle(iq, vec2(0.0), 0.66);
           float ang = atan(iq.y, iq.x);
           vec3 ic = mix(uIris2, uIris, smoothstep(0.55, -0.75, q.y));
-          float stri = 0.5 + 0.5 * sin(ang * 23.0 + 3.0 * sin(ang * 5.0)) ;
+          float stri = 0.5 + 0.5 * sin(ang * 23.0 + 3.0 * sin(ang * 5.0));
           ic *= mix(0.86, 1.08, stri * smoothstep(0.25, 0.8, ir));
-          ic = mix(ic, ic * 1.45 + 0.06, smoothstep(0.3, 0.95, ir) * smoothstep(0.15, -0.65, q.y)); // lower glow crescent
-          ic = mix(ic, ic * 1.25 + 0.04, (1.0 - smoothstep(0.34, 0.5, ir)) * 0.6);                  // inner ring
-          ic *= mix(1.0, 0.42, smoothstep(0.78, 1.0, ir));                                           // limbal ring
-          ic *= mix(0.7, 1.0, smoothstep(0.75, 0.1, q.y));                                           // lid shadow
-          // pupil: tall rounded capsule
+          ic = mix(ic, ic * 1.45 + 0.06, smoothstep(0.3, 0.95, ir) * smoothstep(0.15, -0.65, q.y));
+          ic = mix(ic, ic * 1.25 + 0.04, (1.0 - smoothstep(0.34, 0.5, ir)) * 0.6);
+          ic *= mix(1.0, 0.42, smoothstep(0.78, 1.0, ir));
+          ic *= mix(0.7, 1.0, smoothstep(0.75, 0.1, q.y));
           vec2 pq = (q - vec2(0.0, 0.03)) * vec2(1.0, 0.8);
           float pd = length(vec2(pq.x, max(abs(pq.y) - 0.07, 0.0))) - 0.24;
           float pw = max(fwidth(pd), 1e-4);
           float pupil = 1.0 - smoothstep(-pw, pw, pd);
           vec3 col = mix(sclera, ic, iris);
           col = mix(col, vec3(0.012, 0.01, 0.028), pupil);
-          // catch-lights (same key light for both eyes) + a soft window reflection
           float h1 = iwCircle(p * vec2(1.0, 0.9), uLook * 0.5 + vec2(-0.25, 0.3), 0.19);
           float h2 = iwCircle(p, uLook * 0.5 + vec2(0.24, -0.3), 0.075);
           float h3 = iwCircle(p * vec2(1.0, 1.6), uLook * 0.5 + vec2(0.08, 0.62), 0.07) * 0.6;
           col = mix(col, vec3(1.0), max(max(h1, h2 * 0.9), h3));
-          // top lid: thick dark lash line, thinner lower lid, lash flicks at the outer corner
           float lidTop = smoothstep(0.7, 0.82, p.y + 0.12 * outer * outer) * smoothstep(0.35, 0.6, r);
-          float lash1 = iwCircle(vec2(outer, p.y) , vec2(0.86, 0.46), 0.1);
-          float lash2 = iwCircle(vec2(outer, p.y) , vec2(0.95, 0.24), 0.07);
+          float lash1 = iwCircle(vec2(outer, p.y), vec2(0.86, 0.46), 0.1);
+          float lash2 = iwCircle(vec2(outer, p.y), vec2(0.95, 0.24), 0.07);
           float rim = smoothstep(0.84, 0.97, r);
           float lids = max(max(lidTop, rim), max(lash1, lash2) * smoothstep(0.7, 0.9, r));
           col = mix(col, vec3(0.018, 0.018, 0.03), lids);
@@ -1082,9 +1343,45 @@ export function makeEyeMaterial(u) {
       `,
       fRough: 'roughnessFactor = mix(roughnessFactor, 0.35, iwEyeRim);',
       fEmissive: 'totalEmissiveRadiance += iwEyeEmit + uFlash * 0.5;',
+      fLights: /* glsl */`
+        #ifdef USE_CLEARCOAT
+          material.clearcoat *= mix(1.0, 0.35, iwEyeRim);
+        #endif`,
     });
+    // gaze: turn the ball in eye space (before skinning), then carry the eye-space basis to view space for the parallax
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <skinning_pars_vertex>', '#include <skinning_pars_vertex>\n' + LID_BONE_GLSL)
+      .replace('#include <beginnormal_vertex>', /* glsl */`#include <beginnormal_vertex>
+        vec3 iwEP = position; mat3 iwMR = mat3(1.0);
+        vEyeS = vec3(0.0, 0.0, 1.0); vEyeSock = vEyeS; vLidC = vec2(0.0);
+        if (abs(aEx) > 1.5) {
+          int si = aEx > 0.0 ? 0 : 1; float sd = aEx > 0.0 ? 1.0 : -1.0;
+          mat3 M = uEyeM[si], Mi = uEyeMi[si]; vec3 C = uEyeC[si];
+          // gaze (eyeball radians) → eye-space turn: the stylised aperture spans only ±30° of the ball, so ×0.6 and a clamp keep
+          // the iris in the opening on the widest glances
+          float yaw = uEyeRest + sd * clamp(0.6 * (uLook.x * 1.25 + (si == 0 ? uGaze.x : uGaze.z)), -0.36, 0.36);
+          float pitch = clamp(0.6 * (uLook.y * 1.25 + (si == 0 ? uGaze.y : uGaze.w)), -0.3, 0.3);
+          float cy = cos(yaw), sy = sin(yaw), cp = cos(-pitch), sp = sin(-pitch);
+          mat3 Ry = mat3(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy);
+          mat3 Rx = mat3(1.0, 0.0, 0.0, 0.0, cp, sp, 0.0, -sp, cp);
+          mat3 R = Ry * Rx;
+          vec3 s = R * aEyeS;
+          iwEP = C + M * s;
+          objectNormal = normalize(transpose(Mi) * (R * (transpose(M) * objectNormal)));
+          vEyeS = aEyeS; vEyeSock = s; iwMR = M * R;
+          vLidC = iwLidClose(si, uLid);
+        }`)
+      .replace('#include <skinnormal_vertex>', /* glsl */`#include <skinnormal_vertex>
+        {
+          mat3 A = mat3(modelViewMatrix) * iwMR;
+          #ifdef USE_SKINNING
+            A = mat3(modelViewMatrix) * mat3(skinMatrix) * iwMR;
+          #endif
+          mat3 Ai = inverse(A);
+          vAi0 = vec3(Ai[0][0], Ai[0][1], Ai[0][2]); vAi1 = vec3(Ai[1][0], Ai[1][1], Ai[1][2]); vAi2 = vec3(Ai[2][0], Ai[2][1], Ai[2][2]);
+        }`);
   };
-  m.customProgramCacheKey = () => 'iw-eye3';
+  m.customProgramCacheKey = () => 'iw-eye4';
   return m;
 }
 
@@ -1197,7 +1494,7 @@ export function makeInkFillMaterial() {
 // uv = (t along tentacle, cos(angle)) with aEx = 1 on tentacles (suckers on the inner face).
 // ================================================================================================
 export function makeSquidMaterial(u, ghost = false) {
-  const m = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.24, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.05, sheen: 1, sheenRoughness: 0.4, sheenColor: new THREE.Color(1, 1, 1) });
+  const m = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.3, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.05, sheen: 1, sheenRoughness: 0.4, sheenColor: new THREE.Color(1, 1, 1), specularIntensity: 1 });
   if (ghost) {
     m.transparent = true; m.depthWrite = false; m.depthFunc = THREE.GreaterDepth; m.opacity = 0.42;
   }
@@ -1209,33 +1506,51 @@ export function makeSquidMaterial(u, ghost = false) {
         #ifndef USE_COLOR
         attribute vec3 color;
         #endif
-        attribute float aEx;
-        varying float vTint; varying vec2 vSqUv; varying float vSqPart; varying vec3 vSqP;
+        attribute float aEx; attribute vec3 aSq;
+        varying float vTint; varying vec2 vSqUv; varying float vSqPart; varying vec3 vSqP; varying vec3 vSq;
       `,
       vBegin: /* glsl */`
         {
+          // arms: a wave travelling root → tip (phase per arm) that flexes each arm in / out and sways it sideways,
+          // growing toward the tip, so the arms coil and uncoil like live tentacles (cups ride the same field)
           float wig = color.g; float ph = color.b * 6.2831;
-          float s = sin(uTime * uWig.y + ph + wig * 3.2);
-          float c = cos(uTime * uWig.y * 0.8 + ph * 1.3 + wig * 2.6);
-          transformed.x += s * wig * wig * uWig.x * 2.0;
-          transformed.z += c * wig * wig * uWig.x * 2.0;
-          transformed.y += (s * 0.5 + 0.5) * wig * uWig.x * 0.8;
-          vTint = color.r; vSqUv = uv; vSqPart = aEx; vSqP = position;
+          float s = sin(uTime * uWig.y + ph - wig * 4.2);
+          float c = cos(uTime * uWig.y * 0.8 + ph * 1.3 - wig * 3.1);
+          float k = wig * wig * uWig.x * 2.0;
+          vec2 rad = position.xz; float rl = length(rad); rad = rl > 1e-4 ? rad / rl : vec2(0.0, 1.0);
+          vec2 tng = vec2(-rad.y, rad.x);
+          transformed.xz += rad * (s * k * 1.1) + tng * (c * k * 0.9);
+          transformed.y += (s * 0.5 + 0.5) * wig * uWig.x * 0.8 + s * k * 0.35;
+          vTint = color.r; vSqUv = uv; vSqPart = aEx; vSqP = position; vSq = aSq;
         }
       `,
-      fPars: 'uniform vec3 uTeam; uniform vec3 uFlash; uniform vec3 uGlow; uniform float uOpacity; varying float vTint; varying vec2 vSqUv; varying float vSqPart; varying vec3 vSqP;' + NOISE + BUMP,
+      fPars: 'uniform vec3 uTeam; uniform vec3 uFlash; uniform vec3 uGlow; uniform float uOpacity; varying float vTint; varying vec2 vSqUv; varying float vSqPart; varying vec3 vSqP; varying vec3 vSq;' + NOISE + BUMP + GUMMY_PARS,
       fColor: /* glsl */`
-        float iwH = 0.0; float iwSuck = 0.0;
+        float iwH = 0.0; float iwSuck = 0.0; float iwAO = 1.0; float iwCup = 0.0; float iwTipK = 0.0;
         {
           vec3 tc = uTeam;
           float lum = dot(tc, vec3(0.299, 0.587, 0.114));
           vec3 light = mix(tc, vec3(1.0), 0.6);
           vec3 dark = tc * mix(1.0, 0.5, clamp(lum * 1.4, 0.0, 1.0));
-          diffuseColor.rgb = vTint >= 0.0 ? mix(tc, light, clamp(vTint, 0.0, 1.0)) : mix(tc, dark, clamp(-vTint, 0.0, 1.0));
-          if (vSqPart > 0.5) {
+          vec3 core = pow(max(tc, vec3(1e-4)), vec3(1.45)) * mix(0.82, 0.92, clamp(lum * 1.2, 0.0, 1.0));
+          vec3 base = vTint >= 0.0 ? mix(tc, light, clamp(vTint, 0.0, 1.0)) : mix(tc, dark, clamp(-vTint, 0.0, 1.0));
+          float nv = clamp(dot(normalize(vNormal), normalize(vViewPosition)), 0.0, 1.0);
+          float thick = vSq.x;
+          float deep = smoothstep(0.003, 0.03, thick * (0.25 + 0.75 * nv));
+          diffuseColor.rgb = mix(base, mix(base, core, 0.7), deep);
+          iwAO = vSq.z;
+          iwGumOn = 1.0;
+          iwGumThin = 1.0 - smoothstep(0.0015, 0.016, thick);
+          iwGumTrans = iwSat(tc, 1.4);
+          iwH += 0.00008 * (iwNoise(vSqP * vec3(60.0)) - 0.5);
+          if (vSqPart > 0.5 && vSqPart < 3.5 && vSqPart != 2.0) {
+            // arm
             float t = vSqUv.x, cs = vSqUv.y;
-            diffuseColor.rgb *= mix(0.85, 1.05, t);
-            if (cs < -0.2 && t > 0.2 && t < 0.95) {
+            iwTipK = smoothstep(0.55, 1.0, t);
+            diffuseColor.rgb *= mix(0.86, 1.04, t);
+            diffuseColor.rgb = mix(diffuseColor.rgb, mix(base, light, 0.22), 0.25 * smoothstep(-0.3, -0.85, cs));  // paler sucker side
+            if (vSqPart < 1.5 && cs < -0.2 && t > 0.2 && t < 0.95) {
+              // printed suckers (tiers without modelled ones)
               float fa = fract(t * 14.0) - 0.5;
               float d = length(vec2(fa * 1.0, (cs + 0.78) * 2.2));
               float size = mix(0.3, 0.2, t);
@@ -1244,7 +1559,19 @@ export function makeSquidMaterial(u, ghost = false) {
               diffuseColor.rgb = mix(diffuseColor.rgb, light, iwSuck * 0.75);
               iwH += 0.0006 * smoothstep(size * 0.4, size * 0.85, d) * iwSuck - 0.0004 * (1.0 - smoothstep(0.0, size * 0.5, d)) * iwSuck;
             }
+          } else if (vSqPart > 1.5 && vSqPart < 2.5) {
+            // modelled sucker: ring 0 = dish centre, 1 = rim top, → 1.4 = foot
+            float ring = vSq.y - 1.0; iwCup = 1.0;
+            vec3 rimC = mix(tc, vec3(1.0), 0.42);
+            vec3 dish = mix(core * 0.38, core * 0.8, smoothstep(0.15, 0.6, ring));
+            float cupLod = 1.0 - smoothstep(0.3, 0.7, fwidth(ring));
+            vec3 cupC = ring < 1.0 ? mix(dish, rimC, smoothstep(0.55, 0.9, ring)) : mix(rimC, diffuseColor.rgb, smoothstep(1.02, 1.3, ring));
+            diffuseColor.rgb = mix(mix(diffuseColor.rgb, rimC, 0.35), cupC, cupLod);
+            iwAO *= mix(1.0, ring < 1.0 ? mix(0.6, 1.0, smoothstep(0.1, 0.8, ring)) : mix(1.0, 0.55, smoothstep(1.12, 1.4, ring)), cupLod);
+            iwGumThin = ring < 1.0 ? 0.35 + 0.5 * smoothstep(0.4, 1.0, ring) : 0.6;
           }
+          diffuseColor.rgb *= mix(0.7, 1.0, iwAO);
+          iwGumTrans = mix(iwGumTrans, mix(iwGumTrans, vec3(1.0), 0.15), iwTipK);
           diffuseColor.a *= uOpacity;
         }
       ` + (ghost ? /* glsl */`
@@ -1254,17 +1581,25 @@ export function makeSquidMaterial(u, ghost = false) {
           float fres = pow(1.0 - abs(dot(normalize(vNormal), normalize(vViewPosition))), 3.0);
           diffuseColor.rgb = mix(uTeam * 0.5, uTeam * 0.95, fres);
           diffuseColor.a = uOpacity * mix(0.34, 0.5, fres) * (vSqPart > 0.5 ? 0.8 : 1.0);
+          iwGumOn = 0.0;
         }
       ` : ''),
+      fRough: 'roughnessFactor = mix(roughnessFactor, 0.4, iwCup);',
       fNormal: 'normal = iwBumpN(normal, iwH, -vViewPosition);',
-      fEmissive: 'totalEmissiveRadiance += uFlash + uGlow * 0.5;' + (ghost ? 'totalEmissiveRadiance += uTeam * 0.12;' : ''),
-      fLights: `
+      fEmissive: 'totalEmissiveRadiance += uFlash + uGlow * 0.5 * (0.7 + 0.6 * iwGumThin);' + (ghost ? 'totalEmissiveRadiance += uTeam * 0.12;' : ''),
+      fLights: /* glsl */`
+        #ifdef USE_CLEARCOAT
+          material.clearcoat = mix(0.35, 1.0, iwAO); material.clearcoatRoughness = min((iwCup > 0.5 ? 0.09 : 0.06) + geometryRoughness, 1.0);
+        #endif
+        if (iwGumOn > 0.5) { vec3 iwST = mix(vec3(1.0), iwGumTrans / max(max(iwGumTrans.r, max(iwGumTrans.g, iwGumTrans.b)), 1e-3), 0.6); material.specularColor *= iwST; material.specularColorBlended *= iwST; }
         #ifdef USE_SHEEN
-          material.sheenColor = mix(uTeam, vec3(1.0), 0.5) * 0.35;
+          material.sheenColor = mix(vec3(0.08), mix(uTeam, vec3(1.0), 0.6) * 0.2, iwTipK) * iwAO;
         #endif`,
+      fAO: 'reflectedLight.indirectDiffuse *= iwAO; reflectedLight.indirectSpecular *= mix(0.45, 1.0, iwAO);' + GUMMY_AMBIENT,
     });
+    injectGummy(shader);
   };
-  m.customProgramCacheKey = () => (ghost ? 'iw-squid-ghost4' : 'iw-squid3');
+  m.customProgramCacheKey = () => (ghost ? 'iw-squid-ghost5' : 'iw-squid4');
   return m;
 }
 

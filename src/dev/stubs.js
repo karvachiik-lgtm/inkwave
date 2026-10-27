@@ -43,4 +43,4 @@ export class Environment {
 }
 
 export const audio = { init() {}, setVolumes() {}, setListener() {}, play() {}, loop() { return { set() {}, stop() {} }; }, duck() {} };
-export const music = { play() {}, setIntensity() {}, stop() {} };
+export const music = { play() {}, setIntensity() {}, stop() {}, preload() {}, pause() {}, resume() {}, fileTrack: null };

@@ -17,9 +17,17 @@
 // setStyle(style, cause) — swaps the look with a reaction ('hair'|'eyes'|'skin'|'outfit' → squash-pop / twirl,
 // 'preset'|'random' → dives into the ink and bursts back out in the new look); portrait({ style, color, kind:
 // 'head'|'bust'|'body', size, weapon }, cb(canvas)) — queued studio portraits for menu tiles (one per frame).
+// Online (driven by menus.js): showHub(style, color, weapon) — your kid in the lobby set beside the create / join cards;
+// showLobby(players, colors) / updateLobby / lobbyEmote(id, name) / lobbyGetSet() / lobbyAnchor(id, out) /
+// lobbySlotAnchor(row, i, out) / lobbyLaunch() / leaveLobby() — the room's line-up (see the lobby set section).
+// Lobby set: both online screens are staged in the LobbySet (src/game/lobbySet.js, a back alley), a scene of its own
+// drawn full-frame. .fullFrame (getter) is true while it covers the whole screen: main.js then neither draws nor
+// simulates the world (render() clears and draws the frame itself); it is false during the set's ~0.45 s
+// cross-dissolves, which need the live world underneath. Audits: .debugCam = { pos, target, fov } overrides its camera.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { G, damp, lerp, rng } from '../core/ctx.js';
+import { WEAPONS } from '../config.js';
 
 // ================================================================================================ helpers
 const TAU = Math.PI * 2;
@@ -34,6 +42,8 @@ const wobble = (t, f = 17, z = 7) => (t < 0 ? 0 : Math.exp(-t * z) * Math.sin(t 
 // fast attack / slower release pulse, peak ≈ 0.75
 const punch = (t, a = 22, r = 4.2) => (t < 0 ? 0 : (1 - Math.exp(-t * a)) * Math.exp(-t * r));
 const UPV = new THREE.Vector3(0, 1, 0);
+const wrapA = (a) => { a %= TAU; return a > Math.PI ? a - TAU : a < -Math.PI ? a + TAU : a; };
+const dampAngle = (a, b, l, dt) => a + wrapA(b - a) * (1 - Math.exp(-l * dt));
 
 // Loadout pedestal and results podium dimensions (metres; y = 0 is the pedestal/drum top before the ink coat).
 const PED = { R: 0.64, bevel: 0.09, groove: { y: -0.235, h: 0.021, d: 0.022 }, flange: { y: -0.5, out: 0.075, b: 0.04 }, bottom: -3.0, ink: 0.014 };
@@ -48,6 +58,24 @@ const SLOTS = [
 const CHAR_H = 1.62; // squidkid height incl. hair
 const LOAD_FOCUS_Y = 0.76; // camera aims here on the loadout character (feet at 0)
 const PEDESTAL = new Set(['loadout', 'locker']); // modes that stand one squidkid on the ink pedestal
+const OVERLAY = new Set(['loadout', 'locker', 'results']); // studio modes drawn over the live world
+// Online hub + room: staged in the LobbySet (src/game/lobbySet.js), drawn full-frame (see the lobby set section).
+const SET_MODES = new Set(['hub', 'lobby']);
+const SET_FADE = 0.45;        // set ⇄ world / pedestal / podium cross-dissolve (s)
+const GLIDE = 1.7;            // hub ⇄ room camera glide (s)
+const HUB_ID = '__hub';       // your kid while you are not in a room
+const PLATE_H = 1.64;         // nameplate anchor above the feet (m): just over a kid's head
+// squid travel: cruise speed, acceleration, braking, root lift over the asphalt (the swim pose sinks into the ink),
+// trail blob spacing, and the leap onto the mark (span, time, height)
+// (the leap keeps > 3 m/s across the ground so the character flies it as a dolphin arc, mantle along the path)
+const SWIM = { v: 10, acc: 26, brake: 13, lift: 0.1, gap: 0.07, leap: 2.3, T: 0.5, H: 0.62 };
+// lobby emotes → character dances (danceVar forces the variant; t0 starts mid-dance)
+const LOB_EMOTES = {
+  booyah: { dance: 'victory', v: 0, dur: 2.9, hop: 0.32 },
+  wave: { dance: 'victory', v: 2, dur: 2.35, hop: 0 },
+  dance: { dance: 'victory', v: 1, dur: 3.4, hop: 0 },
+  flex: { dance: 'victory', v: 0, t0: 2.86, dur: 1.55, hop: 0.12, trig: 'hairflip' },
+};
 const sameStyle = (a, b) => {
   if (!a || !b) return false;
   for (const k in a) if (a[k] !== b[k]) return false;
@@ -429,7 +457,7 @@ class InkFX {
         for (let d = 0; d < decks.length; d++) {
           const D = decks[d];
           if (py >= D.y && y < D.y) {
-            const dx = x - D.x, dz = z - D.z;
+            const dx = x - D.x, dz = (z - D.z) / (D.zs || 1);   // zs: oval decks (lobby stage)
             if (dx * dx + dz * dz < D.r * D.r) { landed = true; this.K[i] = 0; this.mesh.setMatrixAt(i, ZERO_M); this._land(i, k, x, D.y, z); break; }
           }
         }
@@ -646,6 +674,139 @@ class Sparkles {
   }
 }
 
+// Wet ink trail behind a swimming squid: low glossy domes laid every few cm along its path (one instanced draw, the
+// swimmer's team colour per instance), overlapping into one streak. Each swells in behind the squid, then soaks into
+// the asphalt (narrower, thinner) and is gone after a few seconds.
+class InkTrail {
+  constructor(root) {
+    const N = (this.N = 520);
+    const geo = new THREE.SphereGeometry(1, 16, 5, 0, TAU, 0, Math.PI / 2);   // a dome: flat underside on the ground
+    // wet but coloured: at the grazing angles a lane is seen at, a full clearcoat just mirrors the sky and reads white
+    this.mat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.28, metalness: 0, clearcoat: 0.55, clearcoatRoughness: 0.14, envMapIntensity: 0.3 });
+    this.mesh = new THREE.InstancedMesh(geo, this.mat, N);
+    this.mesh.frustumCulled = false; this.mesh.count = 0; this.mesh.receiveShadow = true;
+    const white = new THREE.Color(1, 1, 1);
+    for (let i = 0; i < N; i++) { this.mesh.setMatrixAt(i, ZERO_M); this.mesh.setColorAt(i, white); }
+    root.add(this.mesh);
+    this.P = new Float32Array(N * 3); this.Y = new Float32Array(N); this.W = new Float32Array(N); this.Ln = new Float32Array(N);
+    this.A = new Float32Array(N).fill(1e9); this.L = new Float32Array(N); this.next = 0;
+  }
+  add(x, y, z, yaw, w, len, color, life) {
+    const i = this.next; this.next = (i + 1) % this.N;
+    this.P[i * 3] = x; this.P[i * 3 + 1] = y + 0.0015 + (i % 5) * 0.0003; this.P[i * 3 + 2] = z;
+    this.Y[i] = yaw; this.W[i] = w; this.Ln[i] = len; this.A[i] = 0; this.L[i] = life;
+    this.mesh.setColorAt(i, color); this.mesh.instanceColor.needsUpdate = true;
+  }
+  clear() { this.A.fill(1e9); for (let i = 0; i < this.N; i++) this.mesh.setMatrixAt(i, ZERO_M); this.mesh.count = 0; this.mesh.instanceMatrix.needsUpdate = true; }
+  update(dt) {
+    let top = -1;
+    for (let i = 0; i < this.N; i++) {
+      if (this.A[i] >= this.L[i]) continue;
+      const a = (this.A[i] += dt), L = this.L[i];
+      if (a >= L) { this.mesh.setMatrixAt(i, ZERO_M); continue; }
+      const grow = eOut3(a / 0.14), soak = 1 - eInOut((a - 0.3 * L) / (0.7 * L));
+      _q.setFromAxisAngle(UPV, this.Y[i]);
+      // a film, not a tube: a few mm proud of the asphalt, thinning as it soaks in
+      _s.set(this.W[i] * grow * (0.3 + 0.7 * soak), Math.max(0.0004, 0.0065 * grow * soak), this.Ln[i] * grow * (0.55 + 0.45 * soak));
+      _m4.compose(_v.set(this.P[i * 3], this.P[i * 3 + 1], this.P[i * 3 + 2]), _q, _s);
+      this.mesh.setMatrixAt(i, _m4);
+      top = i;
+    }
+    let n = top + 1;
+    for (let i = this.N - 1; i >= n; i--) if (this.A[i] < this.L[i]) { n = i + 1; break; }
+    this.mesh.count = n;
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+  dispose() { this.mesh.geometry.dispose(); this.mat.dispose(); this.mesh.removeFromParent(); }
+}
+
+// Swim paths (set polylines → arc-length tables). Plan shape: centripetal Catmull-Rom through the points in xz,
+// resampled every ~8 cm; heights come from the polyline itself, so a flight of stairs stays a straight rise, which the
+// swimmer takes as one hop (climbs[]). pathAt() → the ground point + plan direction at arc length s, and the hop.
+function polyY(pts, q) {
+  let best = 1e9, y = pts[0].y;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1], dx = b.x - a.x, dz = b.z - a.z, l2 = dx * dx + dz * dz;
+    const u = l2 > 1e-8 ? c01(((q.x - a.x) * dx + (q.z - a.z) * dz) / l2) : 0;
+    const ex = a.x + dx * u - q.x, ez = a.z + dz * u - q.z, d = ex * ex + ez * ez;
+    if (d < best - 1e-9) { best = d; y = a.y + (b.y - a.y) * u; }
+  }
+  return y;
+}
+function makePath(raw, avoid) {
+  const pts = [raw[0].clone()];
+  for (const p of raw) if (p.distanceTo(pts[pts.length - 1]) > 0.03) pts.push(p.clone());
+  if (pts.length < 2) pts.push(pts[0].clone().add(new THREE.Vector3(0, 0, 0.05)));
+  const flat = pts.map((p) => new THREE.Vector3(p.x, 0, p.z));
+  const curve = new THREE.CatmullRomCurve3(flat, false, 'centripetal');
+  const sp = curve.getSpacedPoints(Math.max(2, Math.ceil(curve.getLength() / 0.08)));
+  for (const q of sp) q.y = polyY(pts, q);
+  // steer round kids standing near the line (not at the ends: that is where the swimmer starts / lands)
+  if (avoid && avoid.length) {
+    const n = sp.length, R = 0.62;
+    let cum = 0;
+    const cs = [0];
+    for (let i = 1; i < n; i++) cs.push((cum += Math.hypot(sp[i].x - sp[i - 1].x, sp[i].z - sp[i - 1].z)));
+    for (let pass = 0; pass < 3; pass++) {
+      for (let i = 1; i < n - 1; i++) {
+        if (cs[i] < 0.5 || cs[n - 1] - cs[i] < 1.3) continue;
+        const q = sp[i];
+        for (const o of avoid) {
+          if (Math.abs(o.y - q.y) > 0.5) continue;
+          const dx = q.x - o.x, dz = q.z - o.z, d = Math.hypot(dx, dz);
+          if (d < R) { const k = (R - d) / Math.max(d, 1e-3); q.x += dx * k; q.z += dz * k; }
+        }
+      }
+      for (let i = 1; i < n - 1; i++) { sp[i].x = (sp[i - 1].x + 2 * sp[i].x + sp[i + 1].x) * 0.25; sp[i].z = (sp[i - 1].z + 2 * sp[i].z + sp[i + 1].z) * 0.25; }
+    }
+  }
+  const cum = new Float32Array(sp.length);
+  for (let i = 1; i < sp.length; i++) cum[i] = cum[i - 1] + Math.hypot(sp[i].x - sp[i - 1].x, sp[i].z - sp[i - 1].z);
+  // climbs: runs of steep samples (merged across small gaps), padded, flown as one hop arc
+  const climbs = [];
+  let run = null;
+  for (let i = 1; i < sp.length; i++) {
+    const dh = cum[i] - cum[i - 1], dy = sp[i].y - sp[i - 1].y;
+    if (Math.abs(dy) > 0.004 && Math.abs(dy) > 0.3 * dh) {
+      if (run && cum[i - 1] - run.b < 0.35) run.b = cum[i]; else climbs.push((run = { a: cum[i - 1], b: cum[i] }));
+    }
+  }
+  const len = cum[sp.length - 1];
+  const P = { pts: sp, cum, len, climbs: [] };
+  const hops = [];
+  for (const r of climbs) {   // (P.climbs is still empty here, so pathAt gives plain ground heights)
+    const s0 = Math.max(0, r.a - 0.3), s1 = Math.min(len, r.b + 0.25);
+    pathAt(P, s0, _v); const y0 = _v.y;
+    pathAt(P, s1, _v); const y1 = _v.y;
+    hops.push({ s0, s1, y0, y1, h: 0.34 + 0.3 * Math.abs(y1 - y0) });
+  }
+  P.climbs = hops;
+  return P;
+}
+// → the ground point at arc length s in `out` (and the plan direction in `dir`); returns the hop height above the
+// ground line when s is inside a climb (out.y is then the straight line between the climb's ends), else null
+function pathAt(P, s, out, dir) {
+  const c = P.cum, n = c.length;
+  s = Math.max(0, Math.min(P.len, s));
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (c[m] <= s) lo = m; else hi = m; }
+  const u = (s - c[lo]) / Math.max(1e-6, c[hi] - c[lo]);
+  out.lerpVectors(P.pts[lo], P.pts[hi], u);
+  if (dir) {
+    const a = P.pts[Math.max(0, lo - 1)], b = P.pts[Math.min(n - 1, hi + 1)];
+    dir.set(b.x - a.x, 0, b.z - a.z);
+    if (dir.lengthSq() < 1e-10) dir.set(0, 0, 1); else dir.normalize();
+  }
+  for (const C of P.climbs) {
+    if (s > C.s0 && s < C.s1) {
+      const x = (s - C.s0) / (C.s1 - C.s0);
+      out.y = lerp(C.y0, C.y1, x);
+      return 4 * C.h * x * (1 - x);
+    }
+  }
+  return null;
+}
+
 // ================================================================================================ materials
 function makeBodyMaterial(glowUniform) {
   const m = new THREE.MeshPhysicalMaterial({ color: 0x38306a, roughness: 0.36, metalness: 0, clearcoat: 0.85, clearcoatRoughness: 0.16, vertexColors: true });
@@ -750,7 +911,8 @@ function makeCompositeMaterial() {
   });
 }
 
-// Light rigs per scene mood. Directions are relative to the stage focus; the camera sits on +Z.
+// Studio light rigs per overlay mood. Directions are relative to the stage focus; the camera sits on +Z. (The lobby set
+// is lit by its own lights in a scene of its own: none of these reach it.)
 const MOODS = {
   loadout: { key: 2.75, keyCol: 0xfff0de, rimA: 3.4, rimB: 1.9, fill: 0.5, hemi: 0.8, sky: 0xdce8ff, ground: 0x2c2442, env: 0.6, glow: 2.2 },
   win: { key: 2.9, keyCol: 0xfff1dc, rimA: 3.6, rimB: 2.0, fill: 0.55, hemi: 0.85, sky: 0xdfe9ff, ground: 0x2e2644, env: 0.62, glow: 2.3 },
@@ -768,7 +930,8 @@ export class Showcase {
     this.chars = [];
     this.color = new THREE.Color(0xff8a14);
     this.won = true;
-    this.t = 0; this.fadeIn = 0; this._out = 0; this._lastMode = null;
+    this.t = 0; this.fadeIn = 0; this._out = 0; this._outDur = 0.2; this._lastMode = null;
+    this.lob = null; this._ffFrame = false;
     this.spin = 0; this.spinVel = 0; this.sinceDrag = 99; this.drag = null;
     this.weapon = null; this.hopT = -99; this.hopWeapon = null; this.pop = null;
     this.ui = { panelR: -1, titleR: -1, titleB: -1, bandB: -1, s: null, W: 0, H: 0, next: 0, stamp: -1 };
@@ -832,6 +995,7 @@ export class Showcase {
     this.key.position.set(f.x - 3.4 * spread, f.y + 5.4 * spread, f.z + 4.6 * spread); this.key.target.position.copy(f);
     this.rimA.position.set(f.x + 3.8, f.y + 2.8, f.z - 4.4); this.rimA.target.position.copy(f);
     this.rimB.position.set(f.x - 4.4, f.y + 2.0, f.z - 3.6); this.rimB.target.position.copy(f);
+    this.rimB.color.set(0xd4e8ff);
     this.fill.position.set(f.x + 4.6, f.y + 0.6, f.z + 3.8); this.fill.target.position.copy(f);
     const sc = this.key.shadow.camera, e = 1.25 * spread;
     sc.left = -e; sc.right = e; sc.top = e; sc.bottom = -e; sc.near = 0.5; sc.far = 16 * spread; sc.updateProjectionMatrix();
@@ -939,6 +1103,8 @@ export class Showcase {
 
   showLoadout(weapon, color, style) { this._showPedestal('loadout', weapon, color, style); }
   showLocker(style, color, weapon) { this._showPedestal('locker', weapon || this.weapon || G.game?.profile?.weapon || 'shooter', color, style); }
+  /** Online hub (menus.js 'online'): your kid on the pedestal right of the create / join cards. */
+  showHub(style, color, weapon) { this._showPedestal('hub', weapon || this.weapon || G.game?.profile?.weapon || 'shooter', color, style); }
 
   _showPedestal(mode, weapon, color, style) {
     if (!color || !color.isColor) color = new THREE.Color(color || this.color);
@@ -1067,9 +1233,9 @@ export class Showcase {
 
   hide() {
     if (!this.mode) return;
-    this._lastMode = this.mode;
+    // studio overlays: a quick fade-out, then _clear(); the lobby set dissolves away on its own (_updateSet)
+    if (OVERLAY.has(this.mode) && this.chars.length) { this._lastMode = this.mode; this._out = this._outDur = 0.2; }
     this.mode = null;
-    this._out = 0.2; // quick fade-out, then _clear()
   }
 
   dispose() {
@@ -1080,14 +1246,17 @@ export class Showcase {
       this.scene.remove(st.group);
     }
     this.stageL = this.stageR = null;
+    this._lobRelease();
     this._rt?.dispose(); this._rt = null;
   }
 
   // ---------------------------------------------------------------------------------------------- update
   update(dt) {
     dt = Math.min(dt || 0, 0.1);
+    this._ffFrame = this.fullFrame;   // what main.js saw at the top of this frame (it didn't draw the world if true)
     if (!this._warmState && G.env) this._warmup();
-    let mode = this.mode;
+    this._updateSet(dt);
+    let mode = OVERLAY.has(this.mode) ? this.mode : null;
     if (!mode && this._out > 0) {
       this._out -= dt;
       if (this._out <= 0) { this._clear(); return; }
@@ -1241,7 +1410,7 @@ export class Showcase {
           } else {
             if (!L.landed) {
               L.landed = true; c.trigger('land', L.cause === 'outfit' ? 6 : 4.5); this.landT = t; this.fx.crown(0, PED.ink, 0, 0.5, 10, 0.3);
-              // look-specific flourish (no-ops when the character has no such trigger)
+              // look-specific flourish (no-ops until the animation stream adds them — see docs/HALYARD.md requests)
               c.trigger(L.cause === 'outfit' ? 'admire' : L.cause === 'hair' ? 'hairflip' : 'wink');
             }
             if (x > 1.35) this.look = null;
@@ -1382,6 +1551,1167 @@ export class Showcase {
     }
   }
 
+  // ---------------------------------------------------------------------------------------------- lobby set (hub + room)
+  // showHub(style, color, weapon) · showLobby(players, colors[, opts]) · updateLobby(players, colors) · lobbyEmote(id,
+  // name) · lobbyGetSet() · lobbyLaunch() → seconds · lobbyAnchor(id, out) · lobbySlotAnchor(row, i, out) · leaveLobby().
+  // players = G.net.lobby.players (docs/NET.md), colors = [team 0, team 1] (hex / THREE.Color).
+  //
+  // Both online screens are staged in the LobbySet (src/game/lobbySet.js: a back alley at blue hour with its own
+  // lights), in a scene of its own drawn full-frame: while it covers the screen `fullFrame` is true and main.js neither
+  // draws nor simulates the world; it cross-dissolves with the world / the pedestal / the podium. One member per player
+  // (the hub kid is you, and becomes your room member). Arrivals swim in from the alley mouth along set.lanes(mark) —
+  // a low squid swim laying a wet ink trail, a hop up the dock stairs for the rivals' marks — then leap out as a kid,
+  // splash down on the mark and turn to camera; leavers turn, dive and swim out along set.exitPath(mark); a team switch
+  // swims mark → mark. Opening the room you duck into the ink at the hub spot and burst out of a puddle on your mark
+  // while the camera pulls back to the line-up (whoever is already in the room surfaces right after you). Coming back to
+  // the room (locker, a match) finds everyone standing there. Leaving it, the others duck away and you swim home.
+  /** True while the lobby set covers the whole frame: main.js may skip drawing (and simulating) the world. It is false
+   *  during the set's cross-dissolves, which need the live world underneath (render() handles either case). */
+  get fullFrame() {
+    const L = this.lob;
+    return !!(L && L.ready && L.k >= 1 && SET_MODES.has(this.mode));
+  }
+
+  // Build and compile the alley ahead of time (main.js calls this once the main menu is idle), so the first visit to
+  // the online hub opens straight onto the set instead of the arena while it loads. Kept until it's first shown.
+  preloadLobby() { if (!this.lob) this._lobEnsure().preload = true; }
+
+  _lobEnsure() {
+    if (this.lob) return this.lob;
+    const scene = new THREE.Scene();
+    const kids = new THREE.Group(), fxRoot = new THREE.Group();
+    scene.add(kids, fxRoot);
+    const ink = [this.inkMat.clone(), this.inkMat.clone()];
+    const contact = new THREE.InstancedMesh(this.contact.geometry, this.contact.material, 10);
+    contact.frustumCulled = false; contact.count = 0; contact.renderOrder = 1;
+    for (let i = 0; i < 10; i++) { contact.setMatrixAt(i, ZERO_M); contact.setColorAt(i, this._c.setRGB(0, 0, 0)); }
+    fxRoot.add(contact);
+    const L = (this.lob = {
+      scene, kids, fxRoot, ink, contact, cam: new THREE.PerspectiveCamera(30, 1, 0.08, 240),
+      set: null, ready: false, failed: false, quality: null, k: 0, t: 0, gone: 0,
+      fx: [new InkFX(fxRoot, ink[0], this.rand), new InkFX(fxRoot, ink[1], this.rand)],
+      sparks: new Sparkles(fxRoot, makeSparkMaterial(), this.rand), trail: new InkTrail(fxRoot),
+      members: new Map(), colors: [new THREE.Color(0xff8a14), new THREE.Color(0x2f5bff)], myTeam: null, room: false, initial: false,
+      decks: [], fits: {}, shot: null, shotFrom: null, shotT: 9, cs: null, setT: -1, launchT: -1, seq: 0, nextIn: 0, reduced: false,
+      kFront: 150, bg: new THREE.Color(0x0a0f1c), U: null,
+    });
+    this._lobLoad(L);
+    return L;
+  }
+
+  // The set module loads lazily; everything it will draw (the alley, a squidkid in both forms under its lights, the FX)
+  // is compiled off the critical path before it may dissolve in, so its first frame never hitches.
+  _lobLoad(L) {
+    import('./lobbySet.js').then(async (mod) => {
+      if (this.lob !== L) return;
+      const q = G.settings?.quality || 'high';
+      const set = new mod.LobbySet(this.r, { quality: q, texlib: G.game?.texlib || null });
+      L.set = set; L.quality = q;
+      L.scene.add(set.root);
+      await set.ready;
+      if (this.lob !== L) { set.dispose(); return; }
+      this._lobDecks(L);
+      this._lobColors();
+      const warm = new this.CharacterClass({ color: L.colors[0].clone(), weapon: 'shooter', style: this._profileStyle(), name: 'warm', isLocal: false });
+      warm.root.position.copy(set.hubSpot.pos);
+      L.kids.add(warm.root);
+      warm.update(1 / 30, this._anim());
+      if (warm.kid) warm.kid.visible = true;
+      if (warm.squidRoot) warm.squidRoot.visible = true;
+      const C = set.camera;
+      this._placeLook(L.cam, C.pos, C.target, C.fov, innerWidth / 2, innerHeight / 2, innerWidth, innerHeight);
+      this._lobEnv(L);
+      try { if (this.r.compileAsync) await this.r.compileAsync(L.scene, L.cam); else this.r.compile(L.scene, L.cam); } catch (e) { console.warn('[showcase] lobby set warm-up', e); }
+      L.kids.remove(warm.root); warm.dispose?.();
+      if (this.lob !== L) return;
+      L.ready = true;
+    }).catch((e) => { console.error('[showcase] lobby set', e); L.failed = true; });
+  }
+
+  _lobEnv(L) {
+    const S = L.set;
+    L.scene.environment = (S && S.environment) || G.env?.envMap || null;
+    L.scene.environmentIntensity = S && S.environmentIntensity != null ? S.environmentIntensity : 0.5;
+    if (S && S.fog) L.scene.fog = S.fog;
+    if (S && S.background && S.background.isColor) L.bg.copy(S.background);
+  }
+
+  // droplets land on the dock (a disc over the rivals' marks) or the asphalt
+  _lobDecks(L) {
+    const sp = L.set.spots, F = sp.slice(0, 4), B = sp.slice(4, 8);
+    const avg = (a, k) => a.reduce((s, p) => s + p.pos[k], 0) / a.length;
+    const bx = avg(B, 'x'), bz = avg(B, 'z');
+    let br = 0;
+    for (const p of B) br = Math.max(br, Math.hypot(p.pos.x - bx, p.pos.z - bz));
+    L.groundY = avg(F, 'y');
+    L.decks = [{ x: bx, z: bz, r: br + 1.0, y: avg(B, 'y') + 0.002 }, { x: 0, z: 0, r: 1e4, y: L.groundY + 0.002 }];
+  }
+
+  // release the whole set (GPU resources included) — the online screens were left for good
+  _lobRelease() {
+    const L = this.lob;
+    if (!L) return;
+    this.lob = null;
+    for (const M of L.members.values()) if (M.c) { M.c.dispose?.(); M.c = null; }
+    L.members.clear();
+    if (L.set) { L.set.dispose(); L.set = null; }
+    for (const f of L.fx) { f.mesh.geometry.dispose(); f.splats.geometry.dispose(); f.rings.geometry.dispose(); }
+    for (const m of L.ink) m.dispose();
+    L.sparks.mesh.geometry.dispose(); L.sparks.mesh.material.dispose();
+    L.trail.dispose();
+    L.scene.clear();
+  }
+
+  _enterSetMode(mode) {
+    // a studio overlay on screen (pedestal / podium) dissolves away over the set instead of cutting
+    if (OVERLAY.has(this.mode) && this.chars.length) { this._lastMode = this.mode; this._out = this._outDur = SET_FADE; }
+    this.mode = mode;
+  }
+
+  _lobShot(kind) {
+    const L = this.lob;
+    if (L.shot === kind) return;
+    // on screen: glide between the framings; otherwise cut (the set dissolves in already framed)
+    if (L.shot && L.k > 0.05 && !L.reduced) { L.shotFrom = L.shot; L.shotT = 0; } else L.shotFrom = null;
+    L.shot = kind;
+  }
+
+  /** Online hub (menus.js 'online'): your kid on the set's hub spot, framed right of the create / join cards. */
+  showHub(style, color, weapon) {
+    const L = this._lobEnsure();
+    if (!color || !color.isColor) color = new THREE.Color(color || this.color);
+    const look = style ? { ...style } : this._profileStyle();
+    weapon = weapon || G.game?.profile?.weapon || 'shooter';
+    this._enterSetMode('hub');
+    this._lobShot('hub');
+    if (this.ui.hub) this.ui.hub.next = 0;
+    L.setT = -1; L.launchT = -1;
+    if (!L.room) {
+      L.myTeam = 0;
+      L.colors[0].copy(color);
+      const rv = G.teamColors && G.teamColors[1];
+      if (rv) L.colors[1].set(rv.isColor ? rv : new THREE.Color(rv));
+      this._lobColors(true);
+    }
+    let M = L.members.get(HUB_ID) || [...L.members.values()].find((m) => m.you && !m.dead && !m.leaving);
+    if (M && M.id !== HUB_ID) { L.members.delete(M.id); M.id = HUB_ID; L.members.set(HUB_ID, M); }
+    if (!M) {
+      M = this._lobNew({ id: HUB_ID, name: 'You', you: true, weapon, style: look }, styleKey(look));
+      L.members.set(HUB_ID, M);
+      M.mark = 'hub'; M.fresh = false;
+      this._lobArrive(M, 'pop', 0.3);   // bursts out of a puddle once the alley is up
+      return;
+    }
+    M.you = true; M.ready = false; M.leaving = false; M.team = 0; M.wantTeam = 0;
+    this._lobChange(M, weapon, look, false);
+    if (M.mark !== 'hub') {
+      M.mark = 'hub';
+      if (this._lobStanding(M) && L.k > 0.05) this._lobDepart(M, 'duck');
+      else if (M.phase !== 'dive' && M.phase !== 'swim') this._lobArrive(M, 'stand', 0);
+    } else if (M.phase === 'launched' || M.phase === 'off') this._lobArrive(M, 'stand', 0);
+  }
+
+  /** opts.reduced: prefers-reduced-motion (no camera drift or glides). opts.quick is accepted for compatibility: coming
+   *  back to a room whose line-up is parked here (locker, a match) always finds everyone already standing. */
+  showLobby(players, colors, opts = {}) {
+    const L = this._lobEnsure();
+    L.reduced = !!opts.reduced;
+    if (this.mode !== 'lobby') {
+      this._enterSetMode('lobby');
+      this._lobShot('lobby');
+      if (this.ui.lob) this.ui.lob.next = 0;
+      L.launchT = -1; L.setT = -1;
+      if (L.room) {
+        // back in the room: everyone is simply there (looks / weapons changed meanwhile are already on)
+        for (const M of L.members.values()) {
+          if (M.dead || M.leaving || M.id === HUB_ID || typeof M.mark !== 'number') continue;
+          if (M.phase === 'launched' || M.phase === 'off' || M.phase === 'wait' || M.act) { M.act = null; M.q.length = 0; this._lobArrive(M, 'stand', 0); }
+        }
+      }
+    }
+    const first = !L.room;
+    L.room = true;
+    L.initial = first;
+    this.updateLobby(players, colors);
+    L.initial = false;
+  }
+
+  updateLobby(players, colors) {
+    const L = this.lob;
+    if (!L || !L.room) return;
+    let palette = false;
+    if (colors && colors.length >= 2) {
+      for (let t = 0; t < 2; t++) {
+        const nc = this._c.set(colors[t].isColor ? colors[t] : new THREE.Color(colors[t]));
+        if (!L.colors[t].equals(nc)) { L.colors[t].copy(nc); palette = true; }
+      }
+    }
+    let recolor = palette;
+    const list = Array.isArray(players) ? players.filter((p) => p && p.id != null) : [];
+    const me = list.find((p) => p.you);
+    const teamOf = (p) => (p.team === 1 ? 1 : 0);
+    const myTeam = me ? teamOf(me) : (L.myTeam ?? 0);
+    const flip = L.myTeam != null && !L.initial && myTeam !== L.myTeam;
+    if (myTeam !== L.myTeam) recolor = true;
+    L.myTeam = myTeam;
+    // your hub kid becomes your room member
+    if (me && !L.members.has(me.id)) {
+      const H = L.members.get(HUB_ID);
+      if (H && !H.dead) { L.members.delete(HUB_ID); H.id = me.id; L.members.set(me.id, H); }
+    }
+    const seen = new Set();
+    for (const p of list) {
+      seen.add(p.id);
+      const team = p.you || teamOf(p) === myTeam ? 0 : 1;
+      let M = L.members.get(p.id);
+      if (M && M.dead) { L.members.delete(p.id); M = null; }
+      const skey = styleKey(p.style);
+      if (!M) {
+        M = this._lobNew(p, skey);
+        M.team = M.wantTeam = team; M.fresh = true;
+        L.members.set(p.id, M);
+        continue;
+      }
+      M.name = p.name || M.name; M.host = !!p.host; M.you = !!p.you; M.wantTeam = team;
+      if (M.leaving && M.phase !== 'dive') M.leaving = false;   // left and came straight back: the swim-out turns into an arrival
+      this._lobChange(M, p.weapon, p.style, !!p.ready, skey);
+    }
+    for (const M of L.members.values()) if (!seen.has(M.id) && M.id !== HUB_ID && !M.leaving && !M.dead) this._lobLeave(M);
+    if (recolor) this._lobColors(palette && !flip);
+    this._lobSlots(flip);
+  }
+
+  // weapon / look / ready changes: a reaction on a kid standing on its mark; silent (already on at its entrance)
+  // while it's off stage; queued (played once it lands) while it's travelling
+  _lobChange(M, weapon, style, ready, skey = styleKey(style)) {
+    const onStage = this._lobStanding(M) && this.lob.k > 0.05;
+    const hidden = !M.c || !M.c.root.visible || M.phase === 'wait' || M.phase === 'off' || M.phase === 'launched' || this.lob.k <= 0.05;
+    if (weapon && weapon !== M.weapon) {
+      M.weapon = weapon;
+      if (hidden) { if (M.c) { M.kind = weaponKind(M.weapon); M.c.setWeapon(M.kind); } } else this._lobAct(M, { kind: 'hop' });
+    }
+    if (style && skey !== M.skey) {
+      M.skey = skey; M.style = { ...style };
+      if (hidden) { if (M.c) { this.lob.kids.remove(M.c.root); M.c.dispose?.(); M.c = null; if (M.phase !== 'wait' && M.phase !== 'off' && M.phase !== 'launched') this._lobArrive(M, 'stand', 0); } }
+      else this._lobAct(M, { kind: 'pop' });
+    }
+    if (ready !== M.ready) {
+      M.ready = ready;
+      if (onStage) this._lobAct(M, { kind: ready ? 'ready' : 'unready' });
+      else if (M.c && M.a.form === 'kid') M.c.setDance(ready ? 'lobby_pose' : M.danceIdle);
+    }
+  }
+
+  _lobNew(p, skey) {
+    const L = this.lob;
+    return {
+      id: p.id, name: p.name || 'Squidkid', you: !!p.you, host: !!p.host, ready: !!p.ready, weapon: p.weapon || 'shooter',
+      style: p.style ? { ...p.style } : {}, skey, team: 0, wantTeam: 0, mark: null, at: null, dest: null, c: null, a: this._anim(), kind: null,
+      phase: 'off', t0: 0, delay: 0, flag: 0, enter: null, fresh: false, path: null, s: 0, v: 0, onEnd: null, leap: null, dive: null, after: null,
+      pos: new THREE.Vector3(), yaw: 0, y: 0, sy: 1, vis: 0, plateH: PLATE_H, trailS: 0, hy: 0, popAnt: 0.3, puddle: false,
+      act: null, q: [], leaving: false, dead: false,
+      danceIdle: (L.seq++ & 1) ? 'locker_idle' : 'menu_idle', idleT: 6 + this.rand() * 8, gT: 1 + this.rand() * 3, gY: 0, gV: 0, gTarget: 0, gHold: 0,
+      pop: null, popT: 0, yawOff: (this.rand() - 0.5) * 0.1,
+    };
+  }
+
+  _lobSpot(mark) {
+    const S = this.lob && this.lob.set;
+    if (!S || mark == null) return null;
+    return mark === 'hub' ? S.hubSpot : S.spots[mark] || null;
+  }
+  _lobRowColor(team) { const L = this.lob, t = L.myTeam === 1 ? 1 : 0; return L.colors[team ? 1 - t : t]; }
+  _lobStanding(M) { return !!(M.c && M.c.root.visible && (M.phase === 'idle' || M.phase === 'land')); }
+
+  // team colours → ink materials (by row), the set's own dressing; kids too on a palette change (`kids`) — a side swap
+  // shows on each kid as it dives through the ink instead
+  _lobColors(kids = false) {
+    const L = this.lob;
+    const a = this._lobRowColor(0), b = this._lobRowColor(1);
+    for (let i = 0; i < 2; i++) {
+      const c = i ? b : a;
+      L.ink[i].color.copy(c);
+      L.ink[i].sheenColor.copy(c).lerp(this._c.setRGB(1, 1, 1), 0.55);
+    }
+    // (the set re-bakes its environment map on a colour change: only when the colours really changed)
+    const key = a.getHexString() + b.getHexString();
+    if (L.set && L.sentCols !== key) { L.sentCols = key; L.set.setTeamColors?.(a, b); }
+    if (kids) for (const M of L.members.values()) if (M.c && !M.dead) M.c.setColor(this._lobRowColor(M.team));
+  }
+
+  _lobChar(M) {
+    const kind = weaponKind(M.weapon);
+    const c = new this.CharacterClass({ color: this._lobRowColor(M.team).clone(), weapon: kind, style: { ...M.style }, name: M.name || 'Squidkid', isLocal: false });
+    c.root.rotation.order = 'YXZ';
+    c.setDance(M.ready ? 'lobby_pose' : M.danceIdle);
+    c.root.visible = false;
+    this.lob.kids.add(c.root);
+    M.c = c; M.kind = kind;
+    return c;
+  }
+
+  // slots: you = front centre (mark 0); everyone keeps their mark while their team is unchanged; newcomers fill
+  // centre-out (the set orders its spots front 0..3, rivals 4..7)
+  _lobSlots(flip) {
+    const L = this.lob;
+    const taken = [[null, null, null, null], [null, null, null, null]];
+    const live = [...L.members.values()].filter((M) => !M.leaving && !M.dead && M.id !== HUB_ID);
+    const cur = (M) => (typeof M.dest === 'number' ? M.dest : typeof M.mark === 'number' ? M.mark : null);
+    for (const M of live) if (M.you) { taken[0][0] = M; this._lobMove(M, 0, flip, 0); }
+    for (const M of live) {
+      if (M.you) continue;
+      const m = cur(M);
+      if (!flip && m != null && (m >> 2) === M.wantTeam && !taken[m >> 2][m & 3] && m !== 0) taken[m >> 2][m & 3] = M;
+    }
+    let k = 0;
+    for (const M of live) {
+      if (M.you) continue;
+      const m = cur(M);
+      if (m != null && taken[m >> 2][m & 3] === M) { this._lobMove(M, m, false, 0); continue; }
+      const order = M.wantTeam ? [0, 1, 2, 3] : [1, 2, 3];
+      const s = order.find((i) => !taken[M.wantTeam][i]);
+      if (s == null) { this._lobMove(M, null, flip, k++); continue; }   // overflow (never with ≤ 4 a side)
+      taken[M.wantTeam][s] = M;
+      this._lobMove(M, M.wantTeam * 4 + s, flip, k++);
+    }
+  }
+
+  _lobMove(M, mark, flip, k) {
+    const L = this.lob;
+    const first = M.fresh;
+    if (!first && M.mark === mark && !flip) return;
+    M.fresh = false;
+    M.mark = mark;
+    if (mark == null) { this._lobHide(M); return; }
+    if (first) {
+      if (!L.initial) {
+        // a real arrival: swim in from the alley mouth, spaced out behind anyone already on the way
+        const d = Math.max(0.12, L.nextIn - L.t);
+        L.nextIn = L.t + d + 0.62;
+        this._lobArrive(M, 'swim', d);
+      } else if (M.you) this._lobArrive(M, 'pop', L.k > 0.05 ? 0.2 : 0);
+      else if (L.k > 0.05 && L.shot === 'lobby' && L.shotFrom) this._lobArrive(M, 'pop', 0.95 + 0.13 * k);   // the room surfaces around you
+      else this._lobArrive(M, 'stand', 0);
+      return;
+    }
+    if (this._lobStanding(M) && L.k > 0.05) {
+      // on its mark: a flip (you changed teams: everyone swaps sides) ducks through the ink; one kid switching swims over
+      if (flip || typeof M.at !== 'number') this._lobDepart(M, 'duck', flip ? 0.05 + 0.08 * k : 0);
+      else this._lobDepart(M, 'switch', 0.08 * k);
+    } else if (M.phase === 'wait' || M.phase === 'off' || M.phase === 'launched' || !M.c || !M.c.root.visible || L.k <= 0.05) {
+      if (M.phase !== 'wait') this._lobArrive(M, 'stand', 0);
+    }
+    // travelling (swim / leap / pop / dive): it finishes the trip, then heads for the new mark (see _lobStep 'land')
+  }
+
+  _lobArrive(M, how, delay) {
+    M.phase = 'wait'; M.enter = how; M.delay = delay; M.act = null; M.q.length = 0; M.vis = 0; M.path = null;
+    if (M.c) M.c.root.visible = false;
+    if (how === 'stand' && this.lob.ready) this._lobBegin(M);
+  }
+
+  _lobHide(M) { M.phase = 'off'; M.vis = 0; M.path = null; if (M.c) M.c.root.visible = false; }
+
+  _lobLeave(M) {
+    M.leaving = true;
+    const L = this.lob;
+    if (!M.c || !M.c.root.visible || M.phase === 'wait' || M.phase === 'off' || M.phase === 'launched' || L.k <= 0.05) { this._lobDispose(M); return; }
+    if (M.phase === 'swim' && M.onEnd !== 'gone' && M.path) {
+      // turned back mid-arrival: swim out the way it came
+      const P = M.path, n = P.pts.length;
+      let i = 0;
+      while (i < n - 1 && P.cum[i] < M.s) i++;
+      const back = P.pts.slice(0, i + 1).reverse();
+      back[0] = M.pos.clone();
+      M.path = makePath(back.length > 1 ? back : [M.pos.clone(), P.pts[0]], null);
+      M.s = 0; M.onEnd = 'gone';
+    } else if (this._lobStanding(M)) this._lobDepart(M, 'leave');
+    // leaping / popping / diving: it leaves as soon as it has landed (see _lobIdle)
+  }
+
+  _lobDispose(M) {
+    M.dead = true;
+    if (M.c) { this.lob.kids.remove(M.c.root); M.c.dispose?.(); M.c = null; }
+    if (this.lob.members.get(M.id) === M) this.lob.members.delete(M.id);
+  }
+
+  // A standing kid sets off: turns toward where it's going, hops and dives into its own ink, then (see _lobAfterDive)
+  // swims the route ('leave' → out of the alley · 'switch' → to its new mark) or surfaces on its new mark ('duck').
+  // 'vanish': the room dissolving around you as you leave it (dives and is gone).
+  _lobDepart(M, how, delay = 0) {
+    const L = this.lob, S = L.set;
+    M.after = how; M.phase = 'dive'; M.t0 = L.t + delay; M.flag = 0; M.act = null; M.q.length = 0; M.path = null;
+    let yaw = M.yaw;
+    if (S && (how === 'leave' || how === 'switch')) {
+      const raw = how === 'leave' ? S.exitPath(M.at) : this._lobRoute(M.at, M.mark);
+      if (raw && raw.length) {
+        raw[0] = M.pos.clone();
+        M.path = makePath(raw, this._lobAvoid(M));
+        pathAt(M.path, Math.min(0.7, M.path.len), _v, _d);
+        yaw = Math.atan2(_d.x, _d.z);
+      }
+    }
+    M.dive = { yaw };
+  }
+
+  // mark → mark along the set's own corridors: out along the old mark's exit path until it meets the new mark's lane
+  // (same level: the dock is only climbed by its stairs), then in along that lane
+  _lobRoute(from, to) {
+    const S = this.lob.set;
+    if (typeof from !== 'number') return [this._lobSpot(from)?.pos.clone() || new THREE.Vector3(), S.spots[to].pos.clone()];
+    const dense = (pts) => {
+      const out = [pts[0].clone()];
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i], n = Math.max(1, Math.ceil(a.distanceTo(b) / 0.5));
+        for (let k = 1; k <= n; k++) out.push(new THREE.Vector3().lerpVectors(a, b, k / n));
+      }
+      const cum = [0];
+      for (let i = 1; i < out.length; i++) cum.push(cum[i - 1] + out[i].distanceTo(out[i - 1]));
+      return { p: out, cum };
+    };
+    const E = dense(S.exitPath(from)), N = dense(S.lanes(to));
+    const nl = N.cum[N.cum.length - 1];
+    let best = 1e9, bi = 0, bj = N.p.length - 1;
+    for (let i = 0; i < E.p.length; i++) {
+      for (let j = 0; j < N.p.length; j++) {
+        if (Math.abs(E.p[i].y - N.p[j].y) > 0.12) continue;
+        const c = E.cum[i] + 1.7 * E.p[i].distanceTo(N.p[j]) + (nl - N.cum[j]);
+        if (c < best) { best = c; bi = i; bj = j; }
+      }
+    }
+    return [...E.p.slice(0, bi + 1), ...N.p.slice(bj)];
+  }
+
+  // kids standing on their marks, for swimmers to steer round
+  _lobAvoid(M) {
+    const out = [];
+    for (const N of this.lob.members.values()) if (N !== M && !N.dead && this._lobStanding(N)) out.push(N.pos);
+    return out;
+  }
+
+  /** Queue a one-shot on a member (weapon hop, look pop, ready flourish, emote, launch). `now` pre-empts. */
+  _lobAct(M, act, now = false) {
+    if (act.kind === 'hop' || act.kind === 'pop') { const i = M.q.findIndex((a) => a.kind === act.kind); if (i >= 0) M.q.splice(i, 1); }
+    if (now) { M.q.length = 0; M.act = null; }
+    M.q.push(act);
+  }
+
+  lobbyEmote(id, name) {
+    const M = this.lob && this.lob.members.get(id);
+    if (!M || M.dead || M.leaving || !LOB_EMOTES[name] || !this._lobStanding(M)) return;
+    const i = M.q.findIndex((a) => a.kind === 'emote');
+    if (i >= 0) M.q.splice(i, 1);
+    if (M.act && M.act.kind === 'emote') M.act.end = true;
+    M.q.push({ kind: 'emote', name });
+  }
+
+  /** Countdown started: everyone drops what they're doing and squares up in the ready stance; the camera leans in. */
+  lobbyGetSet() {
+    const L = this.lob;
+    if (!L || this.mode !== 'lobby') return;
+    L.setT = L.t;
+    for (const M of L.members.values()) {
+      if (M.dead || M.leaving || !this._lobStanding(M)) continue;
+      M.q.length = 0;
+      if (M.act && M.act.kind !== 'jumpout') M.act = null;
+      M.gTarget = 0; M.gHold = 0; M.gT = 9;
+      M.c.setDance('lobby_pose');
+      M.c.trigger('land', 4);
+    }
+  }
+
+  /** Match start: every kid super-jumps out, front centre first. Returns the seconds until the alley is empty. */
+  lobbyLaunch() {
+    const L = this.lob;
+    if (!L || this.mode !== 'lobby') return 0;
+    let k = 0;
+    const ms = [...L.members.values()].filter((M) => !M.dead && !M.leaving && this._lobStanding(M) && typeof M.mark === 'number')
+      .sort((a, b) => a.mark - b.mark);
+    for (const M of ms) { M.q.length = 0; M.act = null; M.phase = 'idle'; M.q.push({ kind: 'jumpout', launch: true, delay: 0.07 * k++ }); }
+    L.launchT = L.t;
+    return 0.75 + 0.07 * Math.max(0, k - 1);
+  }
+
+  /** The room was left: the others duck away into the ink; your kid stays and heads back to the hub spot (showHub). */
+  leaveLobby() {
+    const L = this.lob;
+    if (!L) return;
+    let k = 0;
+    for (const M of [...L.members.values()]) {
+      if (M.dead) continue;
+      if (M.you || M.id === HUB_ID) {
+        if (M.id !== HUB_ID) { L.members.delete(M.id); M.id = HUB_ID; L.members.set(HUB_ID, M); }
+        M.ready = false; M.act = null; M.q.length = 0; M.team = M.wantTeam = 0;
+        if (M.c && M.a.form === 'kid') M.c.setDance(M.danceIdle);
+        continue;
+      }
+      M.leaving = true;
+      if (this._lobStanding(M) && L.k > 0.05) this._lobDepart(M, 'vanish', 0.04 + 0.06 * k++);
+      else this._lobDispose(M);
+    }
+    L.room = false; L.myTeam = 0; L.setT = -1; L.launchT = -1; L.nextIn = 0;
+    if (this.mode === 'lobby') this.hide();
+  }
+
+  lobbyAnchor(id, out = {}) {
+    const L = this.lob;
+    if (!L || !L.ready || L.k <= 0.02 || this.mode !== 'lobby') return null;
+    const M = L.members.get(id);
+    if (!M || M.dead || !M.c || M.phase === 'wait' || M.phase === 'off' || M.phase === 'launched') return null;
+    _v.set(M.pos.x, M.pos.y + M.y + M.plateH * M.sy, M.pos.z);
+    return this._lobProject(_v, out, M.vis, M.team, typeof M.mark === 'number' ? M.mark & 3 : 0);
+  }
+
+  lobbySlotAnchor(row, i, out = {}) {
+    const L = this.lob;
+    if (!L || !L.ready || L.k <= 0.02 || this.mode !== 'lobby' || !L.room) return null;
+    const mark = row * 4 + i, S = this._lobSpot(mark);
+    if (!S) return null;
+    let free = true;
+    for (const M of L.members.values()) if (!M.dead && !M.leaving && (M.mark === mark || M.dest === mark)) { free = false; break; }
+    _v.set(S.pos.x, S.pos.y + PLATE_H - 0.35, S.pos.z);
+    return this._lobProject(_v, out, free && L.launchT < 0 ? 1 : 0, row, i);
+  }
+
+  // screen point for a DOM plate; hidden when it would sit under a UI panel (swimmers pass behind them in the distance)
+  _lobProject(p, out, vis, row, slot) {
+    const cam = this.lob.cam, W = innerWidth, H = innerHeight;
+    _s.copy(p);
+    _v.copy(p).project(cam);
+    out.x = (_v.x + 1) * 0.5 * W; out.y = (1 - _v.y) * 0.5 * H;
+    out.behind = _v.z > 1;
+    _d.setFromMatrixColumn(cam.matrixWorld, 0);
+    _s.add(_d).project(cam);
+    out.s = Math.abs(_s.x - _v.x) * 0.5 * W / Math.max(1, this.lob.kFront);
+    const U = this.lob.U;
+    const inside = !U || (out.x > U.l + 24 && out.x < U.r - 24 && out.y > U.t + 20 && out.y < U.b + 30);
+    out.vis = inside ? vis : 0; out.row = row; out.slot = slot;
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------------------------- lobby set: update
+  _updateSet(dt) {
+    const L = this.lob;
+    if (!L) return;
+    const on = SET_MODES.has(this.mode);
+    L.k = on && L.ready ? Math.min(1, L.k + dt / SET_FADE) : Math.max(0, L.k - dt / SET_FADE);
+    if (!on && L.k <= 0) {
+      // off screen: kept (parked) while you're online — a room, the hub or a trip to the locker from either;
+      // released a moment after the online screens are left for good
+      const net = G.net && G.net.state && G.net.state !== 'offline' && G.net.state !== 'error';
+      const st = G.menus && G.menus._stack;
+      const keep = net || L.room || L.preload || (st && st.some((s) => s === 'online' || s === 'lobby')) || (G.menus && (G.menus.current === 'online' || G.menus.current === 'lobby'));
+      L.gone = keep ? 0 : L.gone + dt;
+      if (L.gone > 1.5) this._lobRelease();
+      return;
+    }
+    L.gone = 0;
+    L.preload = false;       // shown once: from here on it follows the normal parked / released rules
+    if (!L.ready) return;
+    const S = L.set;
+    const q = G.settings?.quality;
+    if (q && q !== L.quality) { L.quality = q; S.setQuality?.(q); }
+    L.t += dt;
+    L.shotT += dt;
+    S.update?.(dt, L.t);
+    // members (kids + contact shadows)
+    let ci = 0;
+    for (const M of [...L.members.values()]) {
+      this._lobStep(M, dt);
+      if (M.dead || !M.c || !M.c.root.visible || ci >= 10) continue;
+      const kidK = M.c.kidScale ?? (M.a.form === 'kid' ? 1 : 0);
+      const hgt = Math.max(0, M.y);
+      const al = kidK * (M.y < -0.05 ? 0 : 0.6 * (1 - c01(hgt / 1.4) * 0.8));
+      if (al > 0.01) this._lobContact(ci++, M.pos.x, M.pos.y + 0.004, M.pos.z, 0.66 * (1 + hgt * 0.6), al);
+    }
+    for (let i = ci; i < 10; i++) L.contact.setMatrixAt(i, ZERO_M);
+    L.contact.count = Math.max(ci, 1);
+    L.contact.instanceMatrix.needsUpdate = true;
+    if (L.contact.instanceColor) L.contact.instanceColor.needsUpdate = true;
+    L.fx[0].update(dt, L.decks); L.fx[1].update(dt, L.decks);
+    L.sparks.update(dt);
+    L.trail.update(dt);
+  }
+
+  _lobContact(i, x, y, z, size, alpha) {
+    const C = this.lob.contact;
+    _m4.makeScale(size, 1, size).setPosition(x, y, z);
+    C.setMatrixAt(i, _m4);
+    C.setColorAt(i, this._c.setRGB(alpha, 0, 0));
+  }
+
+  // start an entrance ('stand' · 'pop' out of a puddle · 'swim' in from the alley mouth)
+  _lobBegin(M) {
+    const L = this.lob, S = this._lobSpot(M.mark);
+    if (!S) return;
+    if (!M.c) this._lobChar(M);
+    const c = M.c, a = M.a, how = M.enter;
+    M.dest = M.mark; M.flag = 0; M.t0 = L.t; M.y = 0; M.sy = 1; M.act = null;
+    M.team = typeof M.mark === 'number' ? M.mark >> 2 : 0;
+    c.setColor(this._lobRowColor(M.team));
+    if (how === 'swim') {
+      const P = (M.path = makePath(L.set.lanes(M.mark), this._lobAvoid(M)));
+      M.s = 0; M.v = SWIM.v * 0.8; M.onEnd = 'leap'; M.trailS = 0;
+      const h = pathAt(P, 0, M.pos, _d);
+      M.yaw = Math.atan2(_d.x, _d.z); M.hy = h || 0;
+      a.form = 'swim'; a.grounded = true;
+      M.phase = 'swim'; M.vis = 1; M.plateH = 0.55;
+      this._lobWarm(M, SWIM.lift);
+      return;
+    }
+    M.pos.copy(S.pos); M.yaw = S.yaw + M.yawOff;
+    if (how === 'pop') {
+      M.phase = 'pop'; M.puddle = false; M.popAnt = M.popAnt || 0.3;
+      a.form = 'swim'; M.vis = 0; M.plateH = PLATE_H;
+      this._lobWarm(M, -1.2);
+      c.root.visible = false;
+      return;
+    }
+    // stand: already there, feet planted, mid-idle
+    M.phase = 'idle'; M.at = M.mark; M.vis = 1; M.plateH = PLATE_H;
+    a.form = 'kid'; a.grounded = true;
+    c.trigger('spawn');
+    c.setDance(M.ready ? 'lobby_pose' : M.danceIdle);
+    this._lobWarm(M, 0);
+  }
+
+  // settle a (re)placed kid's springs / feet / squid pose off-screen so its first visible frame is already alive
+  _lobWarm(M, y) {
+    const c = M.c, a = M.a;
+    c.root.position.set(M.pos.x, M.pos.y + y, M.pos.z);
+    c.root.rotation.set(0, M.yaw, 0);
+    c.root.scale.set(1, 1, 1);
+    for (let i = 0; i < 10; i++) { a.time += 1 / 30; c.update(1 / 30, a); }
+    c.root.visible = true;
+  }
+
+  _lobStep(M, dt) {
+    const L = this.lob, t = L.t;
+    if (M.dead || M.phase === 'off' || M.phase === 'launched') return;
+    if (M.phase === 'wait') {
+      if (M.mark == null) return;
+      // entrances wait for the alley to be on screen (a 'stand' happens at once, hidden or not)
+      if (M.enter !== 'stand' && L.k < 0.6) return;
+      M.delay -= dt;
+      if (!M.c && M.delay < 0.5) this._lobChar(M);
+      if (M.delay > 0) return;
+      this._lobBegin(M);
+      if (M.phase === 'wait') return;
+    }
+    const c = M.c;
+    if (!c) return;
+    const a = M.a, fx = L.fx[M.team ? 1 : 0];
+    a.time = G.time;
+    let y = 0, sy = 1, twirl = 0, pitch = 0, air = false, vy = 0;
+    const tau = t - M.t0;
+    if (M.phase === 'swim') {
+      // ---- low fast swim along the path; hops the stairs; brakes into the leap (or a surfacing / the alley mouth)
+      const P = M.path;
+      const sEnd = M.onEnd === 'leap' ? Math.max(0, P.len - SWIM.leap) : P.len;
+      const vEnd = M.onEnd === 'leap' ? 4.6 : M.onEnd === 'pop' ? 1.2 : SWIM.v;
+      const cap = Math.sqrt(vEnd * vEnd + 2 * SWIM.brake * Math.max(0, sEnd - M.s));
+      const inHop = P.climbs.some((C) => M.s > C.s0 - 0.4 && M.s < C.s1);
+      const vT = Math.min(SWIM.v * (inHop ? 0.62 : 1), cap);
+      M.v = M.v < vT ? Math.min(vT, M.v + SWIM.acc * dt) : Math.max(vT, M.v - SWIM.brake * 1.6 * dt);
+      M.s = Math.min(sEnd, M.s + M.v * dt);
+      const h = pathAt(P, M.s, M.pos, _d);
+      M.yaw = dampAngle(M.yaw, Math.atan2(_d.x, _d.z), 14, dt);
+      a.form = 'swim';
+      if (h !== null) { air = true; y = h; vy = (h - M.hy) / Math.max(dt, 1e-3); }
+      else y = SWIM.lift;
+      if (h !== null && M.hy === 0) fx.crown(M.pos.x, M.pos.y, M.pos.z, 0.5, 9, 0.12);   // takes off up / down the steps
+      if (h === null && M.hy > 0.05) { fx.crown(M.pos.x, M.pos.y, M.pos.z, 0.55, 10, 0.12); G.audio?.play?.('swim_splash', { volume: 0.18 }); }
+      M.hy = h || 0;
+      M.plateH = damp(M.plateH, 0.55, 8, dt);
+      if (!air) {
+        // wet trail + a little spray off the tail at speed
+        M.trailS += M.v * dt;
+        const col = this._lobRowColor(M.team), sp = c01(M.v / SWIM.v);
+        while (M.trailS >= SWIM.gap) {
+          M.trailS -= SWIM.gap;
+          const back = M.trailS + 0.16;
+          L.trail.add(M.pos.x - _d.x * back, M.pos.y, M.pos.z - _d.z * back, M.yaw, (0.068 + 0.024 * sp) * (0.85 + 0.3 * this.rand()), 0.12, col, 1.6 + this.rand() * 0.5);
+        }
+        if (this.rand() < dt * 26 * sp) {
+          const r = this.rand, side = r() < 0.5 ? -1 : 1;
+          fx.drop(M.pos.x - _d.x * 0.28 + _d.z * side * 0.07, M.pos.y + 0.05, M.pos.z - _d.z * 0.28 - _d.x * side * 0.07,
+            -_d.x * (0.6 + r()) + _d.z * side * (0.4 + r() * 0.5), 1.1 + r() * 1.3, -_d.z * (0.6 + r()) - _d.x * side * (0.4 + r() * 0.5), 0.01 + r() * 0.012, 1, 2);
+        }
+      }
+      if (M.s >= sEnd - 1e-4) this._lobSwimEnd(M, fx);
+    } else if (M.phase === 'leap') {
+      // ---- out of the ink: a squid arc that pops into the kid past the apex, turning to camera, splash-down on the mark
+      const Lp = M.leap, x = c01(tau / Lp.T);
+      M.pos.lerpVectors(Lp.p0, Lp.p1, x);
+      y = 4 * Lp.H * x * (1 - x); vy = (4 * Lp.H * (1 - 2 * x)) / Lp.T + (Lp.p1.y - Lp.p0.y) / Lp.T;
+      air = x < 1;
+      if (x > 0.42 && a.form !== 'kid') {
+        a.form = 'kid'; c.trigger('jump'); c.setDance(null);
+        this._lobInkBurst(M, fx, 7);
+      } else if (x <= 0.42) a.form = 'squid';
+      M.yaw = Lp.yaw0 + wrapA(Lp.yaw1 - Lp.yaw0) * eInOut(sstep(0.2, 1.05, x));
+      sy = a.form === 'kid' ? 1 + 0.1 * c01(vy / 4) - 0.05 * c01(-vy / 5) : 1;
+      M.plateH = damp(M.plateH, a.form === 'kid' ? PLATE_H : 0.6, 10, dt);
+      if (x >= 1) this._lobLanded(M, fx, 10);
+    } else if (M.phase === 'pop') {
+      // ---- out of a puddle on the mark: the puddle blooms, bubbles, then the kid bursts up through it
+      const ant = M.popAnt, te = tau - ant;
+      if (!M.puddle) {
+        M.puddle = true;
+        fx.splat(M.pos.x, M.pos.y, M.pos.z, 0.42, 2.6);
+        fx.ripple(M.pos.x, M.pos.y, M.pos.z, 0.05, 0.55, Math.max(0.35, ant + 0.1));
+        for (let i = 0; i < 4; i++) { const g = this.rand() * TAU, rr = 0.08 + this.rand() * 0.16; fx.bubble(M.pos.x + Math.sin(g) * rr, M.pos.y + 0.01, M.pos.z + Math.cos(g) * rr, 0.012 + this.rand() * 0.014, 0.25, 0.4 + this.rand() * 0.4); }
+      }
+      const y0 = -1.1, tp = 0.36, peak = 0.34;
+      const g = (2 * (peak - y0)) / (tp * tp), v0 = g * tp;
+      if (te < 0) { c.root.visible = false; y = y0; air = true; }
+      else {
+        c.root.visible = true;
+        y = y0 + v0 * te - 0.5 * g * te * te; vy = v0 - g * te; air = true;
+        a.form = y > -0.42 ? 'kid' : 'swim';
+        if (!M.flag && y > 0) {
+          M.flag = 1; M.vis = 1;
+          fx.crown(M.pos.x, M.pos.y, M.pos.z, 1.15, 22, 0.2);
+          c.trigger('jump');
+          this._lobSparkle(M, 8);
+          G.audio?.play?.('squid_out', { volume: 0.5 });
+        }
+        sy = 1 + 0.16 * c01(vy / 7);
+        twirl = -0.6 * (1 - eOut3(c01(te / 0.55)));
+        if (te > tp && y <= 0) { y = 0; air = false; this._lobLanded(M, fx, 7); }
+      }
+    } else if (M.phase === 'dive') {
+      // ---- turn toward the way out, crouch, hop and dive into its own ink
+      const D = M.dive;
+      if (tau >= -0.05) M.yaw = dampAngle(M.yaw, D.yaw, 11, dt);
+      const at = tau - 0.16, ant = 0.08, T = 0.36, Hh = 0.3;
+      if (at < 0) { /* turning */ }
+      else if (at < ant) sy = 1 - 0.14 * Math.sin((Math.PI * 0.5 * at) / ant);
+      else {
+        const x = Math.min(1, (at - ant) / T);
+        if (!M.flag) { M.flag = 1; c.setDance(null); c.trigger('jump'); }
+        y = 4 * Hh * x * (1 - x) - 0.1 * x * x; vy = (4 * Hh * (1 - 2 * x) - 0.2 * x) / T; air = true;
+        // turns squid right off the ground inside a burst of ink (the character's kid → squid gesture is made for the
+        // ground: mid-air it reads as a glitch), then flies the hop and dives head first into its own puddle
+        if (x > 0.12 && a.form === 'kid') { a.form = 'squid'; this._lobInkBurst(M, fx, 9); }
+        sy = a.form === 'kid' ? 1 + 0.1 * c01(vy / 2.5) : 1;
+        pitch = 1.15 * sstep(0.3, 1, x);
+        M.plateH = damp(M.plateH, a.form === 'kid' ? PLATE_H : 0.55, 10, dt);
+        if (x >= 1) { this._lobAfterDive(M, fx); if (M.dead || M.phase !== 'dive') return this._lobPoseKeep(M, dt); }
+      }
+    } else if (M.phase === 'land') {
+      sy = 1 - 0.17 * wobble(tau, 14, 6);
+      a.form = 'kid';
+      if (tau > 0.55) { M.phase = 'idle'; M.t0 = t; }
+    }
+    if (M.phase === 'idle' || M.phase === 'land') {
+      // settle the turn to camera on the mark (the gait steps it round)
+      const S = this._lobSpot(M.at);
+      if (S) M.yaw = dampAngle(M.yaw, S.yaw + M.yawOff, M.phase === 'land' ? 5 : 3, dt);
+      M.plateH = damp(M.plateH, PLATE_H, 8, dt);
+    }
+    if (M.phase === 'idle') {
+      const r = this._lobIdle(M, t, dt, fx);
+      if (M.dead || M.phase === 'launched') return;
+      if (r) { y = r.y; sy = r.sy; twirl = r.twirl; pitch = r.pitch; air = r.air; vy = r.vy; }
+    }
+    this._lobPose(M, y, sy, twirl, pitch, air, vy, dt);
+  }
+
+  // hold the last pose for the frame a phase handed over mid-step (keeps the kid drawn where it was)
+  _lobPoseKeep(M, dt) { if (M.c && M.c.root.visible) this._lobPose(M, M.y, M.sy, 0, 0, true, 0, dt); }
+
+  _lobSwimEnd(M, fx) {
+    const L = this.lob;
+    if (M.onEnd === 'leap') {
+      const S = this._lobSpot(M.mark) || this._lobSpot(M.dest);
+      if (!S) return;
+      M.dest = M.mark;
+      const p0 = M.pos.clone(), p1 = S.pos.clone();
+      const span = Math.hypot(p1.x - p0.x, p1.z - p0.z);
+      M.leap = { p0, p1, T: SWIM.T * (0.8 + 0.2 * c01(span / SWIM.leap)), H: SWIM.H + Math.max(0, p1.y - p0.y) * 0.4, yaw0: M.yaw, yaw1: S.yaw + M.yawOff };
+      M.phase = 'leap'; M.t0 = L.t; M.flag = 0;
+      M.a.form = 'squid';
+      fx.crown(p0.x, p0.y, p0.z, 0.9, 16, 0.14);
+      fx.ripple(p0.x, p0.y, p0.z, 0.06, 0.5, 0.5);
+      G.audio?.play?.('squid_out', { volume: 0.35 });
+    } else if (M.onEnd === 'pop') {
+      M.phase = 'pop'; M.t0 = L.t; M.flag = 0; M.puddle = false; M.popAnt = 0.08; M.dest = M.mark;
+    } else {
+      // out of the alley: gone (or, if it changed its mind on the way out, straight back in)
+      M.c.root.visible = false; M.vis = 0; M.path = null;
+      if (M.leaving) this._lobDispose(M); else this._lobArrive(M, 'swim', 0.35);
+    }
+  }
+
+  _lobAfterDive(M, fx) {
+    const L = this.lob, how = M.after;
+    // a team change shows as it hits the ink: the squid comes out of the splash in its new colour
+    M.team = typeof M.mark === 'number' ? M.mark >> 2 : 0;
+    M.c.setColor(this._lobRowColor(M.team));
+    fx = L.fx[M.team ? 1 : 0];
+    fx.crown(M.pos.x, M.pos.y, M.pos.z, 1.0, 18, 0.18);
+    fx.splat(M.pos.x, M.pos.y, M.pos.z, 0.3, 1.8);
+    fx.ripple(M.pos.x, M.pos.y, M.pos.z, 0.08, 0.6, 0.55);
+    G.audio?.play?.('squid_in', { volume: 0.35 });
+    M.a.form = 'swim'; M.at = null;
+    if (how === 'vanish' || (how === 'leave' && !M.path)) { this._lobDispose(M); return; }
+    if (how === 'duck') {
+      const S = this._lobSpot(M.mark);
+      const far = S && Math.hypot(S.pos.x - M.pos.x, S.pos.z - M.pos.z) > 0.7 && Math.abs(S.pos.y - M.pos.y) < 0.2;
+      M.dest = M.mark;
+      if (far) { M.path = makePath([M.pos.clone(), S.pos.clone()], this._lobAvoid(M)); M.phase = 'swim'; M.onEnd = 'pop'; M.s = 0; M.v = 1.5; M.trailS = 0; }
+      else { M.popAnt = 0.1; this._lobArrive(M, 'pop', 0.1); }
+      return;
+    }
+    M.phase = 'swim'; M.s = 0; M.v = 1.6; M.trailS = 0; M.hy = 0;
+    M.onEnd = how === 'leave' ? 'gone' : 'leap';
+    M.dest = how === 'leave' ? null : M.mark;
+  }
+
+  _lobLanded(M, fx, amp) {
+    const L = this.lob, c = M.c;
+    M.phase = 'land'; M.t0 = L.t; M.at = M.dest = M.mark; M.vis = 1; M.leap = null; M.path = null; M.popAnt = 0.3;
+    M.a.form = 'kid';
+    c.trigger('land', amp);
+    c.setDance(M.ready ? 'lobby_pose' : M.danceIdle);
+    fx.crown(M.pos.x, M.pos.y, M.pos.z, amp > 8 ? 1.2 : 0.75, amp > 8 ? 24 : 14, 0.22);
+    fx.splat(M.pos.x, M.pos.y, M.pos.z, 0.34, 2.8);
+    if (amp > 8) { fx.ripple(M.pos.x, M.pos.y, M.pos.z, 0.15, 0.95, 0.65); this._lobSparkle(M, 10); G.audio?.play?.('splat_small', { volume: 0.35 }); }
+    this._lobNotice(M);
+  }
+
+  // a kid lands: the others glance over at it
+  _lobNotice(M) {
+    for (const N of this.lob.members.values()) {
+      if (N === M || N.dead || N.phase !== 'idle' || N.act || this.rand() < 0.25) continue;
+      N.gTarget = this._lobYawTo(N, M.pos); N.gHold = 1; N.gT = 1.2 + this.rand() * 0.8;
+    }
+  }
+
+  // yaw (kid space) toward a world point, clamped to a head turn
+  _lobYawTo(M, p) {
+    const yaw = M.c ? M.c.root.rotation.y : M.yaw;
+    const dx = p.x - M.pos.x, dz = p.z - M.pos.z;
+    const kx = dx * Math.cos(yaw) - dz * Math.sin(yaw), kz = dx * Math.sin(yaw) + dz * Math.cos(yaw);
+    return Math.max(-1, Math.min(1, Math.atan2(kx, kz)));
+  }
+
+  _lobInkBurst(M, fx, n) {
+    const r = this.rand, y = M.pos.y + M.y + 0.2;
+    for (let i = 0; i < n; i++) {
+      const g = r() * TAU, sp = 0.6 + r() * 1.1;
+      fx.drop(M.pos.x, y, M.pos.z, Math.sin(g) * sp, 0.4 + r() * 1.4, Math.cos(g) * sp, 0.012 + r() * 0.014, 1, 2);
+    }
+  }
+
+  // idle life + one-shots (hop / pop / ready / unready / emote / jumpout); returns the pose offsets
+  _lobIdle(M, t, dt, fx) {
+    const c = M.c, a = M.a, P = M.pos;
+    let y = 0, sy = 1, twirl = 0, pitch = 0, air = false, vy = 0;
+    // pending business once back on the ground: leave, or head for a mark it was reassigned to on the way in
+    if (!M.act) {
+      if (M.leaving) { this._lobDepart(M, 'leave'); return null; }
+      if (M.mark != null && M.mark !== M.at && this.lob.k > 0.05) { this._lobDepart(M, typeof M.at === 'number' && typeof M.mark === 'number' ? 'switch' : 'duck'); return null; }
+    }
+    if (!M.act && M.q.length) {
+      M.act = M.q.shift();
+      M.act.t0 = t + (M.act.delay || 0);
+      M.act.flag = 0;
+      if (M.act.kind === 'emote') {
+        const E = LOB_EMOTES[M.act.name];
+        c.setDance(E.dance); c.danceVar = E.v; if (E.t0) c.danceT = E.t0;
+        if (E.trig) c.trigger(E.trig);
+        if (!E.hop) c.trigger('jump');
+        this._lobSparkle(M, 6);
+      } else if (M.act.kind === 'ready') c.trigger('jump');
+    }
+    const A = M.act;
+    const at = A ? t - A.t0 : 0;
+    if (A && at >= 0) {
+      if (A.kind === 'hop') {
+        // weapon swap: crouch, spin-hop, the new weapon pops into the hand mid-air, splash on landing
+        const ant = 0.075, T = 0.46, H = 0.3;
+        if (at < ant) sy = 1 - 0.1 * Math.sin((Math.PI * 0.5 * at) / ant);
+        else if (at < ant + T) {
+          const x = (at - ant) / T;
+          y = 4 * H * x * (1 - x); vy = (4 * H * (1 - 2 * x)) / T; air = true;
+          twirl = TAU * eInOut(x);
+          sy = 1 + 0.12 * c01(vy / 3) - 0.04 * c01(-vy / 3);
+          if (!A.flag && x > 0.12) {
+            A.flag = 1;
+            if (M.pop) M.pop.scale.setScalar(1);
+            const kind = weaponKind(M.weapon);
+            c.setWeapon(kind); M.kind = kind;
+            M.pop = c.weapon?.pivot || null;
+            if (M.pop) { M.pop.scale.setScalar(0.001); M.popT = t; }
+            c.trigger('jump');
+          }
+        } else if (A.flag < 2) {
+          A.flag = 2; c.trigger('land', 6); fx.crown(P.x, P.y, P.z, 0.9, 18, 0.26); M.act = null;
+        }
+      } else if (A.kind === 'pop') {
+        // look swap: squash, the new kid pops out of an ink burst, twirl hop, land
+        const ant = 0.085, T = 0.34, H = 0.16;
+        if (at < ant) { sy = 1 - 0.15 * Math.sin((Math.PI * 0.5 * at) / ant); y = -0.015 * (at / ant); }
+        else {
+          if (!A.flag) { A.flag = 1; this._lobSwap(M); fx.crown(P.x, P.y, P.z, 0.85, 18, 0.3); this._lobSparkle(M, 9); M.c.trigger('jump'); }
+          const x = (at - ant) / T;
+          if (x < 1) { y = 4 * H * x * (1 - x); vy = (4 * H * (1 - 2 * x)) / T; air = true; twirl = TAU * eInOut(x); sy = 1 + 0.1 * c01(vy / 2.2) - 0.05 * c01(-vy / 2.2); }
+          else if (A.flag < 2) { A.flag = 2; M.c.trigger('land', 5); fx.crown(P.x, P.y, P.z, 0.5, 10, 0.3); M.c.trigger('wink'); }
+          if (x > 1.35) M.act = null;
+        }
+      } else if (A.kind === 'ready') {
+        // ready: a hop, fist pumps, a ring of glints and a splash ring round the feet
+        const T = 0.36, H = 0.2;
+        if (at < T) { const x = at / T; y = 4 * H * x * (1 - x); vy = (4 * H * (1 - 2 * x)) / T; air = true; sy = 1 + 0.08 * c01(vy / 2); }
+        else if (!A.flag) { A.flag = 1; M.c.trigger('land', 6); M.c.setDance('victory'); M.c.danceVar = 0; fx.crown(P.x, P.y, P.z, 0.8, 16, 0.28); fx.ripple(P.x, P.y, P.z, 0.1, 1.1, 0.8); this._lobSparkle(M, 14); }
+        else sy = 1 - 0.12 * wobble(at - T, 14, 6);
+        if (at > 1.55) { M.act = null; M.c.setDance('lobby_pose'); }
+      } else if (A.kind === 'unready') {
+        sy = 1 - 0.1 * Math.sin(Math.PI * c01(at / 0.3));
+        if (!A.flag) { A.flag = 1; M.c.trigger('land', 4); M.c.setDance(M.danceIdle); }
+        if (at > 0.4) M.act = null;
+      } else if (A.kind === 'emote') {
+        const E = LOB_EMOTES[A.name];
+        if (E.hop) { const T = 0.42; if (at < T) { const x = at / T; y = 4 * E.hop * x * (1 - x); vy = (4 * E.hop * (1 - 2 * x)) / T; air = true; } else if (!A.flag) { A.flag = 1; c.trigger('land', 7); fx.crown(P.x, P.y, P.z, 0.7, 14, 0.28); } }
+        if (at > E.dur || A.end) { M.act = null; c.setDance(M.ready ? 'lobby_pose' : M.danceIdle); }
+      } else if (A.kind === 'jumpout') {
+        // super-jump out (match start): crouch, squid, launch straight up out of frame, then park until the room is back
+        const ant = 0.13;
+        if (at < ant) sy = 1 - 0.22 * Math.sin((Math.PI * 0.5 * at) / ant);
+        else {
+          const x = at - ant;
+          if (!A.flag) {
+            A.flag = 1; M.vis = 0; a.form = 'squid'; c.trigger('jump');
+            fx.crown(P.x, P.y, P.z, 1.2, 22, 0.24); fx.ripple(P.x, P.y, P.z, 0.15, 1.1, 0.6);
+            G.audio?.play?.('super_jump', { volume: 0.4 });
+          }
+          y = 7 * x + 26 * x * x; vy = 7 + 52 * x; air = true; pitch = -Math.PI / 2; sy = 1.4;
+          if (this.rand() < 0.8) fx.drop(P.x + (this.rand() - 0.5) * 0.14, P.y + y - 0.2, P.z + (this.rand() - 0.5) * 0.14, (this.rand() - 0.5) * 0.5, -1, (this.rand() - 0.5) * 0.5, 0.012 + this.rand() * 0.016, 1, 2);
+          if (x > 0.55) { M.act = null; c.root.visible = false; a.form = 'squid'; M.phase = 'launched'; return null; }
+        }
+      }
+    }
+    if (!M.act) {
+      // idle variety: relaxed kids drift between two idles; everyone glances at a neighbour now and then
+      M.idleT -= dt;
+      if (M.idleT <= 0 && !M.ready) { M.idleT = 9 + this.rand() * 7; M.danceIdle = M.danceIdle === 'menu_idle' ? 'locker_idle' : 'menu_idle'; c.setDance(M.danceIdle); }
+      else if (!c.dance) c.setDance(M.ready ? 'lobby_pose' : M.danceIdle);
+    }
+    M.gT -= dt;
+    if (M.gT <= 0) {
+      if (M.gHold > 0 || this.rand() < 0.45) { M.gTarget = 0; M.gHold = 0; M.gT = 2 + this.rand() * 4; }
+      else { M.gTarget = this._lobGlance(M); M.gHold = 1; M.gT = 1.1 + this.rand() * 1.3; }
+    }
+    return { y, sy, twirl, pitch, air, vy };
+  }
+
+  // yaw (kid space) toward the nearest neighbour (the other team counts a little further away)
+  _lobGlance(M) {
+    let best = null, bd = 1e9;
+    for (const N of this.lob.members.values()) {
+      if (N === M || N.dead || !N.c || !N.c.root.visible) continue;
+      const d = Math.hypot(N.pos.x - M.pos.x, N.pos.z - M.pos.z) + (N.team !== M.team ? 0.8 : 0) + this.rand() * 0.9;
+      if (d < bd) { bd = d; best = N; }
+    }
+    return best ? this._lobYawTo(M, best.pos) : (this.rand() - 0.5) * 0.9;
+  }
+
+  _lobPose(M, y, sy, twirl, pitch, air, vy, dt) {
+    const c = M.c, a = M.a;
+    if (!c) return;          // released during this step (left / re-dressed / hidden): nothing left to pose
+    a.grounded = !air; a.vy = vy;
+    M.y = y; M.sy = sy;
+    if (M.pop) {
+      const k = backOut((this.lob.t - M.popT) / 0.34, 2.4);
+      M.pop.scale.setScalar(Math.max(0.001, k));
+      if (this.lob.t - M.popT > 0.34) { M.pop.scale.setScalar(1); M.pop = null; }
+    }
+    const sxz = 1 / Math.sqrt(sy);
+    c.root.position.set(M.pos.x, M.pos.y + y, M.pos.z);
+    c.root.scale.set(sxz, sy, sxz);
+    c.root.rotation.set(pitch, M.yaw + twirl, 0);
+    c.update(dt, a);
+    // swimming squids keep their eyes (gameplay hides a remote swimmer's: it's under the ink there)
+    if (a.form !== 'kid' && c.squid) { c.squid.eyes.visible = true; c.squid.dark.visible = true; }
+    // glance: spring the head toward the target on top of the dance pose
+    const k = 60, z = 11;
+    M.gV += (k * (M.gTarget - M.gY) - z * M.gV) * dt;
+    M.gY += M.gV * dt;
+    if (Math.abs(M.gY) > 0.002 && c.bones?.head && a.form === 'kid') {
+      _q2.setFromAxisAngle(UPV, M.gY * 0.62);
+      c.bones.head.quaternion.premultiply(_q2);
+    }
+  }
+
+  // a new look: rebuild the kid mid-squash (pre-warmed so it never shows a rest pose)
+  _lobSwap(M) {
+    const old = M.c;
+    const c = new this.CharacterClass({ color: this._lobRowColor(M.team).clone(), weapon: weaponKind(M.weapon), style: { ...M.style }, name: M.name || 'Squidkid', isLocal: false });
+    c.root.rotation.order = 'YXZ';
+    const dance = old ? old.dance : (M.ready ? 'lobby_pose' : M.danceIdle);
+    c.setDance(dance);
+    if (old) { c.danceVar = old.danceVar; c.root.position.copy(old.root.position); c.root.rotation.copy(old.root.rotation); c.root.scale.copy(old.root.scale); }
+    const a = M.a, g = a.grounded;
+    for (let i = 0; i < 12; i++) { a.time += 1 / 30; c.update(1 / 30, a); }
+    a.grounded = g;
+    if (old) { c.danceT = old.danceT; this.lob.kids.remove(old.root); old.dispose?.(); }
+    if (M.pop) M.pop = null;
+    this.lob.kids.add(c.root);
+    M.c = c;
+  }
+
+  _lobSparkle(M, n) {
+    const rnd = this.rand, P = M.pos, L = this.lob;
+    for (let i = 0; i < n; i++) {
+      const ang = (i / n) * TAU + rnd() * 0.5, rr = 0.3 + rnd() * 0.3;
+      const col = rnd() < 0.45 ? this._c.copy(this._lobRowColor(M.team)).lerp(_c1.setRGB(1, 1, 1), 0.35) : this._c.setRGB(1, 0.96, 0.84);
+      L.sparks.spawn(P.x + Math.sin(ang) * rr, P.y + 0.35 + rnd() * 1.35, P.z + Math.cos(ang) * rr, 0.07 + rnd() * 0.07, col, 0.45 + rnd() * 0.4);
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------- lobby set: camera
+  // The set's own cameras (camera = the room, hubCamera = the hub), never moved off their positions (the set keeps
+  // them clear of its walls): the fit is a zoom (fov) plus a lens shift that puts the subject inside the free area
+  // between the UI panels — all eight marks with nameplate room for the room, your kid right of the cards for the hub.
+  // Hub ⇄ room glides between the two; a slow handheld drift on top.
+  _lobCamera(W, H) {
+    const L = this.lob, t = L.t;
+    const D = this.debugCam;   // audits: { pos, target, fov } overrides the framing
+    if (D) { this._placeLook(L.cam, D.pos, D.target, D.fov || 30, W * 0.5, H * 0.5, W, H); return; }
+    const A = this._lobFrame(L.shot || 'lobby', W, H, this._fa || (this._fa = { pos: new THREE.Vector3(), tgt: new THREE.Vector3(), fov: 30, sx: 0, sy: 0 }));
+    const gliding = L.shotFrom && L.shotT < GLIDE;
+    if (gliding) {
+      const B = this._lobFrame(L.shotFrom, W, H, this._fb || (this._fb = { pos: new THREE.Vector3(), tgt: new THREE.Vector3(), fov: 30, sx: 0, sy: 0 }));
+      const k = eInOut(L.shotT / GLIDE);
+      A.pos.lerpVectors(B.pos, A.pos, k); A.tgt.lerpVectors(B.tgt, A.tgt, k);
+      A.fov = lerp(B.fov, A.fov, k); A.sx = lerp(B.sx, A.sx, k); A.sy = lerp(B.sy, A.sy, k);
+    }
+    // late layout changes ease in instead of snapping the framing
+    const cs = L.cs || (L.cs = { fov: A.fov, sx: A.sx, sy: A.sy });
+    const kk = gliding ? 1 : 1 - Math.exp(-7 * (this._fdt || 1 / 60));
+    cs.fov += (A.fov - cs.fov) * kk; cs.sx += (A.sx - cs.sx) * kk; cs.sy += (A.sy - cs.sy) * kk;
+    // the camera body never moves off the set's mark (the rivals' marks sit in the on-screen gaps between front heads
+    // by bearing from it): breathing is a slow drift of the aim plus a whisper of zoom; the countdown leans in with the
+    // lens, the launch tilts up after the jumpers
+    let fov = cs.fov;
+    if (!L.reduced) {
+      A.tgt.x += 0.05 * Math.sin(t * 0.21) + 0.015 * Math.sin(t * 0.53 + 1);
+      A.tgt.y += 0.028 * Math.sin(t * 0.17 + 2);
+      A.tgt.z += 0.03 * Math.sin(t * 0.13 + 0.4);
+      fov *= 1 + 0.006 * Math.sin(t * 0.19 + 2.1);
+      if (L.shot === 'lobby') {
+        if (L.setT >= 0) fov *= 1 - 0.05 * eInOut((t - L.setT) / 3);
+        if (L.launchT >= 0) { const k = eInOut((t - L.launchT - 0.2) / 1.1); A.tgt.y += 1.4 * k; fov *= 1 - 0.03 * k; }
+      }
+    }
+    this._placeLook(L.cam, A.pos, A.tgt, fov, cs.sx, cs.sy, W, H);
+  }
+
+  _placeLook(cam, pos, tgt, fov, sx, sy, W, H) {
+    const C = this.lob && this.lob.set && this.lob.set.camera;
+    cam.fov = fov;
+    cam.position.copy(pos);
+    cam.up.set(0, 1, 0);
+    cam.lookAt(tgt);
+    cam.near = (C && C.near) || 0.08; cam.far = (C && C.far) || 240;
+    cam.setViewOffset(W, H, W * 0.5 - sx, H * 0.5 - sy, W, H);
+    cam.updateMatrixWorld();
+  }
+
+  // framing for 'lobby' | 'hub' → o { pos, tgt, fov, sx, sy } (cached per layout)
+  _lobFrame(kind, W, H, o) {
+    const L = this.lob, S = L.set, C = kind === 'hub' ? S.hubCamera : S.camera;
+    const U = kind === 'hub' ? this._measureHub(W, H) : this._measureLobby(W, H);
+    if (kind === 'lobby') L.U = U;
+    const key = `${W}x${H}:${Math.round(U.l)}:${Math.round(U.r)}:${Math.round(U.t)}:${Math.round(U.b)}`;
+    let f = L.fits[kind];
+    if (!f || f.key !== key) {
+      const cam = L.cam;
+      this._placeLook(cam, C.pos, C.target, C.fov, W * 0.5, H * 0.5, W, H);
+      const bb = [1e9, -1e9, 1e9, -1e9];
+      const add = (x, y, z) => {
+        _v.set(x, y, z).project(cam);
+        const px = (_v.x + 1) * 0.5 * W, py = (1 - _v.y) * 0.5 * H;
+        bb[0] = Math.min(bb[0], px); bb[1] = Math.max(bb[1], px); bb[2] = Math.min(bb[2], py); bb[3] = Math.max(bb[3], py);
+      };
+      const u = Math.min(W * 0.01, H * 0.017778);
+      let z, cx, cy;
+      if (kind === 'hub') {
+        const p = S.hubSpot.pos;
+        add(p.x - 0.42, p.y, p.z); add(p.x + 0.42, p.y, p.z); add(p.x, p.y + CHAR_H, p.z); add(p.x, p.y - 0.05, p.z + 0.35);
+        const bw = bb[1] - bb[0], bh = bb[3] - bb[2];
+        const h = Math.min(0.5 * H, 0.88 * (U.b - U.t));
+        z = Math.min(h / Math.max(1, bh), (0.8 * (U.r - U.l)) / Math.max(1, bw));
+        cx = (U.l + U.r) * 0.5; cy = Math.min((U.t + U.b) * 0.5 + 0.03 * H, U.b - 0.5 * bh * z - 0.01 * H);
+      } else {
+        for (const sp of S.spots) {
+          const p = sp.pos;
+          add(p.x - 0.42, p.y - 0.05, p.z + 0.2); add(p.x + 0.42, p.y - 0.05, p.z + 0.2);
+          add(p.x, p.y + PLATE_H, p.z);
+        }
+        const top = U.t + 4.2 * u;   // nameplates stand above the anchor
+        const bw = bb[1] - bb[0], bh = bb[3] - bb[2];
+        z = Math.min((U.r - U.l) / Math.max(1, bw), (U.b - top) / Math.max(1, bh));
+        cx = (U.l + U.r) * 0.5; cy = (top + U.b) * 0.5;
+      }
+      z = Math.max(0.55, Math.min(2.6, z));
+      const fov = (2 * Math.atan(Math.tan((C.fov * Math.PI) / 360) / z) * 180) / Math.PI;
+      const bcx = W * 0.5 + ((bb[0] + bb[1]) * 0.5 - W * 0.5) * z, bcy = H * 0.5 + ((bb[2] + bb[3]) * 0.5 - H * 0.5) * z;
+      f = L.fits[kind] = { key, fov, sx: W * 0.5 + (cx - bcx), sy: H * 0.5 + (cy - bcy) };
+      if (kind === 'lobby') {
+        // px per metre at your mark (the DOM nameplates scale against it)
+        this._placeLook(cam, C.pos, C.target, f.fov, f.sx, f.sy, W, H);
+        const p = S.spots[0].pos;
+        _v.set(p.x, p.y + PLATE_H, p.z).project(cam);
+        _d.setFromMatrixColumn(cam.matrixWorld, 0);
+        _s.set(p.x, p.y + PLATE_H, p.z).add(_d).project(cam);
+        L.kFront = Math.abs(_s.x - _v.x) * 0.5 * W;
+      }
+    }
+    o.pos.copy(C.pos); o.tgt.copy(C.target); o.fov = f.fov; o.sx = f.sx; o.sy = f.sy;
+    return o;
+  }
+
+  _measureLobby(W, H) {
+    const U = this.ui, L = this.lob;
+    const u = Math.min(W * 0.01, H * 0.017778);
+    if (!U.lob) U.lob = { l: 0, r: W, t: 0, b: H, next: 0 };
+    const R = U.lob;
+    if (R.W !== W || R.H !== H) { R.next = 0; R.W = W; R.H = H; }
+    if (L.t >= R.next || R.next - L.t > 3) {
+      R.next = L.t < 2 ? L.t + 0.25 : L.t + 1.5;
+      const side = domBox('.iw-lobby:not(.is-leaving) .iw-lob__side');
+      const bar = domBox('.iw-lobby:not(.is-leaving) .iw-lob__bar');
+      const top = domBox('.iw-lobby:not(.is-leaving) .iw-lob__top'), stat = domBox('.iw-lobby:not(.is-leaving) .iw-lob__status');
+      R.l = (side && side.r < W * 0.6 ? side.r : 3.6 * u + 27 * u) + 1.2 * u;
+      R.r = W - 2.4 * u;
+      R.t = Math.max(top && top.b < H * 0.4 ? top.b : 9 * u, stat && stat.b < H * 0.4 ? stat.b : 0) + 0.4 * u;
+      R.b = (bar && bar.t > H * 0.5 ? bar.t : H - 13 * u) - 0.8 * u;
+    }
+    return R;
+  }
+
+  _measureHub(W, H) {
+    const U = this.ui, L = this.lob;
+    const u = Math.min(W * 0.01, H * 0.017778);
+    if (!U.hub) U.hub = { l: 0, r: W, t: 0, b: H, next: 0 };
+    const R = U.hub;
+    if (R.W !== W || R.H !== H) { R.next = 0; R.W = W; R.H = H; }
+    if (L.t >= R.next || R.next - L.t > 3) {
+      R.next = L.t < 2 ? L.t + 0.25 : L.t + 1.5;
+      // right of the create / join cards, under your name tag, above the weapon / look chips
+      const b = domBox('.iw-online:not(.is-leaving) .iw-hub__body');
+      const tag = domBox('.iw-online:not(.is-leaving) .iw-hub__metag'), chips = domBox('.iw-online:not(.is-leaving) .iw-hub__chips');
+      R.l = (b && b.r > W * 0.2 && b.r < W * 0.8 ? b.r : 3.6 * u + Math.min(50 * u, 0.54 * W)) + 1.2 * u;
+      R.r = W - 2.4 * u;
+      R.t = (tag && tag.b < H * 0.4 ? tag.b : 9 * u) + 0.6 * u;
+      R.b = (chips && chips.t > H * 0.5 ? chips.t : H - 12 * u) - 0.8 * u;
+    }
+    return R;
+  }
+
   // ---------------------------------------------------------------------------------------------- framing
   // Free screen areas come from the live DOM (layout boxes, transform-free) with stylesheet-formula fallbacks.
   _measureUI(W, H) {
@@ -1402,7 +2732,7 @@ export class Showcase {
         return { l: x, t: y, r: x + el.offsetWidth, b: y + el.offsetHeight };
       };
       if (PEDESTAL.has(this.mode) || PEDESTAL.has(this._lastMode)) {
-        const b = box('.iw-locker:not(.is-leaving) .iw-locker__body') || box('.iw-loadout:not(.is-leaving) .iw-loadout__body');
+        const b = box('.iw-locker:not(.is-leaving) .iw-locker__body') || box('.iw-loadout:not(.is-leaving) .iw-loadout__body') || box('.iw-online:not(.is-leaving) .iw-hub__body');
         if (b && b.r > W * 0.2 && b.r < W * 0.8) U.panelR = b.r;
       } else {
         const tt = box('.iw-results:not(.is-leaving) .iw-res__title'), hd = box('.iw-results:not(.is-leaving) .iw-res__head'), bd = box('.iw-results:not(.is-leaving) .iw-res__body');
@@ -1439,14 +2769,14 @@ export class Showcase {
   // Pedestal framing for a mode → o { fy, yaw, pitch, dist, fov, sx, sy, roll }. Loadout: whole kid + pedestal in the free
   // area right of the panel. Locker: closer, a touch lower angle, the kid fills more of the frame (the look is the point).
   _pedestalShot(mode, W, H, U, o) {
-    const t = this.t, locker = mode === 'locker';
+    const t = this.t, locker = mode === 'locker', hub = mode === 'hub';
     const fov = locker ? 23 : 25, tanH = Math.tan((fov * Math.PI) / 360);
     const freeL = U.panelR + W * 0.012, freeR = W * 0.985, freeW = Math.max(W * 0.18, freeR - freeL);
     const fy = locker ? 0.86 : LOAD_FOCUS_Y;
-    const kV = ((locker ? 0.56 : 0.6) * H) / CHAR_H, kW = ((locker ? 0.98 : 0.84) * freeW) / (2 * (PED.R + PED.flange.out));
+    const kV = ((locker ? 0.56 : hub ? 0.5 : 0.6) * H) / CHAR_H, kW = ((locker ? 0.98 : 0.84) * freeW) / (2 * (PED.R + PED.flange.out));
     const k = Math.min(kV, kW);
     let dist = H / (2 * k * tanH);
-    const sx = (freeL + freeR) * 0.5, sy = (locker ? 0.8 : 0.735) * H - fy * k;
+    const sx = (freeL + freeR) * 0.5, sy = (locker ? 0.8 : hub ? 0.68 : 0.735) * H - fy * k;
     const e = eOut3(t / 1.45);
     let yaw = 0.36 * (1 - e) + 0.03 * Math.sin(t * 0.41) * e;
     let pitch = (locker ? -0.07 : -0.1) - 0.05 * (1 - e) + 0.012 * Math.sin(t * 0.29 + 1.3) * e;
@@ -1523,7 +2853,7 @@ export class Showcase {
 
   _portraitStep() {
     // the podium lights are aimed at the results stage; portraits wait until it's gone. Shaders first (see _warmup).
-    if (this.mode === 'results' || (!this.mode && this._out > 0 && this._lastMode === 'results')) return;
+    if (this.mode === 'results' || (!OVERLAY.has(this.mode) && this._out > 0 && this._lastMode === 'results')) return;
     if (this._warmState !== 'done' || (this._pflight || 0) >= 2) return;
     while (this._pq.length && !this._pq[0].cbs.length) this._pq.shift();
     const job = this._pq.shift();
@@ -1593,7 +2923,7 @@ export class Showcase {
     const hidden = [];
     for (const o of this.scene.children) if (o.visible && !o.isLight) { o.visible = false; hidden.push(o); }
     const col = this._c2.set(req.color || this.color);
-    const idle = !this.mode && !(this._out > 0);
+    const idle = !OVERLAY.has(this.mode) && !(this._out > 0);   // studio lights are free (the set has its own)
     const keep = this._c.copy(this.color);
     const keepCol = new THREE.Color().copy(keep);
     if (idle) { this._aimLights(this._tgt.set(0, 0.8, 0), 1, 'loadout'); this._setColor(col); }
@@ -1697,43 +3027,80 @@ export class Showcase {
     const w = this._dbs.x, h = this._dbs.y;
     const comp = G.post?.composer;
     const b = comp && comp.writeBuffer;
-    if (b && b.isWebGLRenderTarget && b.depthBuffer && b.texture.type !== THREE.UnsignedByteType && Math.abs(b.width - w) <= 1 && Math.abs(b.height - h) <= 1) {
+    // the composer's buffers are single-sampled on Apple GPUs (SMAA runs there instead), but the showcase is composited
+    // after the post chain, so it keeps its own 4× target to stay anti-aliased
+    const want = (G.post?.q?.msaa ?? 4) > 0 ? G.post?.samples || 4 : 0;
+    if (b && b.isWebGLRenderTarget && b.depthBuffer && (b.samples || 0) >= want && b.texture.type !== THREE.UnsignedByteType && Math.abs(b.width - w) <= 1 && Math.abs(b.height - h) <= 1) {
       if (this._rt) { this._rt.dispose(); this._rt = null; }
       return b;
     }
-    if (!this._rt) this._rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: (G.post?.q?.msaa ?? 4) > 0 ? 4 : 0 });
+    if (!this._rt) this._rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: want ? 4 : 0 });
     else if (this._rt.width !== w || this._rt.height !== h) this._rt.setSize(w, h);
     return this._rt;
   }
 
+  // Two layers, each rendered into the MSAA HDR target and composited: the lobby set (its own scene + camera; opaque,
+  // dissolving with whatever is under it — or, while it covers the frame, drawn over a cleared canvas because main.js
+  // skipped the world), then the studio overlay (pedestal / podium, premultiplied over the frame).
   render() {
     if (this._pq.length) this._portraitStep();
-    const mode = this.mode || (this._out > 0 ? this._lastMode : null);
-    if (!mode || !this.chars.length) return;
     const r = this.r, W = innerWidth, H = innerHeight;
     this._fdt = 1 / 60;
-    if (PEDESTAL.has(mode)) this._cameraPedestal(mode, W, H); else this._cameraResults(W, H);
-    this.scene.environment = G.env?.envMap || null;
-    this.scene.environmentIntensity = (this.mood || MOODS.loadout).env;
-    const opacity = this.mode ? eOut3(this.fadeIn) : c01(this._out / 0.2);
+    const L = this.lob, setA = L && L.ready && L.set ? L.k : 0;
+    const om = OVERLAY.has(this.mode) ? this.mode : this._out > 0 ? this._lastMode : null;
+    const ov = !!(om && this.chars.length);
+    if (setA <= 0 && !ov) return;
     const prevRT = r.getRenderTarget(), prevAuto = r.autoClear, prevAlpha = r.getClearAlpha();
     r.getClearColor(this._clr);
     r.autoClear = false;
     const target = this._target();
-    r.setRenderTarget(target);
-    r.setClearColor(0x000000, 0);
-    r.clear(true, true, false);
-    r.render(this.scene, this.camera);
-    r.setRenderTarget(prevRT);
-    this.compMat.uniforms.tMap.value = target.texture;
-    this.compMat.uniforms.uOpacity.value = opacity;
-    r.render(this.compScene, this.compCam);
+    if (setA > 0) {
+      this._lobCamera(W, H);
+      this._lobEnv(L);
+      r.shadowMap.needsUpdate = true;
+      r.setRenderTarget(target);
+      r.setClearColor(L.bg, 1);
+      r.clear(true, true, false);
+      r.render(L.scene, L.cam);
+      r.setRenderTarget(prevRT);
+      const covered = this._ffFrame;   // nothing was drawn under us this frame
+      if (covered) { r.setClearColor(0x000000, 1); r.clear(true, false, false); }
+      this.compMat.uniforms.tMap.value = target.texture;
+      this.compMat.uniforms.uOpacity.value = covered ? 1 : eInOut(setA);
+      r.render(this.compScene, this.compCam);
+    }
+    if (ov) {
+      if (PEDESTAL.has(om)) this._cameraPedestal(om, W, H); else this._cameraResults(W, H);
+      this.scene.environment = G.env?.envMap || null;
+      this.scene.environmentIntensity = (this.mood || MOODS.loadout).env;
+      const opacity = OVERLAY.has(this.mode) ? eOut3(this.fadeIn) : c01(this._out / (this._outDur || 0.2));
+      r.shadowMap.needsUpdate = true;
+      r.setRenderTarget(target);
+      r.setClearColor(0x000000, 0);
+      r.clear(true, true, false);
+      r.render(this.scene, this.camera);
+      r.setRenderTarget(prevRT);
+      this.compMat.uniforms.tMap.value = target.texture;
+      this.compMat.uniforms.uOpacity.value = opacity;
+      r.render(this.compScene, this.compCam);
+    }
     this.compMat.uniforms.tMap.value = null;
     r.setClearColor(this._clr, prevAlpha);
     r.autoClear = prevAuto;
   }
 }
 const _c1 = new THREE.Color();
+// a live layout box (offset chain: transform-free, so mid-animation panels measure where they will rest)
+function domBox(sel) {
+  const list = document.querySelectorAll(sel);
+  const el = list[list.length - 1];
+  if (!el || !el.offsetParent) return null;
+  let x = 0, y = 0;
+  for (let e = el; e; e = e.offsetParent) { x += e.offsetLeft; y += e.offsetTop; }
+  return { l: x, t: y, r: x + el.offsetWidth, b: y + el.offsetHeight };
+}
+const styleKey = (st) => (st && typeof st === 'object' ? Object.keys(st).sort().map((k) => `${k}:${st[k]}`).join('|') : '');
+const weaponKind = (id) => (WEAPONS[id] && WEAPONS[id].kind) || id || 'shooter';
 function copyCanvas(src) {
   const d = document.createElement('canvas');
   d.width = src.width; d.height = src.height;

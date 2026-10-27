@@ -1,4 +1,4 @@
-// Halyard Marina — vessel prop pack. Detail meshes that dress the playable vessel blocks of
+// Halyard Marina — vessel prop pack (owner: vessels stream). Detail meshes that dress the playable vessel blocks of
 // the HALYARD layout (ferry, tug on blocks, houseboat, dinghy) plus the non-playable moored boats around the arena.
 // Registered into the PropKit by props.js; placements are exported below and merged into the stage dressing.
 //
@@ -6,7 +6,7 @@
 // by the map's 180° rotation unless `mirror: false`, so the "half" props (ferry_hull, ferry_cabin, …) dress one long
 // side + one end and the mirror copy dresses the other. The playable blocks stay the paint/collision truth: detail on
 // playable walls stands off the face by ≤ 0.12 m, never covers floors, and colliders exist only where listed in
-// the cover pieces in src/world/dressing.js or where a prop is genuinely solid and out of the lanes.
+// docs/HALYARD.md (cover pieces) or where a prop is genuinely solid and out of the lanes.
 
 export function registerMarinaVessels(D, H) {
   const { THREE, PI, TAU, HP, P3, col, shade, mixc, extrudeGeo, TIRE, LIFERING } = H;
@@ -425,7 +425,7 @@ export function registerMarinaVessels(D, H) {
   }
 
   D.ferry_hull = {
-    desc: 'HALYARD double-ended ferry: one long side of the hull (boot-top, belting, plate seams, livery lettering, anchors, draft marks, bulwark cap + guard rail, freeing ports, mooring lines) + one end (lowered car-ramp flap, corner fenders). Place at the origin; the mirror copy dresses the other side/end.',
+    desc: 'HALYARD double-ended ferry: one long side of the hull (boot-top, belting, plate seams, livery lettering, anchors, draft marks, bulwark cap + guard rail (rail collider), freeing ports, mooring lines) + one end (lowered car-ramp flap, corner fenders). Place at the origin; the mirror copy dresses the other side/end.',
     params: {}, variants: 1, mount: 'ground',
     build(B) {
       B.aoBase = null;
@@ -497,6 +497,11 @@ export function registerMarinaVessels(D, H) {
         B.cyl('metal', C.galv, 0.025, L, xm, 2.32, FZ + 0.04, { rz: HP, seg: 10 });
         B.cyl('metal', C.galv, 0.008, L, xm, 2.19, FZ + 0.04, { rz: HP, seg: 6 });
         for (const x of [x0, x1]) B.sph('metal', C.galv, 0.03, x, 2.32, FZ + 0.04, { ws: 8, hs: 6 });
+        // guard rail over the outboard edge of the bulwark top: rail collider (nobody walks off the bulwark through
+        // it; shots / ink / squids pass). 6 cm clear of the bulwark top, 0.75 m tall so a kid up there is pushed, not
+        // lifted; it reaches 0.5 m outboard of the hull so its centre lies beyond the bulwark's outer face by more than a
+        // foot's reach: a kid on the bulwark is always pushed back inboard, never overboard
+        B.col(x0 < 0 ? x0 - 0.03 : x0, 2.06, FZ - 0.5, x0 < 0 ? x1 : x1 + 0.03, 2.75, FZ + 0.1, { rail: true });
       }
       // freeing ports along the bulwark foot, hinged flaps, wet streaks weeping down the hull below
       for (let x = -13.5; x <= 13.6; x += 3.0) {
@@ -618,7 +623,7 @@ export function registerMarinaVessels(D, H) {
     build(B) {
       B.aoBase = null;
       // long wall z = -2.9 (face -Z); local frame: +Z out of the wall, +X = world -X. The livery stripe band (y 1.3…2.1)
-      // and the cabin ends carry the livery texture: everything here sits above y 2.15.
+      // and the cabin ends belong to the surfaces stream: everything here sits above y 2.15.
       B.push(0, DECK, -2.9, PI);
       glazing(B, -5.6, 5.6, 1.0, 1.9, 7);
       B.cyl('metal', C.galv, 0.02, 11.6, 0, 0.89, 0.075, { rz: HP, seg: 8 });                         // handrail under the sills
@@ -807,7 +812,7 @@ export function registerMarinaVessels(D, H) {
     for (let i = 0; i < nb; i++) B.box('wood', shade('#d2b082', B.r(0.9, 1.05)), 0.12, 0.022, W, -L / 2 + 0.06 + (i / (nb - 1)) * (L - 0.12), 0.121, 0, { r: 0.006 });
   }
   D.ferry_cargo = {
-    desc: 'Deck cargo on the ferry car deck (cover, stepped collider 2 × 2 × 0.9 / 1.4): a galvanised mesh stillage of spare fenders, buoys and rope on one pallet, a strapped stack of KRAKEN LINES cartons on the other, ratchet straps to deck rings, a sack truck.',
+    desc: 'Deck cargo on the ferry car deck (cover: carton half solid 1 × 2 × 0.9, mesh cage half 1 × 2 × 1.4 = rail): a galvanised mesh stillage of spare fenders, buoys and rope on one pallet, a strapped stack of KRAKEN LINES cartons on the other, ratchet straps to deck rings, a sack truck.',
     params: {}, variants: 1, mount: 'ground',
     build(B) {
       // low half (+X): pallet + cartons strapped to 0.9 m
@@ -848,8 +853,8 @@ export function registerMarinaVessels(D, H) {
       for (const s of [-1, 1]) B.cyl('rubber', C.black, 0.1, 0.06, -0.12, 0.1, s * 0.22, { rx: HP, seg: 14, bevel: 0.02 });
       B.cyl('metal', C.red, 0.018, 0.4, -0.05, 1.22, 0, { rx: HP, seg: 8 });
       B.pop();
-      B.col(-1, 0, -1, 1, 0.9, 1);
-      B.col(-1, 0.9, -1, 0, 1.4, 1);
+      B.col(0, 0, -1, 1, 0.9, 1);                        // strapped cartons: solid cover
+      B.col(-1, 0, -1, 0, 1.4, 1, { rail: true });      // mesh stillage cage: kids blocked, shots / ink / squids pass
       B.blob(2.4, 2.4);
     },
   };
@@ -864,7 +869,7 @@ export function registerMarinaVessels(D, H) {
   // and stanchion handrails (0.95 m above the slope, 7 cm outboard of the walking width); the rails run out onto the
   // sun deck as landing stubs and turn down to the car deck at the foot. Nothing sits on or over the treads.
   D.ferry_stair = {
-    desc: 'Ferry sun-deck stair dressing (place at the origin; mirrored): steel cheek stringers with flanges + support flats on both side faces, stanchion handrails with mid rails following the slope, landing stubs on the sun deck, foot returns. Non-colliding.',
+    desc: 'Ferry sun-deck stair dressing (place at the origin; mirrored): steel cheek stringers with flanges + support flats on both side faces, stanchion handrails with mid rails following the slope, landing stubs on the sun deck, foot returns. Handrails = rail colliders.',
     params: {}, variants: 1, mount: 'ground',
     build(B) {
       B.aoBase = null;
@@ -903,21 +908,32 @@ export function registerMarinaVessels(D, H) {
         B.tube('metal', railC, [P3(foot[0] + 0.3, foot[1] + 0.5 - 0.05, zR), ...stations.map((sv) => { const q = at(sv); return P3(q[0], q[1] + 0.5, zR); }), P3(head[0] - 0.2, head[1] + 0.5, zR), P3(head[0] - 0.55, head[1] + 0.5, zL)], 0.016, { radial: 6 });
         B.cyl('metal', shade(railC, 0.8), 0.045, 0.02, head[0] - 0.55, head[1] + 0.01, zL, { seg: 8 });   // landing foot on the sun deck
         B.cyl('metal', shade(railC, 0.8), 0.045, 0.02, foot[0] + 0.45, DECK + 0.01, zR, { seg: 8 });       // foot on the car deck
+        // rail colliders (kids can't walk off the stair side; shots / ink / squids pass). Strips stay ≥ 4.5 cm off the
+        // stair's side face and 6 cm above the decks so the level's face / bevel samples never land inside them.
+        const [c0, c1] = out < 0 ? [ze - 0.13, ze - 0.045] : [ze + 0.045, ze + 0.13];   // (-3.03 keeps the corridor's nav row at z -3.5)
+        const yS = (x) => lo[1] + (lo[0] - x) * (hi[1] - lo[1]) / (lo[0] - hi[0]);
+        B.col(lo[0], DECK + 0.06, c0, foot[0] + 0.5, DECK + 0.95, c1, { rail: true });                           // foot return
+        for (let i = 0; i < 4; i++) {
+          const xa = lo[0] - ((lo[0] - hi[0]) * i) / 4, xb = lo[0] - ((lo[0] - hi[0]) * (i + 1)) / 4;
+          B.col(xb, yS(xa) + 0.06, c0, xa, yS(xb) + 0.98, c1, { rail: true });
+        }
+        const [s0, s1] = out < 0 ? [ze + 0.005, ze + 0.1] : [c0, c1];                                          // sun-deck stub
+        B.col(head[0] - 0.55, hi[1] + 0.06, s0, hi[0], hi[1] + 0.98, s1, { rail: true });
       }
     },
   };
 
   // Tug ramp (Alpha: x 16.4…18.6, slope from z -7.6 (y 0) up to the stern at z -13 (y 2.6); the mirror dresses Bravo's).
   // Scaffold-tube guardrails on standards set just outside both edges (sole boards + base plates on the yard), top rail
-  // 0.95 m and mid rail 0.5 m above the slope, scaffold-board toe boards, couplers; the east rail is tied into the dock
-  // kit's scaffold tower (posts x 19.05, z -12.87 / -11.85) at its ledger heights and the west rail to the tug's deck
+  // 0.95 m and mid rail 0.5 m above the slope, scaffold-board toe boards, couplers; the east rail is tied into the docks
+  // stream's scaffold tower (posts x 19.05, z -12.87 / -11.85) at its ledger heights and the west rail to the tug's deck
   // rail end. Nothing over the 2.2 m walking width.
   D.tug_ramp_rails = {
-    desc: 'Scaffold-style guardrails for the tug ramp (place at the origin; mirrored): galvanised standards on sole boards, sloped top + mid rails, timber toe boards, couplers, ties into the adjacent scaffold tower and the tug deck rail. Non-colliding.',
-    params: {}, variants: 1, mount: 'ground',
-    build(B) {
+    desc: 'Scaffold-style guardrails for the tug ramp (place at the origin; mirrored): galvanised standards on sole boards, sloped top + mid rails, timber toe boards, couplers, ties into the adjacent scaffold tower and the tug deck rail. Guardrails = rail colliders.',
+    params: { z0: 'ramp foot z (-7.6)', z1: 'ramp head z (-13.0; Zone Control: -13.45, landing in the stern notch)' }, variants: 1, mount: 'ground',
+    build(B, o = {}) {
       B.aoBase = 0;
-      const z0 = -7.6, z1 = -13.0, H = 2.6, ySl = (z) => H * (z0 - z) / (z0 - z1);
+      const z0 = o.z0 ?? -7.6, z1 = o.z1 ?? -13.0, H = 2.6, ySl = (z) => H * (z0 - z) / (z0 - z1), zStern = -13.0;
       const tube = '#c3cad0', cpl = '#8f979e', board = '#b89568';
       const standards = [-7.95, -9.6, -11.25, -12.87];
       const eastStd = [-7.95, -9.6, -11.85, -12.87];                         // east standards line up with the tower posts
@@ -933,7 +949,7 @@ export function registerMarinaVessels(D, H) {
         // top + mid rails along the slope (overhang the end standards a little), toe board on edge
         const za = zs[0] + 0.25, zb = zs[zs.length - 1] - 0.06;
         for (const h of [0.95, 0.5]) B.tube('metal', tube, [P3(xs, ySl(za) + h, za), P3(xs, ySl(zb) + h, zb)], 0.024, { radial: 8 });
-        const zt0 = z0 - 0.1, zt1 = z1 + 0.08, Lt = Math.hypot(zt0 - zt1, ySl(zt1) - ySl(zt0)), angT = Math.atan2(ySl(zt1) - ySl(zt0), zt0 - zt1);
+        const zt0 = z0 - 0.1, zt1 = Math.max(z1, zStern) + 0.08, Lt = Math.hypot(zt0 - zt1, ySl(zt1) - ySl(zt0)), angT = Math.atan2(ySl(zt1) - ySl(zt0), zt0 - zt1);
         B.box('wood', board, 0.035, 0.15, Lt, xt, (ySl(zt0) + ySl(zt1)) / 2 + 0.075, (zt0 + zt1) / 2, { rx: angT, r: 0.008 });
         noShadow(B, () => { for (const z of zs) bx(B, 'metal', cpl, 0.03, 0.06, 0.05, xt + out * 0.03, ySl(z) + 0.09, z); });  // toe-board clips
       }
@@ -944,6 +960,131 @@ export function registerMarinaVessels(D, H) {
       }
       B.tube('metal', tube, [P3(16.3, 2.85, -12.87), P3(16.21, 2.85, -13.06)], 0.02, { radial: 6 });
       noShadow(B, () => bx(B, 'metal', cpl, 0.07, 0.07, 0.07, 16.3, 2.85, -12.87));
+      // rail colliders along both guardrails (≥ 4.5 cm off the ramp's side faces, 6 cm above the slope, clear of the
+      // tug's stern face): kids can't step off the ramp side, shots / ink / squids pass. Up the slope they reach 0.2 m past
+      // the standards so the nav keeps its ramp column in the middle (no bot plans a side entry / drop through the rail);
+      // the foot box stays tight to the standards and starts at the first standard (z -7.95), so a kid walking the 0.6 m
+      // strip between the ramp foot and the yard edge (the way onto the ramp, nav row z -7.5) never brushes it and is
+      // never nudged toward the water.
+      const zA = -7.95, zF = -8.3, zB = -12.95, n = 4;
+      for (const [xa, xb, xn0, xn1] of [[15.98, 16.355, 16.2, 16.355], [18.645, 19.02, 18.645, 18.8]]) {
+        B.col(xn0, 0.06, zF, xn1, ySl(zF) + 0.98, zA, { rail: true });
+        for (let i = 0; i < n; i++) {
+          const za = zF + ((zB - zF) * i) / n, zb = zF + ((zB - zF) * (i + 1)) / n;
+          B.col(xa, ySl(za) + 0.06, zb, xb, ySl(zb) + 0.98, za, { rail: true });
+        }
+      }
+    },
+  };
+
+  // ================================================================================================ ZONE CONTROL ACCESS (tug)
+  // Zone Control only (dressing onlyIn 'zones'; place at the origin, mirrored): the two extra ways onto the tug deck
+  // (the side zone). Blocks: tug-bow-stair (x 17.9…20.1, treads from z -29.95 on the yard up to the bow at z -24.0, y 2.6)
+  // — the defenders' way up from the quay; the crate steps (colliders here, x 12.1…13.1 top 0.87 and x 13.1…14.5 top
+  // 1.73, z -16.9…-13.3) against the west hull side along the aft deck to the stern corner — the attackers' way up from the mid side. The tug's
+  // own rail / fender / hull clutter is opened for both by tug_dress { access: true }.
+  const TA = { zF: -29.95, zH: -24.0, yH: 2.6, xL: 17.9, xR: 20.1, cx0: 12.1, cx1: 13.1, cx2: 14.5, cz0: -16.9, cz1: -13.3, cA: 0.87, cB: 1.73 };
+  function crateBox(B, x0, x1, y0, y1, z0, z1, tone = 1, ry = 0) {
+    const w = x1 - x0, h = y1 - y0, d = z1 - z0, wc = shade('#c9a47a', tone), dk = shade('#8d6a45', tone);
+    B.push((x0 + x1) / 2, y0, (z0 + z1) / 2, ry);
+    B.box('wood', wc, w - 0.03, h - 0.02, d - 0.03, 0, h / 2, 0, { r: 0.015 });
+    noShadow(B, () => {
+      for (let k = 1; k < 5; k++) { const yy = (k * h) / 5; bx(B, 'wood', shade(wc, 0.72), w - 0.05, 0.008, d - 0.018, 0, yy, 0); bx(B, 'wood', shade(wc, 0.72), w - 0.018, 0.008, d - 0.05, 0, yy, 0); }
+      for (const yy of [0.05, h - 0.05]) {
+        for (const sz of [-1, 1]) bx(B, 'wood', dk, w - 0.01, 0.09, 0.04, 0, yy, sz * (d / 2 - 0.02));
+        for (const sx of [-1, 1]) bx(B, 'wood', dk, 0.04, 0.09, d - 0.09, sx * (w / 2 - 0.02), yy, 0);
+      }
+      for (const sx of [-1, 1]) for (const sz of [-1, 1]) bx(B, 'wood', dk, 0.06, h - 0.16, 0.06, sx * (w / 2 - 0.03), h / 2, sz * (d / 2 - 0.03));
+      // diagonal braces on the long (x) faces
+      for (const sx of [-1, 1]) { B.push(sx * (w / 2 - 0.012), h / 2, 0, 0, Math.atan2(h - 0.2, d - 0.2) * sx); bx(B, 'wood', dk, 0.025, 0.08, Math.hypot(d - 0.2, h - 0.2), 0, 0, 0); B.pop(); }
+    });
+    B.box('wood', shade(wc, 1.05), w - 0.05, 0.03, d - 0.05, 0, h - 0.005, 0, { r: 0.01 });   // lid
+    B.pop();
+  }
+  function palletUnder(B, x0, x1, z0, z1, tone = 1) {
+    const w = x1 - x0, d = z1 - z0, cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+    for (const f of [-0.42, 0, 0.42]) bx(B, 'wood', shade('#7b5a3a', tone), w - 0.02, 0.1, 0.1, cx, 0.05, cz + f * (d - 0.1) / 0.84 * 0.84);
+    noShadow(B, () => { for (let i = 0; i < Math.round(w / 0.17); i++) bx(B, 'wood', shade('#b48f63', tone * (0.92 + (i % 3) * 0.04)), 0.13, 0.022, d - 0.02, x0 + 0.08 + i * ((w - 0.16) / Math.max(1, Math.round(w / 0.17) - 1)), 0.111, cz); });
+  }
+  D.tug_access = {
+    desc: 'Zone Control access to the tug deck (place at the origin; mirrored): steel boarding-stair dressing on the tug-bow-stair block (cheek stringers, support flats, galvanised stanchion handrails with mid rails, hazard kick plates, rails turned down onto the foredeck — rail colliders) and a two-step stack of braced timber spares crates on pallets against the west hull side (colliders: 0.87 m and 1.73 m steps up to the 2.6 m deck), stencilled NUDGE SPARES, lashed with rope.',
+    params: {}, variants: 1, mount: 'ground',
+    build(B) {
+      B.aoBase = 0;
+      // ---------------- bow boarding stair (slope along +Z)
+      const { zF, zH, yH, xL, xR } = TA, run = zH - zF, L = Math.hypot(run, yH), dz = run / L, dy = yH / L, th = Math.atan2(yH, run);
+      const nz = -dy, ny = dz;                                                  // up-normal of the slope (z, y)
+      const at = (sv) => [zF + dz * sv, dy * sv];                               // [z, y] on the slope's edge line, sv from the foot
+      const ySl = (z) => yH * (z - zF) / run;
+      const strC = shade('#6d7f95', 0.78), railC = C.galv;
+      for (const [xe, out] of [[xL, -1], [xR, 1]]) {
+        const xS = xe + out * 0.03, xR2 = xe + out * 0.07;
+        const mid = at(L / 2);
+        B.box('metal', strC, 0.06, 0.3, L + 0.3, xS, mid[1] - ny * 0.2 - dy * 0.15, mid[0] - nz * 0.2 - dz * 0.15, { rx: -th, r: 0.015 });
+        B.box('metal', shade(strC, 0.85), 0.1, 0.04, L + 0.3, xe + out * 0.05, mid[1] - ny * 0.37 - dy * 0.15, mid[0] - nz * 0.37 - dz * 0.15, { rx: -th, r: 0.01 });
+        noShadow(B, () => {
+          for (let sv = 0.9; sv < L - 0.3; sv += 1.05) {
+            const p = at(sv), top = p[1] - 0.4;
+            if (top > 0.12) bx(B, 'metal', strC, 0.04, top, 0.07, xe + out * 0.02, top / 2, p[0] - 0.14);
+            for (const q of [-0.07, 0.07]) cy(B, 'metal', '#50555c', 0.014, 0.016, xe + out * 0.064, p[1] + q * dy - ny * 0.08, p[0] + q * dz - nz * 0.08, { rz: HP });
+          }
+        });
+        // stanchions + sloped top rail + mid rail; the rail turns down onto the foredeck at the head, into the yard at the foot
+        const stations = [0.45, 2.0, 3.55, 5.1, L - 0.25], tops = [];
+        for (const sv of stations) {
+          const p = at(sv);
+          post(B, 'metal', railC, 0.022, 1.2, xR2, p[1] + 0.35, p[0], { seg: 8 });
+          bx(B, 'metal', shade(railC, 0.8), 0.05, 0.12, 0.07, xe + out * 0.045, p[1] - 0.15, p[0]);
+          tops.push([xR2, p[1] + 0.95, p[0]]);
+        }
+        const foot = at(0), head = at(L);
+        const rail = [[xR2, 0.02, foot[0] - 0.45], [xR2, 0.6, foot[0] - 0.45], [xR2, foot[1] + 0.92, foot[0] - 0.2], ...tops,
+          [xR2, head[1] + 0.95, head[0] + 0.05], [xR2, head[1] + 0.95, head[0] + 0.3], [xR2, head[1] + 0.82, head[0] + 0.42], [xR2, head[1] + 0.03, head[0] + 0.42]];
+        B.tube('metal', railC, rail.map((q) => P3(...q)), 0.025, { radial: 8 });
+        B.tube('metal', railC, [P3(xR2, foot[1] + 0.45, foot[0] - 0.3), ...stations.map((sv) => { const q = at(sv); return P3(xR2, q[1] + 0.5, q[0]); }), P3(xR2, head[1] + 0.5, head[0] + 0.2), P3(xR2, head[1] + 0.5, head[0] + 0.42)], 0.016, { radial: 6 });
+        B.cyl('metal', shade(railC, 0.8), 0.045, 0.02, xR2, head[1] + 0.01, head[0] + 0.42, { seg: 8 });
+        B.cyl('metal', shade(railC, 0.8), 0.045, 0.02, xR2, 0.01, foot[0] - 0.45, { seg: 8 });
+        // rail colliders (kids can't step off the stair side; shots / ink / squids pass): ≥ 4.5 cm off the side face, 6 cm
+        // above the slope; the head stub runs onto the foredeck to meet the tug rail's end post
+        const [c0, c1] = out < 0 ? [xe - 0.13, xe - 0.045] : [xe + 0.045, xe + 0.13];
+        B.col(c0, 0.06, foot[0] - 0.5, c1, 0.95, zF, { rail: true });
+        for (let i = 0; i < 4; i++) {
+          const za = zF + (run * i) / 4, zb = zF + (run * (i + 1)) / 4;
+          B.col(c0, ySl(za) + 0.06, za, c1, ySl(zb) + 0.98, zb, { rail: true });
+        }
+        B.col(c0, yH + 0.06, zH, c1, yH + 0.98, zH + 0.45, { rail: true });
+      }
+      // ---------------- crate steps against the west hull side (attackers' way up from the mid side)
+      const { cx0, cx1, cx2, cz0, cz1, cA, cB } = TA, zm = (cz0 + cz1) / 2;
+      palletUnder(B, cx0 + 0.02, cx1 - 0.01, cz0 + 0.03, zm - 0.02, 0.95);
+      palletUnder(B, cx0 + 0.02, cx1 - 0.01, zm + 0.02, cz1 - 0.03, 1.02);
+      crateBox(B, cx0 + 0.04, cx1 - 0.02, 0.122, cA, cz0 + 0.05, zm - 0.03, 0.97);
+      crateBox(B, cx0 + 0.02, cx1 - 0.03, 0.122, cA, zm + 0.03, cz1 - 0.06, 1.04);
+      palletUnder(B, cx1 + 0.02, cx2 - 0.03, cz0 + 0.03, cz1 - 0.03, 0.9);
+      crateBox(B, cx1 + 0.04, cx2 - 0.04, 0.122, 0.93, cz0 + 0.05, cz1 - 0.05, 1.0);
+      crateBox(B, cx1 + 0.05, cx2 - 0.05, 0.93, cB, cz0 + 0.12, zm - 0.02, 0.92);
+      crateBox(B, cx1 + 0.06, cx2 - 0.04, 0.93, cB, zm + 0.02, cz1 - 0.1, 1.06);
+      // stencils on the faces toward the yard (-X) and the ends (±Z)
+      B.push(cx0 + 0.05, 0, zm, -HP);
+      text(B, 'NUDGE', 0.12, '#3a3f4a', 0.6, 0.55, 0.004, { weight: 0.2 });
+      text(B, 'SPARES', 0.09, '#3a3f4a', 0.6, 0.38, 0.004, { weight: 0.2, spacing: 0.3 });
+      text(B, 'THIS WAY UP', 0.06, '#3a3f4a', -0.7, 0.62, 0.004, { weight: 0.2, spacing: 0.2 });
+      B.pop();
+      B.push(cx1 + 0.075, 0, zm, -HP);
+      text(B, 'HALYARD BOATYARD', 0.09, '#3a3f4a', 0.7, 1.45, 0.004, { weight: 0.2, spacing: 0.2 });
+      B.pop();
+      B.push((cx1 + cx2) / 2, 0, cz0 + 0.065, PI);
+      text(B, 'FRAGILE', 0.08, '#b0473b', 0, 0.62, 0.004, { weight: 0.22, spacing: 0.3 });
+      B.pop();
+      // rope lashings over the upper crates (down to pallet rings) + a coil left on the lower step
+      for (const zz of [cz0 + 0.45, zm - 0.35, zm + 0.4, cz1 - 0.45]) {
+        B.tube(ns(B, 'rubber'), C.rope, [P3(cx1 + 0.03, 0.2, zz), P3(cx1 + 0.03, cB + 0.005, zz), P3(cx2 - 0.3, cB + 0.02, zz), P3(cx2 - 0.05, cB + 0.005, zz)], 0.012, { radial: 4 });
+      }
+      B.tor('rubber', C.ropeDk, 0.2, 0.035, cx0 + 0.5, cA + 0.035, cz1 - 0.55, { rx: HP, rs: 5, ts: 16 });
+      B.tor('rubber', C.rope, 0.14, 0.03, cx0 + 0.5, cA + 0.09, cz1 - 0.55, { rx: HP, rs: 5, ts: 14 });
+      // colliders: the two steps (walkable tops)
+      B.col(cx0, 0, cz0, cx1, cA, cz1);
+      B.col(cx1, 0, cz0, cx2, cB, cz1);
     },
   };
 
@@ -1414,11 +1555,17 @@ export function registerMarinaVessels(D, H) {
   }
 
   D.tug_dress = {
-    desc: 'Harbour tug NUDGE up on blocks (dresses the tug-hull/tug-house blocks, placed at the hull centre): raked stem with bow fender + tyre stack, gunwale fender, tyre fenders all round on chains, rubbing strake, portholes, boot-top + load line, low deck rail open at the ramp, H-bitt + towing winch (colliders), towing hook, windowed deckhouse with doors + sidelights, Kraken stack (collider), mast with towing lights, radar, horn, searchlight, antennas + flag; boat stands, timber cribbing and a ladder in the yard.',
-    params: {}, variants: 1, mount: 'ground',
-    build(B) {
+    desc: 'Harbour tug NUDGE up on blocks (dresses the tug-hull/tug-house blocks, placed at the hull centre): raked stem with bow fender + tyre stack, gunwale fender, tyre fenders all round on chains, rubbing strake, portholes, boot-top + load line, low deck rail open at the ramp (rail colliders), H-bitt + towing winch (colliders), towing hook, windowed deckhouse with doors + sidelights, Kraken stack (collider), mast with towing lights, radar, horn, searchlight, antennas + flag; boat stands, timber cribbing and a ladder in the yard.',
+    params: { access: 'Zone Control build: open the bow rail for the boarding stair (local x 0.35…2.65) and the west rail for the crate steps (local z 1.55…5.25, to the stern corner)' },
+    variants: 1, mount: 'ground',
+    build(B, o = {}) {
       B.aoBase = 0;
       const HX = 3.0, HZ = 5.5, DK = 2.6, buff = C.buff, tugDk = C.tugDk;
+      // Zone Control access (tug_access dresses the stair + crates): gaps in the deck rail, the gunwale fender and the
+      // hull-side clutter where the bow stair lands (bow, local x) and where the crate steps stand (west side, local z)
+      const acc = !!o.access, bowGap = [0.35, 2.65], westGap = [1.55, 5.25];
+      const inBow = (x) => acc && x > bowGap[0] - 0.05 && x < bowGap[1] + 0.1;
+      const inWest = (z, pad = 0) => acc && z > westGap[0] - pad && z < westGap[1] + pad;
       // --- gunwale fender: one continuous rubber bumper around the hull (open at the ramp), swelling into the bow fender
       const gy = 2.44, pts = [], rad = [], R0 = 0.12, cr = 0.2;
       const push = (x, z, r = R0) => { pts.push(P3(x, gy, z)); rad.push(r); };
@@ -1432,7 +1579,21 @@ export function registerMarinaVessels(D, H) {
       for (let k = 1; k < 10; k++) push(-HX, -HZ + cr + (k / 10) * (2 * HZ - 2 * cr));
       arc(-HX + cr, HZ - cr, PI, HP);
       push(-1.28, HZ);
-      B.tube('rubber', C.rubber, pts, (t) => rad[Math.round(t * (rad.length - 1))], { radial: 8 });
+      if (!acc) B.tube('rubber', C.rubber, pts, (t) => rad[Math.round(t * (rad.length - 1))], { radial: 8 });
+      else {
+        // two runs either side of the bow stair's landing, each ending in a rounded cap
+        let run = [], rr = [];
+        const flush = () => {
+          if (run.length > 1) {
+            const rs = rr.slice();
+            B.tube('rubber', C.rubber, run, (t) => rs[Math.round(t * (rs.length - 1))], { radial: 8 });
+            for (const k of [0, run.length - 1]) B.sph('rubber', C.rubber, rs[k], run[k][0], run[k][1], run[k][2], { ws: 8, hs: 6 });
+          }
+          run = []; rr = [];
+        };
+        pts.forEach((p, k) => { if (p[2] < -HZ + 0.05 && inBow(p[0])) { flush(); return; } run.push(p); rr.push(rad[k]); });
+        flush();
+      }
       // --- raked stem under the bow fender, resting on the bow cribbing; bow tyre stack chained to it
       const stem = [];
       for (let k = 0; k <= 8; k++) { const t = k / 8, y = 0.42 + t * 1.8; stem.push(P3(0, y, -HZ - 0.09 - 0.21 * Math.pow(t, 1.6))); }
@@ -1459,12 +1620,13 @@ export function registerMarinaVessels(D, H) {
         // tyre fenders hung on chains below the gunwale fender
         for (let k = 0; k < 8; k++) {
           const z = -4.0 + k * 1.2;
+          if (s < 0 && inWest(z, 0.4)) continue;
           tyre(B, -s * z, 1.72, 0.09, 'z', 0.9);
           lanyard(B, [-s * z - 0.1, 2.31, 0.06], [-s * z - 0.04, 1.97, 0.1]);
           lanyard(B, [-s * z + 0.1, 2.31, 0.06], [-s * z + 0.04, 1.97, 0.1]);
         }
         // weathering: tyre scuffs + a primer patch on the lower hull
-        for (let k = 0; k < 8; k += 2) streak(B, -s * (-4.0 + k * 1.2), 1.42, 0.004, 0.36, 0.3, shade(C.tug, 0.78), C.tug);
+        for (let k = 0; k < 8; k += 2) if (!(s < 0 && inWest(-4.0 + k * 1.2, 0.4))) streak(B, -s * (-4.0 + k * 1.2), 1.42, 0.004, 0.36, 0.3, shade(C.tug, 0.78), C.tug);
         streak(B, s * 3.4, 0.62, 0.005, 0.9, 0.5, mixc(C.tug, '#b9b3a6', 0.42), C.tug);                 // sanded patches
         streak(B, s * 2.55, 0.5, 0.006, 0.55, 0.36, mixc(C.tug, '#b9b3a6', 0.32), C.tug);
         B.pop();
@@ -1475,8 +1637,13 @@ export function registerMarinaVessels(D, H) {
       text(B, 'INKWAVE', 0.1, C.white, -2.15, 0.82, HZ + 0.002, { weight: 0.2, spacing: 0.4 });
       // --- low deck-edge rail (0.36 m), open at the ramp; buff paint
       const railY = DK + 0.36, inset = 0.1;
-      const railRuns = [
+      const railRuns = !acc ? [
         [[1.3, HZ - inset], [HX - inset, HZ - inset], [HX - inset, -HZ + inset], [-HX + inset, -HZ + inset], [-HX + inset, HZ - inset], [-1.3, HZ - inset]],
+      ] : [
+        // Zone Control: open at the stern ramp, the bow stair landing and the west crate steps
+        [[1.3, HZ - inset], [HX - inset, HZ - inset], [HX - inset, -HZ + inset], [bowGap[1], -HZ + inset]],
+        [[bowGap[0], -HZ + inset], [-HX + inset, -HZ + inset], [-HX + inset, westGap[0]]],
+        [[-HX + inset, westGap[1]], [-HX + inset, HZ - inset], [-1.3, HZ - inset]],
       ];
       for (const run of railRuns) {
         const rp = [];
@@ -1495,6 +1662,28 @@ export function registerMarinaVessels(D, H) {
         B.tube('metal', buff, rp.map((p) => P3(p[0], DK + 0.19, p[2])), 0.012, { radial: 6 });
         for (const e of [rp[0], rp[rp.length - 1]]) B.sph('metal', buff, 0.032, e[0], railY, e[2], { ws: 8, hs: 6 });
       }
+      // deck-rail colliders (rail: kids can't walk off the deck edge, shots / ink / squids pass), open at the ramp like
+      // the rail itself. A floating band 0.62…1.1 m over the deck: a kid's body (0.35…1.45 m) can't get past it, but a
+      // squid climbing the inked hull side passes under it (the climb probes at +0.3 / +0.85 m never touch it before the
+      // ledge pop), so the hull stays a squid route onto the flank high ground. The boxes sit just OUTBOARD of the hull
+      // edge (0.3 m, over the yard): a kid anywhere on the deck — even one that surfaces right on the edge after a climb —
+      // is always pushed back inboard (a rail pushes out along its nearest face), never off the deck; and the nav keeps
+      // its deck-edge nodes (the only ones along the 1.3 m strips beside the deckhouse) and the bow row.
+      // (5 mm clear of the edge so the edge-line nav nodes never hinge on float rounding; ≤ 0.3 m out, or the nav's
+      // 45° clearance probe would drop them)
+      const r0 = DK + 0.62, r1 = DK + 1.1, O = 0.3, e = 0.005;
+      B.col(HX + e, r0, -HZ - O, HX + O, r1, HZ + O, { rail: true });
+      if (!acc) {
+        B.col(-HX - O, r0, -HZ - O, -HX - e, r1, HZ + O, { rail: true });
+        B.col(-HX - O, r0, -HZ - O, HX + O, r1, -HZ - e, { rail: true });
+      } else {
+        // the gaps' edges line up with the rail's end posts (the stair handrails / crate edges take over there)
+        B.col(-HX - O, r0, -HZ - O, -HX - e, r1, westGap[0], { rail: true });
+        B.col(-HX - O, r0, westGap[1], -HX - e, r1, HZ + O, { rail: true });
+        B.col(-HX - O, r0, -HZ - O, bowGap[0], r1, -HZ - e, { rail: true });
+        B.col(bowGap[1], r0, -HZ - O, HX + O, r1, -HZ - e, { rail: true });
+      }
+      for (const s of [-1, 1]) B.col(s > 0 ? 1.26 : -HX - O, r0, HZ + e, s > 0 ? HX + O : -1.26, r1, HZ + O, { rail: true });
       // --- foredeck H-bitt (collider) and the towing winch against the deckhouse (collider)
       B.box('metal', C.steelDk, 1.16, 0.05, 0.4, 0, DK + 0.025, -3.7, { r: 0.02 });
       for (const s of [-1, 1]) {
@@ -1581,12 +1770,13 @@ export function registerMarinaVessels(D, H) {
       // --- in the yard: boat stands, cribbing under the bow + bilges, a ladder up the west side
       for (const s of [-1, 1]) {
         B.push(s * HX, 0, 0, s * HP);
-        for (const z of [-3.3, 0.9, 4.25]) boatStand(B, -s * z, 1.05, 0.62);
+        for (const z of [-3.3, 0.9, 4.25]) if (!(s < 0 && inWest(z, 0.45))) boatStand(B, -s * z, 1.05, 0.62);
         cribbing(B, -s * -1.6, 2, 0.34);
-        cribbing(B, -s * 2.0, 2, 0.34);
+        if (!(s < 0 && inWest(2.0, 0.6))) cribbing(B, -s * 2.0, 2, 0.34);
         B.pop();
       }
-      B.push(0, 0, -HZ, PI); cribbing(B, 0, 2, 0.5); B.pop();
+      B.push(acc ? -0.35 : 0, 0, -HZ, PI); cribbing(B, 0, 2, 0.5); B.pop();
+      if (!acc) {
       B.push(-HX, 0, 2.6, -HP);                                                                          // ladder (west side)
       for (const s of [-1, 1]) {
         B.tube('metal', '#c9ced3', [P3(s * 0.23, 0.02, 0.78), P3(s * 0.23, 2.3, 0.14)], 0.024, { radial: 6 });
@@ -1594,13 +1784,16 @@ export function registerMarinaVessels(D, H) {
       }
       for (let k = 1; k < 8; k++) { const t = k / 8.2; B.cyl('metal', '#c9ced3', 0.016, 0.46, 0, 0.02 + t * 2.28, 0.78 - t * 0.64, { rz: HP, seg: 6 }); }
       B.pop();
+      }
     },
   };
 
   // ================================================================================================ HOUSEBOAT "SEA SHANTY"
-  // Blocks: houseboat-hull x -17.6…-12.4, z -23.4…-14.4, deck y 0.7 (kid-hoppable pontoon); houseboat-cabin x -16.6…-13.4,
-  // z -21.4…-16.2, roof y 2.9 (squid-only high ground); gangway lands on the west edge at z -18.8. Placed at the hull
-  // centre (-15, 0, -18.9): local hull x ±2.6, z ±4.5; cabin x ±1.6, z -2.5…2.7.
+  // Blocks: houseboat-hull x -17.6…-7.0, z -23.4…-14.4, deck y 0.7 (a wide floating-home pontoon filling the slip:
+  // kid-hoppable from the Long Pier gangway side, the finger pier and the boardwalk; a porch rail along the fuel-dock
+  // side); houseboat-cabin x -16.2…-13.0, z -21.4…-16.2, roof y 2.9 (squid-only high ground); gangway lands on the west
+  // edge at z -18.8. Placed at the CABIN centre (-14.6, 0, -18.9): local hull x -3.0…7.6, z ±4.5 (the open sun deck is
+  // local x 1.6…7.6); cabin x ±1.6, z -2.5…2.7.
   const bushPuff = (seed, det = 1) => cached('puff|' + seed + '|' + det, () => H.puffGeo(det, seed));
   const flowerBlob = (seed) => cached('blob|' + seed, () => H.blobGeo(1, 0, seed));
   // leafy mound + flower heads inside a W × D footprint at height y (planter soil level)
@@ -1664,26 +1857,51 @@ export function registerMarinaVessels(D, H) {
   function arcPtsXY(cx, cy2, R, a0, a1, n) { const out = []; for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * (i / n); out.push(P3(cx + Math.cos(a) * R, cy2 + Math.sin(a) * R, 0)); } return out; }
 
   D.houseboat_dress = {
-    desc: 'Houseboat SEA SHANTY (dresses the houseboat hull/cabin blocks, placed at the hull centre): timber deck-edge cap + rubbing strip, waterline band, name, fenders, mooring lines to the pier cleats, porch rail (open at the gangway + pier side), cottage windows with curtains + flower boxes, door with lamp + mailbox, fascia/gutters; roof garden (planter trough, solar panels, kayak on a rack, chimney — colliders), deck chair + furled parasol, festoon lights; bike + laundry line on the back deck.',
+    desc: 'Houseboat SEA SHANTY (dresses the houseboat hull/cabin blocks, placed at the cabin centre): timber deck-edge cap + rubbing strip, waterline band, sheer line + scuppers, names, fenders, mooring lines to the Long Pier and fuel-dock cleats, porch rail along the fuel-dock side + the open-water stern (rail colliders; open at the gangway, the pier, the finger pier and the boardwalk), cottage windows with curtains + flower boxes, door with lamp + mailbox, fascia/gutters; open sun deck with a café table set + a timber planter bench (colliders) and festoon lights; roof garden (planter trough, solar panels, kayak on a rack, chimney — colliders), deck chair + furled parasol; bike + laundry line.',
     params: {}, variants: 1, mount: 'ground',
     build(B) {
       B.aoBase = 0.7;
-      const HX = 2.6, HZ = 4.5, DK = 0.7, CX = 1.6, CZ0 = -2.5, CZ1 = 2.7, RF = 2.9, wood = C.teak, woodDk = C.teakDk;
-      const band = '#2f3b3a';
-      // --- pontoon hull: waterline band, rubbing strip, deck-edge timber cap on the faces, name
-      for (const s of [-1, 1]) {
-        B.box(ns(B, 'paint'), band, 0.02, 0.34, 2 * HZ + 0.04, s * (HX + 0.01), -1.5, 0, { r: 0.006 });
-        B.box(ns(B, 'paint'), band, 2 * HX + 0.04, 0.34, 0.02, 0, -1.5, s * (HZ + 0.01), { r: 0.006 });
-        B.box('rubber', C.rubber, 0.07, 0.1, 2 * HZ - 0.3, s * (HX + 0.03), 0.3, 0, { round: true, r: 0.03 });
-        B.box('rubber', C.rubber, 2 * HX - 0.3, 0.1, 0.07, 0, 0.3, s * (HZ + 0.03), { round: true, r: 0.03 });
-        B.box('wood', wood, 0.07, 0.14, 2 * HZ + 0.14, s * (HX + 0.035), DK - 0.07, 0, { r: 0.02 });
-        B.box('wood', wood, 2 * HX, 0.14, 0.07, 0, DK - 0.07, s * (HZ + 0.035), { r: 0.02 });
+      // local frame = the cabin centre; the hull runs from XW (west, Long Pier side) to XE (east, fuel-dock side)
+      const XW = -3.0, XE = 7.6, XC = (XW + XE) / 2, HW = (XE - XW) / 2, HZ = 4.5;
+      const DK = 0.7, CX = 1.6, CZ0 = -2.5, CZ1 = 2.7, RF = 2.9, wood = C.teak, woodDk = C.teakDk;
+      const ORG = [-14.6, -18.9];                                               // placement (world) → local = world - ORG
+      const band = '#2f3b3a', sheer = shade(C.houseTeal, 1.12);
+      // --- pontoon hull: waterline band, rubbing strip, pale sheer line, deck-edge timber cap on the faces, scuppers
+      for (const [x, s] of [[XW, -1], [XE, 1]]) {
+        B.box(ns(B, 'paint'), band, 0.02, 0.34, 2 * HZ + 0.04, x + s * 0.01, -1.5, 0, { r: 0.006 });
+        B.box('rubber', C.rubber, 0.07, 0.1, 2 * HZ - 0.3, x + s * 0.03, 0.3, 0, { round: true, r: 0.03 });
+        B.box(ns(B, 'paint'), sheer, 0.012, 0.07, 2 * HZ - 0.1, x + s * 0.006, 0.47, 0, { r: 0.004 });
+        B.box('wood', wood, 0.07, 0.14, 2 * HZ + 0.14, x + s * 0.035, DK - 0.07, 0, { r: 0.02 });
       }
-      B.push(-HX, 0, 0, -HP);                                                    // west face (toward the Long Pier)
+      for (const s of [-1, 1]) {
+        B.box(ns(B, 'paint'), band, 2 * HW + 0.04, 0.34, 0.02, XC, -1.5, s * (HZ + 0.01), { r: 0.006 });
+        B.box('rubber', C.rubber, 2 * HW - 0.3, 0.1, 0.07, XC, 0.3, s * (HZ + 0.03), { round: true, r: 0.03 });
+        B.box(ns(B, 'paint'), sheer, 2 * HW - 0.1, 0.07, 0.012, XC, 0.47, s * (HZ + 0.006), { r: 0.004 });
+        B.box('wood', wood, 2 * HW, 0.14, 0.07, XC, DK - 0.07, s * (HZ + 0.035), { r: 0.02 });
+      }
+      noShadow(B, () => {                                                       // deck scuppers just above the rubbing strip
+        for (let x = XW + 1.2; x < XE - 0.8; x += 2.1) for (const s of [-1, 1]) bx(B, 'paint', band, 0.22, 0.06, 0.012, x, 0.12, s * (HZ + 0.006));
+        for (const z of [-3.2, -1.05, 1.1, 3.25]) bx(B, 'paint', band, 0.012, 0.06, 0.22, XE + 0.006, 0.12, z);
+        // welded pontoon plate seams between the waterline band and the rubbing strip (clear of the names + swim ladder)
+        const seam = shade(C.houseTeal, 0.86), sy = (-1.33 + 0.24) / 2, sh = 0.24 + 1.33;
+        for (let z = -HZ + 1.5; z < HZ - 0.5; z += 1.5) {
+          if (Math.abs(z - 2.75) > 1.35) bx(B, 'paint', seam, 0.01, sh, 0.035, XW - 0.005, sy, z);
+          if (Math.abs(z) > 1.35) bx(B, 'paint', seam, 0.01, sh, 0.035, XE + 0.005, sy, z);
+        }
+        for (let x = XW + 1.5; x < XE - 0.5; x += 1.5) {
+          if (Math.abs(x - 4.9) > 1.45) bx(B, 'paint', seam, 0.035, sh, 0.01, x, sy, -HZ - 0.005);
+          bx(B, 'paint', seam, 0.035, sh, 0.01, x, sy, HZ + 0.005);
+        }
+      });
+      B.push(XW, 0, 0, -HP);                                                    // west face (toward the Long Pier)
       text(B, 'SEA SHANTY', 0.26, C.white, 2.75, -0.2, 0.002, { weight: 0.17 });
       text(B, 'INKWAVE', 0.11, C.white, 2.75, -0.4, 0.002, { weight: 0.2, spacing: 0.4 });
       B.pop();
-      B.push(HX, 0, 0, HP);                                                      // east face
+      B.push(4.9, 0, -HZ, PI);                                                  // south face (seen from the quay across the slip)
+      text(B, 'SEA SHANTY', 0.3, C.white, 0, -0.18, 0.002, { weight: 0.17 });
+      text(B, 'INKWAVE', 0.12, C.white, 0, -0.42, 0.002, { weight: 0.2, spacing: 0.4 });
+      B.pop();
+      B.push(XE, 0, 0, HP);                                                      // east face
       text(B, 'SEA SHANTY', 0.26, C.white, 0, -0.2, 0.002, { weight: 0.17 });
       // swim ladder down the east side
       for (const s of [-1, 1]) B.tube('metal', C.galv, [P3(s * 0.22, -1.9, 0.12), P3(s * 0.22, 0.45, 0.12), P3(s * 0.22, 0.62, 0.08), P3(s * 0.22, 0.62, 0.02)], 0.02, { radial: 6 });
@@ -1699,13 +1917,17 @@ export function registerMarinaVessels(D, H) {
         for (const q of [-1, 1]) B.tor('gloss', C.white, 0.02, 0.008, 0, -0.28 + q * 0.38, 0.17, { rs: 3, ts: 7 });
         B.pop();
       };
-      hangFender(-HX, -2.9, -HP); hangFender(-HX, 3.1, -HP, C.white);
-      hangFender(-1.0, -HZ, PI, C.white); hangFender(1.2, -HZ, PI);
-      const hullCleats = [[-HX, 0.62, -3.85], [-HX, 0.62, 4.05]], pierCleats = [[-4.64, 0.075, -3.9], [-4.64, 0.075, 4.1]];
-      for (let k = 0; k < 2; k++) {
-        const [hx0, hy0, hz0] = hullCleats[k], [px, py, pz] = pierCleats[k];
-        sideCleat(hx0, hy0, hz0, -HP);
-        rope(B, [hx0 - 0.07, hy0, hz0], [px + 0.07, py + 0.04, pz], 0.22, 0.018, C.rope, 14);
+      hangFender(XW, -2.9, -HP); hangFender(XW, 3.1, -HP, C.white);
+      hangFender(-1.4, -HZ, PI, C.white); hangFender(1.2, -HZ, PI); hangFender(6.7, -HZ, PI, C.white);
+      hangFender(XE, -2.1, HP); hangFender(XE, 2.35, HP, C.white);
+      // mooring lines: west to the Long Pier inner-run cleats (world x -19.64, z -22.8 / -14.8), east across the slip to
+      // the fuel dock's berth cleats (world x -4.36, z -21.6 / -16.4) — breast lines both sides, as if moored in the berth
+      const L2 = (wx, wz) => [wx - ORG[0], wz - ORG[1]];
+      const lines = [[XW, -3.85, -1, L2(-19.64, -22.8)], [XW, 4.05, -1, L2(-19.64, -14.8)], [XE, -2.95, 1, L2(-4.36, -21.6)], [XE, 2.95, 1, L2(-4.36, -16.4)]];
+      for (const [hx0, hz0, s, [px, pz]] of lines) {
+        const hy0 = 0.62, py = 0.075;
+        sideCleat(hx0, hy0, hz0, s * HP);
+        rope(B, [hx0 + s * 0.07, hy0, hz0], [px - s * 0.07, py + 0.04, pz], 0.22, 0.018, C.rope, 14);
         bittTurns(B, px, py - 0.015, pz, 0.05, 0.035, 1, C.rope);
       }
       // --- cabin: corner boards, fascia + gutters + downpipes, windows, door
@@ -1751,21 +1973,68 @@ export function registerMarinaVessels(D, H) {
       ringBuoy(B, 1.85, DK + 0.72, 0.07, 0.75);
       B.pop();
 
-      // --- porch rail: east side + short returns on the north and south (the west/pier side and the gangway stay open)
-      const railH = 0.82, px = HX - 0.12;
+      // --- porch rail: the fuel-dock (east) side, the stern over open water (south, from the finger pier's end to the
+      //     corner) and a short return on the boardwalk side (north). The west/pier side, the gangway, the finger-pier
+      //     stretch of the stern and the rest of the boardwalk side stay open (kid hops onto the deck).
+      const railH = 0.82, px = XE - 0.12, XS = 2.4;
       const posts = [];
       for (let z = -HZ + 0.12; z <= HZ - 0.11; z += 1.1) posts.push([px, z]);
       posts.push([px, HZ - 0.12]);
-      for (const zs of [-1, 1]) for (const x of [px - 0.6, px - 1.2]) posts.push([x, zs * (HZ - 0.12)]);
+      for (let x = px - 1.1; x > XS + 0.3; x -= 1.1) posts.push([x, -HZ + 0.12]);
+      posts.push([XS, -HZ + 0.12]);
+      for (const x of [px - 0.6, px - 1.2]) posts.push([x, HZ - 0.12]);
       for (const [x, z] of posts) {
         B.box('wood', C.white, 0.08, railH, 0.08, x, DK + railH / 2, z, { r: 0.02 });
         bx(B, 'wood', C.white, 0.1, 0.04, 0.1, x, DK + railH + 0.02, z);
       }
       B.box('wood', wood, 0.12, 0.05, 2 * HZ - 0.12, px, DK + railH + 0.05, 0, { r: 0.02 });
-      for (const zs of [-1, 1]) B.box('wood', wood, 1.32, 0.05, 0.12, px - 0.6, DK + railH + 0.05, zs * (HZ - 0.12), { r: 0.02 });
+      B.box('wood', wood, px - XS + 0.12, 0.05, 0.12, (px + XS) / 2, DK + railH + 0.05, -HZ + 0.12, { r: 0.02 });
+      B.box('wood', wood, 1.32, 0.05, 0.12, px - 0.6, DK + railH + 0.05, HZ - 0.12, { r: 0.02 });
       for (const y of [0.32, 0.56]) {
         B.cyl('rubber', C.rope, 0.014, 2 * HZ - 0.3, px, DK + y, 0, { rx: HP, seg: 6 });
-        for (const zs of [-1, 1]) B.cyl('rubber', C.rope, 0.014, 1.2, px - 0.6, DK + y, zs * (HZ - 0.12), { rz: HP, seg: 6 });
+        B.cyl('rubber', C.rope, 0.014, px - XS - 0.1, (px + XS) / 2, DK + y, -HZ + 0.12, { rz: HP, seg: 6 });
+        B.cyl('rubber', C.rope, 0.014, 1.2, px - 0.6, DK + y, HZ - 0.12, { rz: HP, seg: 6 });
+      }
+      // porch-rail colliders (rail: kids can't walk through, shots / ink / squids pass), 6 cm above the deck. Each box
+      // reaches 0.7 m out over the water so its centre lies beyond the deck edge by more than a foot's reach (0.24): a kid
+      // anywhere its feet still hold the deck — even a squid surfacing on the very lip — is pushed back inboard (a rail
+      // pushes out along its nearest face), never into the slip.
+      // the RIB tender's painter from the stern corner post down to its bow eye (boat_rib placed at world (-9.4, -27.0))
+      rope(B, [px, DK + 0.12, -HZ + 0.12], [-7.74 - ORG[0], -1.28, -27.12 - ORG[1]], 0.35, 0.014, C.rope, 16);
+      const p0 = DK + 0.06, p1 = DK + railH + 0.08, t = XE - (px - 0.04), W0 = 0.7;
+      B.col(px - 0.04, p0, -HZ - W0, XE + W0, p1, HZ + W0, { rail: true });
+      B.col(XS - 0.06, p0, -HZ - W0, px - 0.04, p1, -HZ + t, { rail: true });
+      B.col(px - 1.26, p0, HZ - t, px - 0.04, p1, HZ + W0, { rail: true });
+      // festoon lights over the sun deck: from the roof's east corner posts out to two tall posts on the porch rail
+      for (const [zr, zp] of [[CZ0 + 0.08, -HZ + 0.12 + 1.1], [CZ1 - 0.08, -HZ + 0.12 + 4.4]]) {   // on the rail posts at z -3.28 / 0.02
+        B.box('wood', C.white, 0.08, 1.55, 0.08, px, DK + railH + 0.1 + 0.62, zp, { r: 0.02 });
+        B.sph('metal', C.black, 0.03, px, DK + railH + 0.1 + 1.4, zp, { ws: 8, hs: 6 });
+        const a = [CX - 0.06, RF + 1.4, zr], b = [px, DK + railH + 0.1 + 1.36, zp];
+        B.tube(ns(B, 'rubber'), C.black, ropePts(a, b, 0.42, 16), 0.006, { radial: 4 });
+        const lp3 = ropePts(a, b, 0.42, 44);
+        for (let k = 1; k < 11; k++) {
+          const q = lp3[k * 4];
+          cy(B, 'rubber', C.black, 0.01, 0.04, q[0], q[1] - 0.025, q[2], { seg: 5 });
+          B.sph('glow', k % 3 === 1 ? '#ffd9a8' : '#fff0c9', 0.03, q[0], q[1] - 0.07, q[2], { ws: 6, hs: 4, glow: 2.6, sy: 1.25 });
+        }
+      }
+      // --- the open sun deck (local x 1.6…7.6): a café table set under a coral parasol and a timber planter bench —
+      //     two low cover pieces (colliders), everything else left clear
+      { const n = B.cols.length; B.push(4.4, DK, -1.9, 0.35); D.cafeset.build(B, { color: C.coral, variant: 1 }); B.pop(); B.cols.length = n; }
+      B.col(4.4 - 0.85, DK, -1.9 - 0.85, 4.4 + 0.85, DK + 0.78, -1.9 + 0.85);
+      {
+        const bx0 = 5.0, bz = 2.95, bW = 2.6, bD = 0.55, bH = 0.5;
+        B.box('wood', wood, bW, bH, bD, bx0, DK + bH / 2, bz, { r: 0.03 });
+        for (let k = 0; k < 3; k++) B.box('wood', shade(wood, 0.92), bW + 0.02, 0.02, bD + 0.02, bx0, DK + 0.12 + k * 0.14, bz, { r: 0.006 });
+        B.box('paint', '#5a4535', bW - 0.1, 0.04, bD - 0.1, bx0, DK + bH - 0.03, bz, { r: 0.01 });
+        plantBed(B, bx0 - 0.35, DK + bH - 0.04, bz, bW - 0.9, bD - 0.12, 5);
+        // a little olive tree at the east end of the trough
+        B.cyl('wood', C.teakDk, 0.035, 0.9, bx0 + 0.9, DK + bH + 0.4, bz, { seg: 7 });
+        for (let k = 0; k < 4; k++) B.add('foliage', bushPuff((k + 2) % 6), mixc('#6f8f5a', '#9db77a', k * 0.25), bx0 + 0.9 + ((k % 2) - 0.5) * 0.3, DK + bH + 0.95 + (k >> 1) * 0.18, bz + ((k >> 1) - 0.5) * 0.22, { s: 0.3, sy: 0.24, ry: k * 1.7 });
+        // slatted bench seat along the trough's inboard (south) face
+        for (let k = 0; k < 4; k++) B.box('wood', shade(C.teak, 1.06), bW - 0.2, 0.03, 0.08, bx0, DK + 0.44, bz - bD / 2 - 0.08 - k * 0.09, { r: 0.01 });
+        for (const q of [-1, 1]) B.box('wood', woodDk, 0.06, 0.44, 0.36, bx0 + q * (bW / 2 - 0.3), DK + 0.22, bz - bD / 2 - 0.2, { r: 0.012 });
+        B.col(bx0 - bW / 2, DK, bz - bD / 2 - 0.42, bx0 + bW / 2, DK + bH, bz + bD / 2);
       }
       // laundry pegged on a line along the outside of the east porch rail (never over the deck), between two tall posts
       const lz0 = 1.05, lz1 = HZ - 0.12, ly = DK + railH + 0.3, lx = px + 0.07;
@@ -1896,7 +2165,7 @@ export function registerMarinaVessels(D, H) {
   // Marina gate: aluminium gangway from the quay edge (local x = 0, y = 0) down to a pontoon at local x = run, y = -1.15,
   // handrails, a locked mesh gate with a "BERTH HOLDERS ONLY" sign at the top (so it never reads as a way out).
   D.marina_gate = {
-    desc: 'Marina access: hinged aluminium gangway with handrails from the quay edge down to the marina pontoon, locked security gate + sign at the top. Outside the play bounds; non-colliding.',
+    desc: 'Marina access: hinged aluminium gangway with handrails from the quay edge down to the marina pontoon, locked security gate + sign at the top. Outside the play bounds; only the gate collides (rail).',
     params: { run: 'm (3.4)', width: 'm (1.3)' }, variants: 1, mount: 'ground',
     build(B, o) {
       noShadow(B, () => {
@@ -1922,6 +2191,9 @@ export function registerMarinaVessels(D, H) {
       B.box('gloss', C.navy, 0.04, 0.46, 1.2, 0.26, 2.42, 0, { round: true, r: 0.03 });
       B.push(0.235, 0, 0, -HP); text(B, 'HALYARD MARINA', 0.1, C.white, 0, 2.47, 0.001, { weight: 0.2, depth: 0.004 }); text(B, 'BERTH HOLDERS ONLY', 0.06, C.mustard, 0, 2.3, 0.001, { weight: 0.22, depth: 0.004 }); B.pop();
       });
+      // the locked gate is a rail collider (a kid on the quay can't walk through it; shots / ink / squids pass)
+      const Wg = (o.width ?? 1.3) / 2 + 0.13;
+      B.col(0.27, 0, -Wg, 0.37, 2.15, Wg, { rail: true });
     },
   };
 
@@ -1974,23 +2246,32 @@ export const HALYARD_VESSELS = [
   { type: 'ferry_hull', pos: [0, 0, 0] },
   { type: 'ferry_cabin', pos: [0, 0, 0] },
   { type: 'ferry_bridge', pos: [0, 3.8, 0], mirror: false },
-  // cover pieces (Alpha half; mirrored)
+  // cover pieces from docs/HALYARD.md (Alpha half; mirrored)
   { type: 'ferry_locker', pos: [11.75, 1.3, 2.15] },
   { type: 'ferry_cargo', pos: [14.2, 1.3, 0.4] },
-  // ---- the tug on blocks in the boatyard
-  { type: 'tug_dress', pos: [17.5, 0, -18.5] },
+  // ---- the tug on blocks in the boatyard (Zone Control build: its deck is the side zone — rails opened for the bow
+  //      boarding stair + the crate steps, the stern ramp eased to 23.8° into a notch; see tug_access)
+  { type: 'tug_dress', pos: [17.5, 0, -18.5], notIn: 'zones' },
+  { type: 'tug_dress', pos: [17.5, 0, -18.5], access: true, onlyIn: 'zones' },
+  { type: 'tug_access', pos: [0, 0, 0], onlyIn: 'zones' },
   // ---- ramp dressing: ferry sun-deck stair (stringers + handrails) and the tug ramp's scaffold guardrails
   { type: 'ferry_stair', pos: [0, 0, 0] },
-  { type: 'tug_ramp_rails', pos: [0, 0, 0] },
-  // ---- the houseboat in the Long Pier slip
-  { type: 'houseboat_dress', pos: [-15, 0, -18.9] },
-  // ---- dinghy on its trailer (boatyard cover piece)
-  { type: 'dinghy_trailer', pos: [22.1, 0, -27.7] },
+  { type: 'tug_ramp_rails', pos: [0, 0, 0], notIn: 'zones' },
+  { type: 'tug_ramp_rails', pos: [0, 0, 0], z0: -7.55, z1: -13.45, onlyIn: 'zones' },
+  // ---- the houseboat in the Long Pier slip + its RIB tender on a painter off the stern (in the open-water corner of the
+  //      slip by the fuel dock; non-colliding)
+  { type: 'houseboat_dress', pos: [-14.6, 0, -18.9] },
+  { type: 'boat_rib', pos: [-9.4, -1.6, -27.0], rotY: Math.PI / 2 - 0.08, length: 3.6, color: '#3f9f97' },
+  // ---- dinghy on its trailer (boatyard cover piece). Zone Control: the bow stair takes the yard in front of the tug's
+  //      bow, so the trailer is parked out on the quay by the boathouse instead (keeps the lane east of the stair open
+  //      from the quay — no dead-end alley beside the tug)
+  { type: 'dinghy_trailer', pos: [22.1, 0, -27.7], notIn: 'zones' },
+  { type: 'dinghy_trailer', pos: [20.4, 0, -35.3], rotY: 0.12, onlyIn: 'zones' },
   // ---- the marina beyond the boatyard (mirrored beyond the Long Pier): quay gate + gangway, walkway, fingers, boats
   ...marina(),
 ];
 
-// The marina layout (Alpha half, x > 24; mirrored). It lives in the basin behind the dock kit's breakwater (rocks
+// The marina layout (Alpha half, x > 24; mirrored). It lives in the basin behind the docks stream's breakwater (rocks
 // from x ≈ 38.7, head at z 10) and south of its channel markers (z 17…22): a walkway along Z at x 26.7…28.5 reached by a
 // gated gangway from the quay at z -37.9, fingers off its outer side every 4.2 m, boats in the berths (sterns to the
 // walkway, bows toward the breakwater, ≤ 8.6 m so they clear the rocks), a RIB + kayaks alongside its inner side.

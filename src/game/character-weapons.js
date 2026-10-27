@@ -13,6 +13,12 @@
 //   charger  trigger · bolt (charging handle, draws back with the charge) · lens / eyepiece (scope glow) · ports
 //            (muzzle-brake heat) · glow = coil rings with a per-vertex aSeg threshold (makeCoilMaterial lights them in order)
 //   roller   led (reservoir lamp) · drum (spins; character.js gives it inertia)
+//   dualies  trigger · slide / slideInk (snaps back on its own hand's shot) · led
+//   slosher  surface (the ink, kept level against the swing) · lever (thumb lever)
+//   splatling trigger · barrels (spin with the charge / stream) · glow = the 8-segment charge meter (makeCoilMaterial)
+// Fork kinds (bucket, spinner, twins, brush, sp_*) are static shells; spinner carries its own `spin` barrel cluster
+// (character.js turns it about +Z through spinAt) and twins sets `mirrorDual` (character.js mirrors a copy into the
+// left fist — distinct from `dual`, which gives the left hand a full second instance with its own parts).
 //
 // Hands: the squidkid fist is modelled around a Ø 2.8 cm handle whose axis passes through HAND.hole (character-geo).
 // A grip spec { pos, handZ, handY } says where that handle axis passes (pos), which way it runs toward the thumb
@@ -126,6 +132,22 @@ function chevronShape(w, h, n = 3, gap = 0.4) {
     sh.push(s);
   }
   return sh;
+}
+/** Run fn(v) over every vertex of g in place, then refresh normals. */
+function deformG(g, fn) {
+  const p = g.attributes.position; const v = new V3();
+  for (let i = 0; i < p.count; i++) { v.fromBufferAttribute(p, i); fn(v); p.setXYZ(i, v.x, v.y, v.z); }
+  g.computeVertexNormals();
+  return g;
+}
+/** Deterministic PRNG (procedural clutter such as bristles is identical on every build). */
+function rng(seed) { let s = seed >>> 0; return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296); }
+/** Surface |x| of an undeformed superEllipsoid(rx, ry, rz, e1, e2) at local (y, z), for seating screws and decals on flanks. */
+function seX(rx, ry, rz, e1, e2, y, z) {
+  const sl = Math.min(1, Math.abs(y) / ry) ** (1 / e1);
+  const f = Math.sqrt(Math.max(0, 1 - sl * sl)) ** e1;
+  const sw = Math.min(1, Math.abs(z) / (rz * f + 1e-9)) ** (1 / e2);
+  return rx * f * Math.sqrt(Math.max(0, 1 - sw * sw)) ** e2;
 }
 
 // ---------------------------------------------------------------------------------------------- hands
@@ -629,9 +651,658 @@ function buildSplatling() {
   };
 }
 
+// ---------------------------------------------------------------------------------------------- bucket
+/** Slosh pail: a stubby cream pail tipped mouth-forward on a trigger frame. The right fist holds the pistol post of a
+ *  D-frame whose top bar arches over the pail; the left fist an underslung loop handle below the front. Ink surges up
+ *  the pail and spills over a wide dark pour lip under the mouth. Pail space: axis PA tilts up toward +Z, PU = its up. */
+function buildBucket() {
+  const P = new Parts(), I = new Parts();
+  pistolGrip(P);
+  const al = 0.3;
+  const PX = new V3(1, 0, 0), PU = new V3(0, Math.cos(al), -Math.sin(al)), PA = new V3(0, Math.sin(al), Math.cos(al));
+  const B0 = new V3(0, 0.03, 0.068);                                    // centre of the pail base
+  const pail = (g) => placeXY(g, PX, PU, B0);                          // pail-local (x, up, along axis) → weapon space
+  const pp = (x, y, z) => B0.clone().addScaledVector(PX, x).addScaledVector(PU, y).addScaledVector(PA, z);
+  const rOut = (z) => 0.0605 + 0.123 * (z - 0.012);                    // outer wall radius along the axis
+  const rIn = (z) => 0.056 + 0.1265 * (z - 0.028);                     // inner wall radius
+  // shell (thick walled, gloss cream), dark liner, rolled rim bead, metal hoops, rubber foot
+  P.add(pail(latheZ([[0, 0], [0.05, 0], [0.057, 0.003], [0.0605, 0.012], [0.083, 0.192], [0.0822, 0.198], [0.0778, 0.198], [0.0765, 0.19], [0.056, 0.028], [0.05, 0.022], [0, 0.021]], 28)), C.cream, M.gloss);
+  P.add(pail(latheZ([[0, 0.0228], [0.049, 0.0236], [0.0548, 0.0292], [0.0752, 0.191], [0.0738, 0.191], [0.0534, 0.0302], [0.0482, 0.0252], [0, 0.0244]], 28)), C.darker, M.satin);
+  P.add(pail(at(torus(0.0806, 0.0064, 6, 28), 0, 0, 0.195)), C.dark, M.gloss);
+  for (const z of [0.056, 0.148]) P.add(pail(at(torus(rOut(z) + 0.0006, 0.0036, 5, 28), 0, 0, z)), C.metal, M.metal);
+  P.add(pail(latheZ(smoothProfile([[0, -0.009], [0.048, -0.009], [0.058, -0.006], [0.0636, 0.002], [0.0638, 0.012], [0.0606, 0.02]], 8).concat([[0, 0.02]]), 28)), C.rubber, M.rubber);
+  P.add(pail(latheZ([[0, -0.0118], [0.042, -0.0118], [0.0455, -0.0098], [0.046, -0.006], [0, -0.006]], 24)), C.dark, M.gloss);   // base plate
+  I.add(pail(at(torus(0.0335, 0.0036, 5, 24), 0, 0, -0.0118)));
+  P.add(pail(latheZ([[0, -0.0158], [0.0085, -0.0158], [0.0095, -0.013], [0.0095, -0.01], [0, -0.01]], 6)), C.metal, M.metal);  // drain plug
+  // ink inside: surges up toward the mouth, then drops over the lip (wavy surface clamps a lathe that fills the liner)
+  const surf = (x, z) => (z < 0.15 ? -0.03 + 0.2 * (z - 0.03) : -0.006 - 1.4 * (z - 0.15)) + 0.0032 * Math.sin(x * 95 + z * 60) + 0.0022 * Math.sin(z * 150 - x * 40);
+  const fillProf = [[0, 0.027]];
+  for (let k = 0; k <= 12; k++) { const z = 0.03 + k * 0.013; fillProf.push([rIn(z) - 0.0045, z]); }
+  fillProf.push([0, 0.19]);
+  I.add(pail(deformG(latheZ(fillProf, 24), (v) => { v.y = Math.min(v.y, surf(v.x, v.z)); })));
+  // pour lip: wide curved scoop under the mouth, flaring out and slightly down; ink tongue spilling over it + drips
+  const lipR = (z) => 0.0772 + 0.42 * Math.max(0, z - 0.19);
+  const lip = superEllipsoid(0.9, 0.0034, 0.033, 0.5, 0.4, 20, 5, (q) => {
+    const th = q.x, z = 0.219 + q.z, r = lipR(z) - q.y;
+    q.set(r * Math.sin(th), -r * Math.cos(th), z);
+  });
+  P.add(pail(lip), C.dark, M.gloss);
+  const tongue = superEllipsoid(0.52, 0.0042, 0.036, 0.6, 0.55, 16, 5, (q) => {
+    const th = q.x, s = q.z / 0.036;
+    const front = 0.236 + 0.007 * Math.cos(th * 9) - 0.05 * th * th;
+    const z = 0.172 + (s + 1) * 0.5 * (front - 0.172);
+    const r = lipR(z) - 0.0076 - q.y * (1 + 0.35 * Math.sin(th * 7 + z * 80));
+    q.set(r * Math.sin(th), -r * Math.cos(th), z);
+  });
+  I.add(pail(tongue));
+  for (const [x, len] of [[0.022, 1], [-0.03, 0.7]]) {
+    const hy = 0.0085 * len;
+    const d = superEllipsoid(0.0048, hy, 0.0048, 1, 1, 8, 6, (q) => { if (q.y > 0) { const k = 1 - 0.7 * q.y / hy; q.x *= k; q.z *= k; } });
+    const R = lipR(0.244) + 0.0034, p = pp(x, -Math.sqrt(R * R - x * x), 0.244);
+    I.add(at(d, p.x, p.y - hy * 0.85, p.z));
+  }
+  // flank ink windows (below the waterline on both sides) + squid decal wrapped on the left flank
+  for (const sx of [1, -1]) {
+    const psi = sx > 0 ? -0.38 : Math.PI + 0.38, zc = 0.1, r = rOut(zc);
+    const place = (g) => { g.rotateY(0.1225); g.rotateZ(psi); return pail(at(g, r * Math.cos(psi), r * Math.sin(psi), zc)); };
+    P.add(place(superEllipsoid(0.0028, 0.0125, 0.034, 0.5, 0.45, 8, 6)), C.dark, M.gloss);
+    I.add(place(superEllipsoid(0.0034, 0.0085, 0.029, 0.6, 0.5, 8, 6)));
+  }
+  {
+    const zc = 0.1, psc = 0.42;
+    const sq = deformG(decal(squidShape(0.032)), (v) => { const z = zc - v.x, r = rOut(z) + 0.0004 + v.z, ps = psc + v.y / r; v.set(r * Math.cos(ps), r * Math.sin(ps), z); });
+    P.add(pail(sq), C.decal, M.print);
+  }
+  const valve = lathe([[0, 0], [0.0058, 0], [0.0058, 0.006], [0.0085, 0.0075], [0.0085, 0.0115], [0, 0.012]], 10);
+  P.add(orient(valve, PU, pp(0, rOut(0.034) - 0.001, 0.034)), C.metal, M.metal);
+  // trigger frame: dark block over the grip bolted to the pail base, carry bar arching over the pail to the rim
+  P.add(at(superEllipsoid(0.02, 0.0145, 0.047, 0.45, 0.55, 10, 6), 0, 0.047, 0.01), C.dark, M.satin);
+  for (const sx of [1, -1]) for (const z of [-0.018, 0.026]) screw(P, new V3(sx * seX(0.02, 0.0145, 0.047, 0.45, 0.55, 0.001, z - 0.01), 0.048, z), new V3(sx, 0, 0), 0.0026);
+  P.add(orient(superEllipsoid(0.0032, 0.0016, 0.0032, 1, 1, 8, 4), new V3(-1, 0, 0), new V3(-0.0196, 0.052, 0.004)), C.green, M.led);
+  const arch = sweep([new V3(0, 0.052, -0.024), new V3(0, 0.108, -0.016), new V3(0, 0.162, 0.024), new V3(0, 0.188, 0.09), new V3(0, 0.192, 0.155), new V3(0, 0.178, 0.216)], {
+    seg: 20, radial: 7, capSteps: 2, radius: () => 0.0082, flat: 1.35, outward: (Pp, o) => o.set(1, 0, 0),
+  });
+  P.add(arch.geo, C.dark, M.satin);
+  const sleevePts = []; for (let k = 0; k <= 6; k++) sleevePts.push(arch.curve.getPointAt(0.4 + k * 0.05));
+  const sleeve = sweep(sleevePts, { seg: 14, radial: 7, capSteps: 2, radius: (t) => 0.0112 + 0.0007 * Math.cos(t * Math.PI * 14), flat: 1.25, outward: (Pp, o) => o.set(1, 0, 0) });
+  P.add(sleeve.geo, C.rubber, M.rubber);
+  const foot = superEllipsoid(0.0135, 0.008, 0.013, 0.5, 0.6, 8, 5); foot.rotateX(-al);
+  const fp = pp(0, 0.086, 0.196); P.add(at(foot, fp.x, fp.y, fp.z), C.dark, M.gloss);
+  // left hand: rubber loop handle slung under the front of the pail
+  const loop = sweep([new V3(0, -0.012, 0.117), new V3(0, -0.043, 0.121), new V3(0, -0.05, 0.14), new V3(0, -0.05, 0.19), new V3(0, -0.042, 0.21), new V3(0, -0.002, 0.212)], {
+    seg: 16, radial: 7, capSteps: 2, radius: () => 0.0068, flat: 1, outward: (Pp, o) => o.set(1, 0, 0),
+  });
+  P.add(loop.geo, C.dark, M.satin);
+  P.add(at(latheZ(smoothProfile([[0, 0.13], [0.0112, 0.1315], [0.0134, 0.138], [0.0136, 0.188], [0.0126, 0.196], [0, 0.198]], 8), 12), 0, -0.05, 0), C.rubber, M.rubber);
+  for (let k = 0; k < 4; k++) P.add(at(torus(0.0137, 0.0011, 3, 12), 0, -0.05, 0.146 + k * 0.012), C.darker, M.satin);
+  return {
+    kind: 'bucket', body: P.build(), ink: I.build(),
+    muzzle: pp(0, -0.07, 0.25),
+    gripR: GRIP_PISTOL,
+    gripL: { pos: new V3(0, -0.05, 0.164), handZ: new V3(0, 0, 1), handY: new V3(0.8, -0.55, -0.1) },
+    twirl: new V3(0, 0.03, 0.03),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------- spinner
+/** Rotary ink cannon: in-line caged ink tank at the back, cream motor housing over the pistol grip, a fat fixed barrel
+ *  shroud (left-hand foregrip underneath, motor pod on the right), carry handle on top. The six-barrel cluster in front
+ *  is the separate `spin` mesh (authored in weapon space) turning about the axis +Z through `spinAt`. */
+function buildSpinner() {
+  const P = new Parts(), I = new Parts(), S = new Parts();
+  pistolGrip(P);
+  const y0 = 0.072, Z0 = 0.25;                                         // cluster axis height, shroud front face
+  // housing: cream shell, dark lower frame, team-ink spine
+  const HR = [0.034, 0.042, 0.092, 0.42, 0.56], HC = new V3(0, 0.07, 0.03);
+  P.add(at(superEllipsoid(HR[0], HR[1], HR[2], HR[3], HR[4], 14, 10), HC.x, HC.y, HC.z), C.cream, M.satin);
+  P.add(at(superEllipsoid(0.0305, 0.012, 0.086, 0.4, 0.5, 12, 6), 0, 0.038, 0.03), C.dark, M.satin);
+  I.add(at(superEllipsoid(0.019, 0.0065, 0.056, 0.5, 0.6, 12, 5), 0, 0.1105, 0.045));
+  const flankX = (y, z) => seX(HR[0], HR[1], HR[2], HR[3], HR[4], y - HC.y, z - HC.z);
+  for (const sx of [1, -1]) for (const [y, z] of [[0.094, -0.02], [0.094, 0.085], [0.046, 0.085]]) screw(P, new V3(sx * flankX(y, z), y, z), new V3(sx, 0, 0), 0.0027);
+  const sq = decal(squidShape(0.028)); placeXY(sq, new V3(0, 0, -1), new V3(0, 1, 0), new V3(flankX(0.07, 0) + 0.0002, 0.068, 0)); P.add(sq, C.decal, M.print);
+  for (const s of chevronShape(0.034, 0.01, 3, 0.45)) { const g = decal(s); placeXY(g, new V3(0, 0, 1), new V3(0, 1, 0), new V3(flankX(0.048, 0.05) + 0.0002, 0.043, 0.03)); I.add(g); }
+  P.add(orient(superEllipsoid(0.0034, 0.0016, 0.0034, 1, 1, 8, 4), new V3(-1, 0, 0), new V3(-flankX(0.07, 0), 0.07, 0)), C.amber, M.led);
+  // rear ink tank: caged capsule in line with the barrels, dark end caps, metal band + valve
+  const tz = -0.108;
+  I.add(at(latheZ(smoothProfile([[0, -0.05], [0.033, -0.048], [0.0355, -0.038], [0.0355, 0.038], [0.033, 0.048], [0, 0.05]], 8), 16), 0, y0, tz));
+  for (let k = 0; k < 6; k++) {
+    const a = (k / 6) * Math.PI * 2 + Math.PI / 6;
+    P.add(at(superEllipsoid(0.0028, 0.0028, 0.044, 0.6, 0.6, 4, 4), Math.cos(a) * 0.0372, y0 + Math.sin(a) * 0.0372, tz), C.dark, M.satin);
+  }
+  P.add(at(torus(0.0385, 0.0022, 4, 20), 0, y0, tz), C.metal, M.metal);
+  P.add(at(latheZ([[0, -0.013], [0.028, -0.013], [0.0375, -0.009], [0.0398, -0.002], [0.0398, 0.006], [0.0365, 0.0095], [0, 0.0095]], 16), 0, y0, tz - 0.052), C.dark, M.gloss);
+  P.add(at(latheZ([[0, -0.0095], [0.0365, -0.0095], [0.0398, -0.006], [0.0398, 0.004], [0.036, 0.009], [0, 0.009]], 16), 0, y0, tz + 0.05), C.dark, M.gloss);
+  P.add(orient(lathe([[0, 0], [0.0075, 0], [0.0075, 0.006], [0.0105, 0.0078], [0.0105, 0.0135], [0, 0.0142]], 10), new V3(0, 0, -1), new V3(0, y0, tz - 0.064)), C.metal, M.metal);
+  // fixed barrel shroud: collar into the housing, cooling fins, team ring at the lip, dark front face
+  P.add(at(latheZ([[0, 0.112], [0.051, 0.113], [0.053, 0.12], [0.051, 0.127], [0, 0.128]], 24), 0, y0, 0), C.dark, M.gloss);
+  P.add(at(latheZ(smoothProfile([[0, 0.096], [0.036, 0.098], [0.0475, 0.106], [0.0505, 0.122], [0.0505, 0.222], [0.0488, 0.242], [0.044, 0.25]], 10).concat([[0, 0.2505]]), 24), 0, y0, 0), C.cream, M.satin);
+  P.add(at(latheZ([[0, Z0 - 0.001], [0.041, Z0 - 0.001], [0.041, Z0 + 0.0015], [0, Z0 + 0.0015]], 20), 0, y0, 0), C.darker, M.satin);
+  for (let k = 0; k < 4; k++) P.add(at(torus(0.0508, 0.0019, 4, 24), 0, y0, 0.15 + k * 0.016), C.darker, M.satin);
+  I.add(at(torus(0.0478, 0.0034, 5, 24), 0, y0, 0.238));
+  // motor pod on the right flank (finned can, metal end cap)
+  const mz = 0.172;
+  P.add(at(latheZ(smoothProfile([[0, -0.042], [0.012, -0.041], [0.0158, -0.034], [0.0158, 0.034], [0.012, 0.041], [0, 0.042]], 7), 12), -0.046, 0.046, mz), C.dark, M.gloss);
+  for (let k = 0; k < 4; k++) P.add(at(torus(0.0162, 0.0014, 3, 12), -0.046, 0.046, mz - 0.024 + k * 0.016), C.darker, M.satin);
+  P.add(at(latheZ([[0, 0.0], [0.0085, 0.0], [0.0095, 0.004], [0.007, 0.0075], [0, 0.008]], 10), -0.046, 0.046, mz + 0.041), C.metal, M.metal);
+  // carry handle over the housing (rubber pad on top)
+  const handle = sweep([new V3(0, 0.104, -0.036), new V3(0, 0.148, -0.024), new V3(0, 0.166, 0.02), new V3(0, 0.166, 0.085), new V3(0, 0.15, 0.13), new V3(0, 0.116, 0.148)], {
+    seg: 18, radial: 7, capSteps: 2, radius: () => 0.0085, flat: 1.4, outward: (Pp, o) => o.set(1, 0, 0),
+  });
+  P.add(handle.geo, C.dark, M.satin);
+  const padPts = []; for (let k = 0; k <= 6; k++) padPts.push(handle.curve.getPointAt(0.33 + k * 0.055));
+  P.add(sweep(padPts, { seg: 12, radial: 7, capSteps: 2, radius: (t) => 0.011 + 0.0007 * Math.cos(t * Math.PI * 12), flat: 1.3, outward: (Pp, o) => o.set(1, 0, 0) }).geo, C.rubber, M.rubber);
+  // left-hand foregrip under the shroud (mounted at both ends so the fingers wrap freely)
+  P.add(at(latheZ(smoothProfile([[0, 0.164], [0.0112, 0.166], [0.0134, 0.174], [0.0136, 0.236], [0.0124, 0.244], [0, 0.246]], 8), 12), 0, -0.012, 0), C.rubber, M.rubber);
+  for (let k = 0; k < 4; k++) P.add(at(torus(0.0137, 0.0011, 3, 12), 0, -0.012, 0.186 + k * 0.012), C.darker, M.satin);
+  for (const z of [0.16, 0.238]) P.add(at(superEllipsoid(0.0085, 0.02, 0.0075, 0.5, 0.6, 6, 5), 0, 0.008, z), C.dark, M.satin);
+  // spinning cluster (weapon space, axis through (0, y0) along +Z): toothed drive gear, 6 barrels, clamp + front plates
+  const gear = lathe([[0, 0], [0.043, 0], [0.0455, 0.003], [0.0455, 0.013], [0.043, 0.016], [0, 0.016]], 64, (v) => {
+    const rr = Math.hypot(v.x, v.z);
+    if (rr > 0.04) { const a = Math.atan2(v.z, v.x); const k = 1 + 0.07 * Math.max(-1, Math.min(1, Math.sin(a * 16) * 2.5)); v.x *= k; v.z *= k; }
+  });
+  gear.rotateX(Math.PI / 2); S.add(at(gear, 0, y0, Z0 + 0.001), C.gunmetal, M.metal);
+  S.add(at(latheZ([[0, 0.0], [0.0095, 0.0], [0.0095, 0.19], [0, 0.19]], 10), 0, y0, Z0), C.metal, M.metal);
+  for (let k = 0; k < 6; k++) {
+    const a = (k / 6) * Math.PI * 2, bx = Math.cos(a) * 0.029, by = y0 + Math.sin(a) * 0.029;
+    S.add(at(latheZ([[0, 0.012], [0.0088, 0.012], [0.0088, 0.186], [0.0096, 0.192], [0.0106, 0.2], [0.0106, 0.207], [0.0094, 0.2112], [0.0064, 0.2115], [0.0058, 0.2], [0, 0.199]], 10), bx, by, Z0), C.gunmetal, M.metal);
+    S.add(at(latheZ([[0, 0.1995], [0.0055, 0.2], [0.0055, 0.203], [0, 0.203]], 8), bx, by, Z0), C.darker, M.satin);
+  }
+  S.add(at(latheZ([[0, 0.092], [0.04, 0.092], [0.0435, 0.095], [0.0435, 0.103], [0.04, 0.106], [0, 0.106]], 24), 0, y0, Z0), C.dark, M.gloss);
+  S.add(at(latheZ([[0, 0.17], [0.04, 0.17], [0.0438, 0.1735], [0.0438, 0.1825], [0.04, 0.186], [0, 0.186]], 24), 0, y0, Z0), C.cream, M.gloss);
+  S.add(at(latheZ([[0, 0.185], [0.012, 0.185], [0.0115, 0.19], [0.008, 0.195], [0, 0.197]], 12), 0, y0, Z0), C.metal, M.metal);
+  // hazard index marks (make the rotation readable): on the clamp-plate rim and the front face, between two barrels
+  const ia = Math.PI / 6;
+  const m1 = superEllipsoid(0.0022, 0.006, 0.0072, 0.6, 0.6, 5, 5); m1.rotateZ(ia);
+  S.add(at(m1, Math.cos(ia) * 0.0436, y0 + Math.sin(ia) * 0.0436, Z0 + 0.099), C.hazard, M.print);
+  const m2 = superEllipsoid(0.0075, 0.0045, 0.0012, 0.6, 0.6, 6, 4); m2.rotateZ(ia);
+  S.add(at(m2, Math.cos(ia) * 0.034, y0 + Math.sin(ia) * 0.034, Z0 + 0.1862), C.hazard, M.print);
+  return {
+    kind: 'spinner', body: P.build(), ink: I.build(), spin: S.build(), spinAt: new V3(0, y0, Z0),
+    muzzle: new V3(0, y0, Z0 + 0.2115),
+    gripR: GRIP_PISTOL,
+    gripL: { pos: new V3(0, -0.012, 0.205), handZ: new V3(0, 0, 1), handY: new V3(0.75, -0.62, -0.1) },
+    twirl: new V3(0, 0.03, 0.03),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------- twins
+/** One of a pair of stubby ink pistols (the character mirrors a copy into the left fist): chunky cream receiver, a caged
+ *  ink drum laid across the top, fat flared barrel with a team ring, and a vertical ink vial ahead of the trigger guard
+ *  that doubles as the support grip. */
+function buildTwins() {
+  const P = new Parts(), I = new Parts();
+  pistolGrip(P);
+  const RR = [0.0272, 0.036, 0.06, 0.42, 0.56], RC = new V3(0, 0.07, 0.01);
+  P.add(at(superEllipsoid(RR[0], RR[1], RR[2], RR[3], RR[4], 14, 10, (q) => { if (q.z > 0.028) q.y *= 1 - 0.2 * (q.z - 0.028) / 0.032; }), RC.x, RC.y, RC.z), C.cream, M.satin);
+  P.add(at(superEllipsoid(0.0242, 0.0115, 0.058, 0.4, 0.5, 12, 6), 0, 0.04, 0.012), C.dark, M.satin);
+  const flankX = (y, z) => seX(RR[0], RR[1], RR[2], RR[3], RR[4], y - RC.y, z - RC.z);
+  // cross drum on top (axis X): team ink between dark end caps, two strap bands, metal hubs
+  const dc = new V3(0, 0.112, -0.012);
+  const drum = latheZ(smoothProfile([[0, -0.027], [0.021, -0.026], [0.0238, -0.019], [0.0238, 0.019], [0.021, 0.026], [0, 0.027]], 8), 18);
+  drum.rotateY(Math.PI / 2); I.add(at(drum, dc.x, dc.y, dc.z));
+  for (const sx of [1, -1]) {
+    const cap = latheZ([[0, -0.0045], [0.0238, -0.0045], [0.026, -0.0015], [0.026, 0.003], [0.022, 0.0058], [0.01, 0.0064], [0, 0.0066]], 18);
+    cap.rotateY(sx * Math.PI / 2); P.add(at(cap, dc.x + sx * 0.0265, dc.y, dc.z), C.dark, M.gloss);
+    const hub = latheZ([[0, 0], [0.0072, 0], [0.0078, 0.0028], [0.005, 0.0048], [0, 0.005]], 10);
+    hub.rotateY(sx * Math.PI / 2); P.add(at(hub, dc.x + sx * 0.032, dc.y, dc.z), C.metal, M.metal);
+    const band = torus(0.0246, 0.0021, 4, 20); band.rotateY(Math.PI / 2); P.add(at(band, sx * 0.011, dc.y, dc.z), C.dark, M.satin);
+  }
+  // barrel: short and fat, vent rings, team ring in the waist, flared tip with a dark bore
+  P.add(at(latheZ([[0, 0.058], [0.0158, 0.058], [0.0158, 0.072], [0.0172, 0.075], [0.0172, 0.1], [0.016, 0.104], [0.0186, 0.108], [0.0212, 0.116], [0.0214, 0.122], [0.0196, 0.1255], [0.013, 0.1258], [0.0098, 0.121], [0.0084, 0.113], [0, 0.111]], 14), 0, 0.068, 0), C.gunmetal, M.metal);
+  P.add(at(latheZ([[0, 0.108], [0.008, 0.108], [0.008, 0.1142], [0, 0.1142]], 10), 0, 0.068, 0), C.darker, M.satin);
+  for (const z of [0.082, 0.092]) P.add(at(torus(0.0174, 0.0012, 3, 14), 0, 0.068, z), C.darker, M.satin);
+  I.add(at(torus(0.0166, 0.0032, 4, 14), 0, 0.068, 0.1055));
+  // rear cap + cocking knob
+  P.add(at(superEllipsoid(0.0245, 0.03, 0.0085, 0.45, 0.55, 10, 6), 0, 0.07, -0.05), C.dark, M.gloss);
+  P.add(at(latheZ([[0, -0.011], [0.0066, -0.011], [0.0072, -0.007], [0.0072, 0.0], [0, 0.0]], 10), 0, 0.074, -0.056), C.metal, M.metal);
+  // ink vial support grip (tilted like the shooter's foregrip), cage bars, foot cap, socket under the nose
+  const vial = (g) => { g.rotateX(-0.12); return at(g, 0, 0.016, 0.072); };
+  I.add(vial(lathe(smoothProfile([[0, -0.03], [0.0105, -0.029], [0.012, -0.022], [0.012, 0.024], [0.0105, 0.03], [0, 0.031]], 7), 14)));
+  for (let k = 0; k < 4; k++) { const a = (k / 4) * Math.PI * 2 + Math.PI / 4; P.add(vial(at(superEllipsoid(0.0021, 0.025, 0.0021, 0.6, 0.6, 4, 4), Math.cos(a) * 0.0132, 0, Math.sin(a) * 0.0132)), C.dark, M.satin); }
+  P.add(vial(lathe([[0, -0.038], [0.0118, -0.038], [0.0142, -0.034], [0.0146, -0.027], [0.0126, -0.023], [0, -0.023]], 14)), C.dark, M.gloss);
+  P.add(at(superEllipsoid(0.0165, 0.0105, 0.019, 0.5, 0.6, 10, 5), 0, 0.047, 0.07), C.dark, M.gloss);
+  // flank details: squid decal (left), screws, status LED (right)
+  const sq = decal(squidShape(0.024)); placeXY(sq, new V3(0, 0, -1), new V3(0, 1, 0), new V3(flankX(0.066, -0.018) + 0.0002, 0.066, -0.018)); P.add(sq, C.decal, M.print);
+  for (const sx of [1, -1]) for (const [y, z] of [[0.09, 0.04], [0.048, -0.028]]) screw(P, new V3(sx * flankX(y, z), y, z), new V3(sx, 0, 0), 0.0025);
+  P.add(orient(superEllipsoid(0.003, 0.0015, 0.003, 1, 1, 8, 4), new V3(-1, 0, 0), new V3(-flankX(0.08, -0.025), 0.08, -0.025)), C.green, M.led);
+  return {
+    kind: 'twins', mirrorDual: true, body: P.build(), ink: I.build(),
+    muzzle: new V3(0, 0.068, 0.1258),
+    gripR: GRIP_PISTOL,
+    gripL: { pos: new V3(0, 0.016, 0.072), handZ: new V3(0, 1, -0.12), handY: new V3(0.45, -0.05, -1) },
+    twirl: new V3(0, 0.03, 0.03),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------- brush
+/** Deck brush pushed along the ground like the roller (same hand stations on the shaft): ball-knob top grip, ink
+ *  canister clipped on the shaft feeding a hose to the head, a lockable knuckle hinge, and a wide cream head canted down
+ *  so the bristles meet the ground in the roller's pose. Bristle roots are natural, the tips soaked in team ink.
+ *  Head space: HX across, HY up the head toward the hinge, HN out of the broad front face. */
+function buildBrush() {
+  const P = new Parts(), I = new Parts();
+  const KZ = 0.724, be = 0.42;                                          // hinge on the shaft axis, head cant (rad)
+  const K = new V3(0, 0, KZ), HX = new V3(1, 0, 0), HY = new V3(0, Math.sin(be), -Math.cos(be)), HN = new V3(0, Math.cos(be), Math.sin(be));
+  const head = (g) => placeXY(g, HX, HY, K);
+  const hp = (x, y, z) => K.clone().addScaledVector(HX, x).addScaledVector(HY, y).addScaledVector(HN, z);
+  // shaft, rubber top grip with a cream ball knob (right hand), mid grip with dark collars (left hand)
+  P.add(latheZ([[0, -0.07], [0.0098, -0.07], [0.0098, 0.69], [0, 0.69]], 10), C.metal, M.metal);
+  P.add(latheZ(smoothProfile([[0, -0.086], [0.0116, -0.085], [0.0144, -0.076], [0.0138, -0.05], [0.0132, -0.02], [0.0136, 0.02], [0.0142, 0.046], [0.0156, 0.054], [0.0112, 0.06]], 10), 12), C.rubber, M.rubber);
+  P.add(at(superEllipsoid(0.02, 0.02, 0.018, 0.85, 1, 14, 10), 0, 0, -0.1), C.cream, M.gloss);
+  I.add(at(torus(0.0142, 0.0028, 5, 14), 0, 0, 0.062));
+  P.add(latheZ(smoothProfile([[0.0098, 0.13], [0.0136, 0.136], [0.0142, 0.15], [0.0138, 0.19], [0.0142, 0.235], [0.0136, 0.25], [0.0098, 0.256]], 8), 10), C.rubber, M.rubber);
+  for (const z of [0.126, 0.26]) P.add(at(latheZ([[0.0098, -0.005], [0.0148, -0.004], [0.0154, 0.0], [0.0148, 0.004], [0.0098, 0.005]], 12), 0, 0, z), C.dark, M.gloss);
+  // ink canister clipped on top of the shaft: cage bars, caps, two band clamps
+  const cz = 0.418, cy = 0.035;
+  I.add(at(latheZ(smoothProfile([[0, -0.082], [0.0172, -0.08], [0.0192, -0.071], [0.0192, 0.071], [0.0172, 0.08], [0, 0.082]], 8), 12), 0, cy, cz));
+  for (let k = 0; k < 4; k++) { const a = (k / 4) * Math.PI * 2 + Math.PI / 4; P.add(at(superEllipsoid(0.0024, 0.0024, 0.066, 0.6, 0.6, 4, 4), Math.cos(a) * 0.0203, cy + Math.sin(a) * 0.0203, cz), C.dark, M.satin); }
+  for (const s of [-1, 1]) P.add(at(latheZ([[0, -0.009 * s], [0.0205, -0.009 * s], [0.0216, -0.004 * s], [0.0216, 0.006 * s], [0.018, 0.0095 * s], [0, 0.01 * s]], 12), 0, cy, cz + s * 0.078), C.dark, M.gloss);
+  for (const z of [0.366, 0.47]) {
+    P.add(at(superEllipsoid(0.0118, 0.0215, 0.0085, 0.5, 0.6, 8, 6), 0, 0.016, z), C.dark, M.satin);
+    P.add(at(torus(0.0106, 0.0024, 4, 12), 0, 0, z), C.metal, M.metal);
+  }
+  // feed hose from the canister over the hinge (right side) into a fitting on the head's front face
+  const fit = hp(-0.07, -0.036, 0.024);
+  P.add(orient(lathe([[0, 0], [0.0078, 0], [0.0078, 0.006], [0.0062, 0.0085], [0.0062, 0.012], [0, 0.0125]], 10), HN, fit), C.metal, M.metal);
+  const hose = sweep([new V3(0, 0.036, 0.5), new V3(-0.01, 0.045, 0.56), new V3(-0.045, 0.047, 0.65), new V3(-0.068, 0.036, 0.73), fit.clone().addScaledVector(HN, 0.011)], {
+    seg: 18, radial: 6, capSteps: 2, radius: () => 0.0052, flat: 1, outward: (Pp, o) => o.set(0, 1, 0),
+  });
+  P.add(hose.geo, C.rubber, M.rubber);
+  // knuckle hinge: collar, neck hub, gunmetal cheeks rising from the head, pivot pin, nut (right) + fluted lock knob (left)
+  P.add(latheZ([[0.0098, 0.664], [0.0162, 0.666], [0.0168, 0.676], [0.0098, 0.678]], 12), C.metal, M.metal);
+  P.add(at(superEllipsoid(0.0168, 0.0185, 0.034, 0.5, 0.6, 10, 8), 0, 0, 0.7), C.dark, M.satin);
+  for (const sx of [1, -1]) P.add(head(at(superEllipsoid(0.0046, 0.031, 0.02, 0.5, 0.6, 6, 7), sx * 0.0262, -0.018, 0)), C.gunmetal, M.metal);
+  const pin = latheZ([[0, -0.036], [0.0082, -0.036], [0.0082, 0.036], [0, 0.036]], 10); pin.rotateY(Math.PI / 2); P.add(at(pin, 0, 0, KZ), C.metal, M.metal);
+  const nut = latheZ([[0, 0], [0.0098, 0], [0.0098, 0.0055], [0.0072, 0.0078], [0, 0.008]], 6); nut.rotateY(-Math.PI / 2); P.add(at(nut, -0.0306, 0, KZ), C.metal, M.metal);
+  const knob = lathe(smoothProfile([[0, 0], [0.0175, 0.0], [0.0195, 0.005], [0.0185, 0.0125], [0.011, 0.0175], [0, 0.018]], 8), 42, (v) => {
+    const rr = Math.hypot(v.x, v.z);
+    if (rr > 0.006) { const a = Math.atan2(v.z, v.x); const k = 1 - 0.16 * Math.max(0, Math.cos(a * 7)) ** 2 * Math.min(1, (rr - 0.006) / 0.01); v.x *= k; v.z *= k; }
+  });
+  P.add(orient(knob, new V3(1, 0, 0), new V3(0.0306, 0, KZ)), C.dark, M.gloss);
+  P.add(orient(lathe([[0, 0], [0.0062, 0], [0.0064, 0.0025], [0.004, 0.004], [0, 0.0042]], 10), new V3(1, 0, 0), new V3(0.0484, 0, KZ)), C.metal, M.metal);
+  // head block: cream stock with rubber end bumpers, metal ferrule with crimp lines and rivets
+  P.add(head(at(superEllipsoid(0.205, 0.0275, 0.026, 0.4, 0.38, 24, 8, (q) => { q.z *= 1 - 0.1 * (q.x / 0.205) ** 2; }), 0, -0.0475, 0)), C.cream, M.gloss);
+  for (const sx of [1, -1]) P.add(head(at(superEllipsoid(0.013, 0.031, 0.0285, 0.5, 0.6, 8, 7), sx * 0.2, -0.05, 0)), C.rubber, M.rubber);
+  P.add(head(at(superEllipsoid(0.194, 0.022, 0.0212, 0.35, 0.34, 24, 6), 0, -0.092, 0)), C.metal, M.metal);
+  for (const y of [-0.08, -0.104]) P.add(head(at(superEllipsoid(0.1948, 0.0012, 0.0216, 0.6, 0.34, 24, 3), 0, y, 0)), C.gunmetal, M.metal);
+  for (const x of [-0.14, -0.05, 0.05, 0.14]) for (const s of [1, -1]) screw(P, hp(x, -0.092, s * 0.0212), HN.clone().multiplyScalar(s), 0.0025);
+  // back face (toward the kid): ink level window, squid decal, LED, screws; team chevrons on the top edge
+  P.add(head(at(superEllipsoid(0.066, 0.0125, 0.0024, 0.5, 0.4, 14, 5), -0.1, -0.047, -0.0252)), C.dark, M.gloss);
+  I.add(head(at(superEllipsoid(0.06, 0.0082, 0.003, 0.6, 0.45, 14, 5), -0.1, -0.047, -0.0252)));
+  const sq = decal(squidShape(0.03)); placeXY(sq, new V3(-1, 0, 0), new V3(0, 1, 0), new V3(0.1, -0.049, -0.0252)); P.add(head(sq), C.decal, M.print);
+  P.add(head(at(superEllipsoid(0.0034, 0.0034, 0.0014, 1, 1, 8, 4), 0.165, -0.047, -0.0254)), C.amber, M.led);
+  for (const x of [-0.04, 0.04]) screw(P, hp(x, -0.062, -0.0254), HN.clone().negate(), 0.0028);
+  for (const sx of [1, -1]) for (const s of chevronShape(0.05, 0.014, 3, 0.45)) { const g = decal(s); placeXY(g, new V3(sx, 0, 0), new V3(0, 0, -sx), new V3(sx * 0.058, -0.0204, sx * 0.007)); I.add(head(g)); }
+  // bristles: three staggered rows of tapered clumps (natural roots, ink-soaked tips), chiselled so the tip line lies on
+  // the ground plane of the roller pose; solid cores behind them keep the bed dense
+  P.add(head(at(superEllipsoid(0.178, 0.03, 0.0125, 0.5, 0.5, 20, 6), 0, -0.132, 0)), C.bone, M.satin);
+  I.add(head(at(superEllipsoid(0.17, 0.026, 0.0105, 0.5, 0.5, 20, 6), 0, -0.186, 0)));
+  const rnd = rng(7), NC = 30, W = 0.178;
+  [-0.0126, -0.0042, 0.0042, 0.0126].forEach((z0, ri) => {
+    const n = ri % 2 ? NC - 1 : NC;
+    for (let c = 0; c < n; c++) {
+      const x = -W + (c + (ri % 2 ? 0.5 : 0)) * (2 * W / (NC - 1)) + (rnd() - 0.5) * 0.004;
+      const zr = z0 + (rnd() - 0.5) * 0.002;
+      const dir = new V3((x / W) * 0.09 + (rnd() - 0.5) * 0.06, -1, (z0 / 0.0126) * 0.07 + (rnd() - 0.5) * 0.05).normalize();   // root → tip
+      const R0 = new V3(x, -0.104, zr);
+      const yTip = -0.221 - 0.257 * (zr + dir.z * 0.117) + (rnd() - 0.5) * 0.009;
+      const len = (R0.y - yTip) / -dir.y, up = dir.clone().negate();
+      const w = 0.0052 + rnd() * 0.0014;
+      P.add(head(orient(superEllipsoid(w, len * 0.26, w * 0.9, 0.45, 1, 5, 4), up, R0.clone().addScaledVector(dir, len * 0.26))), C.bone, M.satin);
+      const th = len * 0.29;
+      const tip = superEllipsoid(w * 1.12, th, w * 1.02, 0.55, 1, 5, 5, (q) => { const k = 0.62 + 0.19 * (q.y / th + 1); q.x *= k; q.z *= k; });
+      I.add(head(orient(tip, up, R0.clone().addScaledVector(dir, len * 0.71))));
+    }
+  });
+  return {
+    kind: 'brush', body: P.build(), ink: I.build(),
+    muzzle: hp(0, -0.221, 0),
+    gripR: { pos: new V3(0, 0, -0.022), handZ: new V3(0, 0, 1), handY: new V3(-0.3, 1, 0) },
+    gripL: { pos: new V3(0, 0, 0.19), handZ: new V3(0, 0, 1), handY: new V3(0.5, 1, 0) },
+    twirl: new V3(0, 0, 0),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------- specials (held)
+// Held only while a special runs. Same contract as the main weapons (weapon space, grips, muzzle); `spin` like the
+// spinner's cluster (plastic only, turns about weapon +Z through spinAt while firing).
+
+/** Twister Zooka: shoulder-fired vortex launcher. A fat cream tube (axis at y = 0.112) over the pistol grip, rubber
+ *  shoulder pad under its tail, dark rear venturi, hazard band and a wide flared cream bell whose throat holds a
+ *  vortex impeller (`spin`); a caged team-ink canister rides on top in two saddles, a reflex sight on the left, a
+ *  vertical foregrip under the front for the left hand. ~0.98 m long (z −0.36 … 0.65). */
+function buildZooka() {
+  const P = new Parts(), I = new Parts(), S = new Parts();
+  pistolGrip(P);
+  const yT = 0.112, R = 0.058;
+  const T = (g) => at(g, 0, yT, 0);
+  // tube + joint collars
+  P.add(T(latheZ([[0, -0.282], [R - 0.003, -0.282]].concat(smoothProfile([[R - 0.002, -0.28], [R, -0.27], [R, 0.25], [R + 0.001, 0.4], [R + 0.004, 0.43]], 10), [[0, 0.43]]), 26)), C.cream, M.gloss);
+  P.add(T(at(torus(R + 0.003, 0.0062, 5, 26), 0, 0, 0.405)), C.dark, M.gloss);
+  P.add(T(at(torus(R + 0.002, 0.0048, 5, 26), 0, 0, -0.262)), C.dark, M.gloss);
+  for (let k = 0; k < 6; k++) P.add(T(latheZ([[R + 0.0009, 0.318 + k * 0.013], [R + 0.0009, 0.331 + k * 0.013]], 26)), k % 2 ? C.dark : C.hazard, M.print);
+  // rear venturi: dark flared cone with a team rim, darker exhaust throat
+  P.add(T(latheZ([[0, -0.268], [R - 0.004, -0.268], [R + 0.001, -0.285], [0.066, -0.326], [0.072, -0.35], [0.0705, -0.358], [0.064, -0.357], [0.054, -0.334], [0.036, -0.312], [0, -0.306]], 26)), C.dark, M.gloss);
+  I.add(T(at(torus(0.0705, 0.0048, 5, 26), 0, 0, -0.354)));
+  P.add(T(latheZ([[0, -0.309], [0.035, -0.313], [0.052, -0.333], [0, -0.333]], 18)), C.darker, M.satin);
+  // flared muzzle bell: cream horn, team lip, dark throat
+  const bellOut = smoothProfile([[R + 0.002, 0.425], [R + 0.006, 0.47], [0.07, 0.53], [0.09, 0.585], [0.112, 0.628], [0.12, 0.642]], 10);
+  P.add(T(latheZ(bellOut.concat([[0.123, 0.648], [0.119, 0.655], [0.108, 0.652], [0.088, 0.62], [0.066, 0.582], [0.052, 0.556], [0, 0.55]]), 28)), C.cream, M.gloss);
+  I.add(T(at(torus(0.118, 0.0072, 6, 28), 0, 0, 0.65)));
+  P.add(T(latheZ([[0, 0.5505], [0.0535, 0.5505], [0.0535, 0.5565], [0, 0.558]], 20)), C.darker, M.satin);
+  for (let k = 0; k < 4; k++) {  // swirl ribs on the bell (hint of the twister)
+    const a0 = k * Math.PI / 2, pts = [];
+    for (let i = 0; i <= 8; i++) { const t = i / 8, z = 0.47 + t * 0.15, rr = profR(bellOut, z) + 0.0018, a = a0 + t * 1.3; pts.push(new V3(Math.cos(a) * rr, yT + Math.sin(a) * rr, z)); }
+    I.add(sweep(pts, { seg: 16, radial: 5, capSteps: 2, radius: (t) => 0.0042 + 0.0016 * t, flat: 0.7, outward: (Pp, o) => o.set(Pp.x, Pp.y - yT, 0).normalize() }).geo);
+  }
+  // vortex impeller in the bell (spin): dark hub cone, five twisted vanes (one hazard = index mark), metal tip
+  const sz = 0.592;
+  S.add(at(latheZ([[0, -0.012], [0.017, -0.012], [0.019, -0.004], [0.014, 0.01], [0.006, 0.022], [0, 0.026]], 14), 0, yT, sz), C.dark, M.gloss);
+  for (let k = 0; k < 5; k++) {
+    const v = superEllipsoid(0.024, 0.0028, 0.012, 0.6, 0.6, 8, 5, (q) => {
+      const a = 0.55 + 8 * (q.x + 0.024), c = Math.cos(a), s = Math.sin(a), y = q.y, z = q.z;
+      q.y = y * c - z * s; q.z = y * s + z * c; q.x += 0.037;
+    });
+    v.rotateZ(k * Math.PI * 2 / 5); S.add(at(v, 0, yT, sz + 0.004), k ? C.cream : C.hazard, M.gloss);
+  }
+  S.add(at(latheZ([[0, 0.022], [0.0055, 0.022], [0.0045, 0.03], [0, 0.031]], 8), 0, yT, sz), C.metal, M.metal);
+  // receiver block over the grip, rubber shoulder pad under the tail
+  P.add(at(superEllipsoid(0.026, 0.021, 0.072, 0.45, 0.55, 10, 6), 0, 0.06, 0.012), C.dark, M.satin);
+  for (const sx of [1, -1]) for (const z of [-0.03, 0.05]) screw(P, new V3(sx * seX(0.026, 0.021, 0.072, 0.45, 0.55, 0.002, z - 0.012), 0.062, z), new V3(sx, 0, 0), 0.0027);
+  P.add(at(superEllipsoid(0.042, 0.016, 0.08, 0.45, 0.5, 12, 6, (q) => { q.y -= 9 * q.x * q.x; }), 0, yT - R - 0.004, -0.14), C.rubber, M.rubber);
+  // team-ink canister riding on top: cage bars, dark caps, saddles, valve, feed pipe, swirl decal on the front cap
+  const yC = yT + R + 0.043, zC = -0.01;
+  I.add(at(latheZ(smoothProfile([[0, -0.118], [0.03, -0.116], [0.0355, -0.104], [0.0355, 0.104], [0.03, 0.116], [0, 0.118]], 8), 16), 0, yC, zC));
+  for (let k = 0; k < 6; k++) { const a = (k / 6) * Math.PI * 2 + Math.PI / 6; P.add(at(superEllipsoid(0.0031, 0.0031, 0.1, 0.6, 0.6, 4, 5), Math.cos(a) * 0.0378, yC + Math.sin(a) * 0.0378, zC), C.dark, M.satin); }
+  for (const s of [-1, 1]) P.add(at(latheZ([[0, -0.011 * s], [0.0372, -0.011 * s], [0.0402, -0.005 * s], [0.0402, 0.007 * s], [0.035, 0.0115 * s], [0, 0.012 * s]], 18), 0, yC, zC + s * 0.114), C.dark, M.gloss);
+  for (const z of [-0.07, 0.06]) {
+    P.add(at(superEllipsoid(0.034, 0.024, 0.016, 0.5, 0.6, 10, 6), 0, yT + R + 0.008, zC + z), C.dark, M.satin);
+    P.add(at(torus(0.0392, 0.0032, 4, 18), 0, yC, zC + z), C.metal, M.metal);
+  }
+  P.add(at(lathe([[0, 0], [0.0068, 0], [0.0068, 0.008], [0.0098, 0.0098], [0.0098, 0.0145], [0, 0.015]], 10), 0, yC + 0.036, zC - 0.08), C.metal, M.metal);
+  P.add(sweep([new V3(0, yC - 0.012, zC + 0.124), new V3(0, yC - 0.014, zC + 0.148), new V3(0, yT + R + 0.016, 0.17), new V3(0, yT + R - 0.004, 0.176)], { seg: 10, radial: 7, capSteps: 2, radius: () => 0.0072, flat: 1, outward: (Pp, o) => o.set(1, 0, 0) }).geo, C.metal, M.metal);
+  for (const s of swirlShapes(0.024, 2, 0.62)) { const g = decal(s, 0.0008); placeXY(g, new V3(1, 0, 0), new V3(0, 1, 0), new V3(0, yC, zC + 0.1255)); P.add(g, C.decal, M.print); }
+  // reflex sight on the left (+X): bracket, dark housing, lens, team hood stripe
+  const sp = new V3(0.064, yT + 0.046, 0.13);
+  P.add(at(superEllipsoid(0.008, 0.018, 0.02, 0.5, 0.6, 6, 5), sp.x - 0.012, sp.y - 0.02, sp.z), C.dark, M.satin);
+  P.add(at(rbox(0.026, 0.03, 0.052, 0.35, 10, 6), sp.x, sp.y, sp.z), C.dark, M.gloss);
+  P.add(at(superEllipsoid(0.0098, 0.0112, 0.0025, 0.6, 0.6, 10, 4), sp.x, sp.y + 0.001, sp.z + 0.026), C.lens, M.lens);
+  I.add(at(superEllipsoid(0.0135, 0.0035, 0.024, 0.5, 0.6, 8, 4), sp.x, sp.y + 0.0155, sp.z + 0.006));
+  // flank decals: squid (left), forward chevrons (both), amber LED (right)
+  P.add(wrapZ(refine(decal(squidShape(0.052)), 0.006), R + 0.0004, 0.25, -0.1, yT), C.dark, M.print);
+  for (const sx of [1, -1]) for (const g of chevrons(0.07, 0.022, 3)) { g.rotateZ(Math.PI); I.add(wrapZ(g, R + 0.0004, sx > 0 ? 0.05 : Math.PI - 0.05, 0.215, yT)); }
+  P.add(orient(superEllipsoid(0.0038, 0.0018, 0.0038, 1, 1, 8, 4), new V3(-1, 0.3, 0).normalize(), new V3(-R * 0.955, yT + R * 0.29, -0.03)), C.amber, M.led);
+  // left-hand foregrip under the front of the tube
+  const fg = superEllipsoid(0.0118, 0.036, 0.0132, 0.55, 0.65, 10, 10, (q) => { if (q.z > 0) { const f = 0.5 + 0.5 * Math.cos((q.y / 0.0125) * Math.PI * 2); q.z -= 0.0012 * f; } });
+  fg.rotateX(-0.12); P.add(at(fg, 0, 0.008, 0.262), C.rubber, M.rubber);
+  P.add(at(superEllipsoid(0.0134, 0.0042, 0.0152, 0.5, 0.5, 10, 4), 0, -0.029, 0.267), C.dark, M.gloss);
+  P.add(at(superEllipsoid(0.0145, 0.014, 0.024, 0.5, 0.6, 8, 5), 0, 0.046, 0.258), C.dark, M.satin);
+  return {
+    kind: 'sp_zooka', body: P.build(), ink: I.build(), spin: S.build(), spinAt: new V3(0, yT, sz),
+    muzzle: new V3(0, yT, 0.655),
+    gripR: GRIP_PISTOL,
+    gripL: { pos: new V3(0, 0.008, 0.262), handZ: new V3(0, 1, -0.12), handY: new V3(0.45, -0.05, -1) },
+    twirl: new V3(0, 0.03, 0.03),
+  };
+}
+
+/** Bubble Blower: chubby cream toy gun with a fan pod on its back; a flared team nozzle feeds a big wand ring
+ *  (Ø 0.28, a soaked team-ink cord inside a cream frame, drips hanging off it) held by four spokes. An upside-down
+ *  soap bottle plugs in underneath: its rubber-sleeved neck is the left hand's foregrip. Muzzle = ring centre. */
+function buildBlower() {
+  const P = new Parts(), I = new Parts();
+  pistolGrip(P);
+  const yB = 0.074, zR = 0.232, RR = 0.128;
+  // body shell, dark lower frame, team spine, fan pod on the back
+  const BR = [0.031, 0.04, 0.09, 0.55, 0.62], BC = new V3(0, 0.072, 0.03);
+  P.add(at(superEllipsoid(BR[0], BR[1], BR[2], BR[3], BR[4], 14, 10, (q) => { if (q.z > 0.04) q.y *= 1 - 0.25 * (q.z - 0.04) / 0.05; }), BC.x, BC.y, BC.z), C.cream, M.gloss);
+  P.add(at(superEllipsoid(0.027, 0.012, 0.084, 0.4, 0.5, 12, 6), 0, 0.039, 0.032), C.dark, M.satin);
+  I.add(at(superEllipsoid(0.016, 0.006, 0.05, 0.5, 0.6, 10, 5), 0, 0.111, 0.045));
+  const flankX = (y, z) => seX(BR[0], BR[1], BR[2], BR[3], BR[4], y - BC.y, z - BC.z);
+  P.add(at(latheZ(smoothProfile([[0, -0.104], [0.028, -0.102], [0.042, -0.092], [0.046, -0.078], [0.045, -0.062], [0.036, -0.05]], 8).concat([[0, -0.05]]), 22), 0, yB, 0), C.dark, M.gloss);
+  for (const [r, z] of [[0.0335, -0.1035], [0.021, -0.1055]]) P.add(at(torus(r, 0.0021, 4, 20), 0, yB, z), C.gunmetal, M.metal);
+  P.add(at(latheZ([[0, -0.109], [0.0085, -0.109], [0.0092, -0.105], [0, -0.103]], 10), 0, yB, 0), C.metal, M.metal);
+  I.add(at(torus(0.0445, 0.0034, 5, 22), 0, yB, -0.068));
+  // soap window + bubble button on top, LED, screws, squid decal
+  P.add(at(superEllipsoid(0.013, 0.012, 0.013, 0.8, 0.9, 12, 8), 0, 0.104, -0.022), C.dark, M.gloss);
+  I.add(at(superEllipsoid(0.0105, 0.0105, 0.0105, 1, 1, 12, 8), 0, 0.115, -0.022));
+  for (const sx of [1, -1]) for (const [y, z] of [[0.09, 0.06], [0.05, -0.02]]) screw(P, new V3(sx * flankX(y, z), y, z), new V3(sx, 0, 0), 0.0026);
+  const sq = decal(squidShape(0.03)); placeXY(sq, new V3(0, 0, -1), new V3(0, 1, 0), new V3(flankX(0.072, 0.02) + 0.0002, 0.072, 0.02)); P.add(sq, C.decal, M.print);
+  P.add(orient(superEllipsoid(0.0032, 0.0016, 0.0032, 1, 1, 8, 4), new V3(-1, 0, 0), new V3(-flankX(0.08, 0.0), 0.08, 0.0)), C.green, M.led);
+  // nozzle: dark collar, flared team cone, dark lip
+  P.add(at(latheZ([[0, 0.108], [0.024, 0.108], [0.027, 0.114], [0.024, 0.12], [0, 0.12]], 16), 0, yB, 0), C.dark, M.gloss);
+  I.add(at(latheZ(smoothProfile([[0.0195, 0.116], [0.022, 0.135], [0.03, 0.158], [0.044, 0.176]], 7).concat([[0.046, 0.18], [0.04, 0.181], [0.026, 0.165], [0, 0.16]]), 18), 0, yB, 0));
+  P.add(at(torus(0.0445, 0.004, 5, 20), 0, yB, 0.179), C.dark, M.gloss);
+  // wand ring: cream frame (split front/back lips), soaked team cord inside, four spokes, drips
+  P.add(at(deformG(torus(RR + 0.007, 0.0118, 8, 48), (v) => { v.z *= 0.8; }), 0, yB, zR), C.cream, M.gloss);
+  I.add(at(deformG(torus(RR - 0.0065, 0.0082, 6, 48), (v) => { const a = Math.atan2(v.y, v.x), k = 1 + 0.18 * Math.sin(a * 11) * Math.sin(a * 5 + 1); const cx = Math.cos(a) * (RR - 0.0065), cy = Math.sin(a) * (RR - 0.0065); v.x = cx + (v.x - cx) * k; v.y = cy + (v.y - cy) * k; }), 0, yB, zR));
+  for (let k = 0; k < 4; k++) {
+    const a = Math.PI / 4 + k * Math.PI / 2, c = Math.cos(a), s = Math.sin(a);
+    const p0 = new V3(c * 0.04, yB + s * 0.04, 0.176), p1 = new V3(c * (RR - 0.006), yB + s * (RR - 0.006), zR - 0.006);
+    const len = p0.distanceTo(p1);
+    P.add(orient(lathe([[0, 0], [0.0045, 0.0], [0.0045, len], [0, len]], 6), p1.clone().sub(p0), p0), C.dark, M.satin);
+    const clamp = superEllipsoid(0.0105, 0.0078, 0.0135, 0.5, 0.6, 8, 5); clamp.rotateZ(a - Math.PI / 2);
+    P.add(at(clamp, c * (RR - 0.012), yB + s * (RR - 0.012), zR - 0.004), C.dark, M.gloss);
+  }
+  for (const [a, len] of [[-Math.PI / 2 - 0.18, 1], [-Math.PI / 2 + 0.4, 0.65]]) {
+    const hy = 0.0105 * len, c = new V3(Math.cos(a) * (RR + 0.012), yB + Math.sin(a) * (RR + 0.012), zR);
+    const d = superEllipsoid(0.0058, hy, 0.0058, 1, 1, 8, 6, (q) => { if (q.y > 0) { const f = 1 - 0.65 * q.y / hy; q.x *= f; q.z *= f; } });
+    I.add(at(d, c.x, c.y - 0.006 - hy * 0.7, c.z));
+  }
+  // upside-down soap bottle underneath: neck in a rubber sleeve (left-hand grip), cream collar, team bulb, dark foot
+  const bt = (g) => { g.rotateX(-0.12); return at(g, 0, 0.0, 0.112); };
+  P.add(bt(lathe(smoothProfile([[0, -0.036], [0.0112, -0.0355], [0.0134, -0.029], [0.0128, 0.0], [0.0134, 0.028], [0.0112, 0.034], [0, 0.035]], 10), 12)), C.rubber, M.rubber);
+  for (let k = 0; k < 4; k++) P.add(bt(hring(0.0135, 0.0011, -0.018 + k * 0.012, 3, 12)), C.darker, M.satin);
+  P.add(bt(lathe([[0, 0.032], [0.0165, 0.032], [0.0182, 0.037], [0.0165, 0.047], [0, 0.048]], 14)), C.dark, M.gloss);
+  P.add(bt(lathe([[0, -0.034], [0.0172, -0.034], [0.0192, -0.039], [0.0188, -0.046], [0, -0.046]], 16)), C.cream, M.gloss);
+  I.add(bt(lathe(smoothProfile([[0, -0.044], [0.018, -0.046], [0.03, -0.058], [0.0345, -0.078], [0.033, -0.098], [0.024, -0.11], [0, -0.113]], 12), 18)));
+  for (let k = 0; k < 4; k++) { const a = Math.PI / 4 + k * Math.PI / 2; P.add(bt(at(superEllipsoid(0.0026, 0.024, 0.0026, 0.6, 0.6, 4, 5), Math.cos(a) * 0.0335, -0.078, Math.sin(a) * 0.0335)), C.dark, M.satin); }
+  P.add(bt(lathe([[0, -0.119], [0.018, -0.119], [0.0215, -0.1155], [0.02, -0.108], [0, -0.107]], 16)), C.dark, M.gloss);
+  return {
+    kind: 'sp_blower', body: P.build(), ink: I.build(),
+    muzzle: new V3(0, yB, zR),
+    ringR: RR,
+    gripR: GRIP_PISTOL,
+    gripL: { pos: new V3(0, 0.0, 0.112), handZ: new V3(0, 1, -0.12), handY: new V3(0.45, -0.05, -1) },
+    twirl: new V3(0, 0.03, 0.03),
+  };
+}
+
+/** Ink Jet hand cannon: fat cream pressure chamber (team ink windows on both flanks) between two dark intake pods,
+ *  cooling fins on top, a gunmetal barrel ending in a flared afterburner nozzle (dark petals, team ring). A corrugated
+ *  rubber hose leaves the dark rear cap and curls down behind the grip to a quick coupler (`hoseAt` = rear port,
+ *  `hoseEnd` = coupler tip, where a longer hose can continue). Horizontal foregrip under the barrel (blaster pose). */
+function buildJetgun() {
+  const P = new Parts(), I = new Parts();
+  pistolGrip(P, { baseCol: C.dark });
+  const yJ = 0.09;
+  const J = (g) => at(g, 0, yJ, 0);
+  // chamber
+  P.add(J(latheZ(smoothProfile([[0, -0.07], [0.036, -0.068], [0.05, -0.052], [0.054, -0.02], [0.054, 0.1], [0.049, 0.132], [0.036, 0.146], [0, 0.148]], 12), 24)), C.cream, M.gloss);
+  for (const z of [-0.035, 0.12]) P.add(J(at(torus(0.0535, 0.0042, 5, 24), 0, 0, z)), C.dark, M.gloss);
+  for (const sx of [1, -1]) {
+    P.add(wrapZ(superEllipsoid(0.052, 0.018, 0.003, 0.4, 0.4, 12, 6), 0.0538, sx > 0 ? 0 : Math.PI, 0.04, yJ), C.dark, M.gloss);
+    I.add(wrapZ(superEllipsoid(0.046, 0.0125, 0.0038, 0.5, 0.45, 12, 6), 0.0538, sx > 0 ? 0 : Math.PI, 0.04, yJ));
+    // intake pods low on the flanks: dark cans with a team ring and a metal grille
+    const px = sx * 0.058, py = yJ - 0.036;
+    P.add(at(latheZ(smoothProfile([[0, -0.03], [0.014, -0.029], [0.019, -0.02], [0.019, 0.034], [0.022, 0.044], [0.022, 0.05]], 8).concat([[0, 0.05]]), 14), px, py, 0.02), C.dark, M.gloss);
+    I.add(at(torus(0.0198, 0.0026, 4, 14), px, py, 0.052));
+    P.add(at(latheZ([[0, 0.049], [0.0175, 0.049], [0.0175, 0.052], [0, 0.052]], 12), px, py, 0.02), C.darker, M.satin);
+    for (const r of [0.006, 0.012]) P.add(at(torus(r, 0.0013, 3, 12), px, py, 0.0725), C.metal, M.metal);
+    screw(P, new V3(sx * 0.0535, yJ + 0.03, -0.02), new V3(sx, 0.55, 0).normalize(), 0.0028);
+  }
+  // cooling fins + rear sight on top, LED on the right, squid decal on the left
+  for (let k = 0; k < 5; k++) P.add(at(superEllipsoid(0.03, 0.009, 0.0032, 0.5, 0.5, 8, 4), 0, yJ + 0.054, 0.01 + k * 0.018), C.dark, M.satin);
+  P.add(at(superEllipsoid(0.012, 0.0032, 0.048, 0.5, 0.5, 8, 4), 0, yJ + 0.05, 0.046), C.dark, M.satin);
+  P.add(at(superEllipsoid(0.0105, 0.0078, 0.006, 0.4, 0.4, 6, 4, (q) => { if (q.y > 0.002 && Math.abs(q.x) < 0.003) q.y = 0.002; }), 0, yJ + 0.064, -0.036), C.darker, M.satin);
+  P.add(wrapZ(refine(decal(squidShape(0.028)), 0.005), 0.0542, 0.62, -0.012, yJ), C.dark, M.print);
+  P.add(orient(superEllipsoid(0.0034, 0.0016, 0.0034, 1, 1, 8, 4), new V3(-0.8, 0.6, 0), new V3(-0.043, yJ + 0.033, -0.04)), C.red, M.led);
+  // barrel + afterburner nozzle
+  P.add(J(latheZ([[0, 0.14], [0.026, 0.14], [0.026, 0.2], [0.03, 0.206], [0.03, 0.214], [0, 0.214]], 16)), C.gunmetal, M.metal);
+  for (const z of [0.158, 0.172, 0.186]) P.add(J(at(torus(0.0265, 0.0017, 3, 16), 0, 0, z)), C.darker, M.satin);
+  P.add(J(latheZ(smoothProfile([[0.026, 0.21], [0.03, 0.235], [0.04, 0.262], [0.05, 0.283]], 7).concat([[0.052, 0.288], [0.047, 0.29], [0.036, 0.27], [0.024, 0.245], [0, 0.24]]), 20)), C.dark, M.gloss);
+  I.add(J(at(torus(0.0325, 0.0045, 5, 20), 0, 0, 0.228)));
+  for (let k = 0; k < 8; k++) {
+    const a = (k / 8) * Math.PI * 2 + Math.PI / 8;
+    const pet = superEllipsoid(0.0105, 0.0022, 0.03, 0.4, 0.5, 6, 4, (q) => { q.y += 0.36 * (q.z + 0.03); });
+    pet.rotateZ(a - Math.PI / 2); P.add(at(pet, Math.cos(a) * 0.041, yJ + Math.sin(a) * 0.041, 0.262), C.gunmetal, M.metal);
+  }
+  P.add(J(latheZ([[0, 0.242], [0.022, 0.247], [0.034, 0.266], [0.045, 0.285], [0, 0.285]], 18)), C.darker, M.satin);
+  // rear cap + hose port
+  P.add(J(latheZ([[0, -0.086], [0.03, -0.086], [0.046, -0.078], [0.052, -0.066], [0.052, -0.056], [0, -0.056]], 22)), C.dark, M.gloss);
+  const port = new V3(0.03, yJ - 0.006, -0.08), pdir = new V3(0.62, -0.2, -0.76).normalize();
+  P.add(orient(lathe([[0, -0.008], [0.013, -0.008], [0.013, 0.008], [0.0105, 0.011], [0.0105, 0.02], [0, 0.021]], 12), pdir, port), C.metal, M.metal);
+  // corrugated hose: out of the rear-left, hanging down the left of the grip (clear of the right forearm), coupler
+  const hp = [port.clone().addScaledVector(pdir, 0.016), new V3(0.056, yJ - 0.022, -0.1), new V3(0.072, yJ - 0.065, -0.108), new V3(0.076, -0.02, -0.094), new V3(0.07, -0.062, -0.07), new V3(0.06, -0.094, -0.052)];
+  const hose = sweep(hp, { seg: 40, radial: 8, capSteps: 2, radius: (t) => 0.0098 + 0.0012 * Math.cos(t * Math.PI * 34), flat: 1, outward: (Pp, o) => o.set(1, 0, 0), transport: true });
+  P.add(hose.geo, C.rubber, M.rubber);
+  const he = hose.sample(1), hEnd = he.P.clone().addScaledVector(he.T, 0.024);
+  P.add(orient(lathe([[0, -0.004], [0.0122, -0.004], [0.0132, 0.002], [0.0132, 0.014], [0.011, 0.017], [0.011, 0.022], [0, 0.024]], 12), he.T, he.P), C.metal, M.metal);
+  I.add(orient(hring(0.0128, 0.0022, 0.008, 4, 12), he.T, he.P));
+  // foregrip under the barrel (horizontal, blaster-style) + mount
+  P.add(at(latheZ(smoothProfile([[0, 0.12], [0.0118, 0.122], [0.0136, 0.13], [0.0136, 0.182], [0.0124, 0.19], [0, 0.192]], 8), 12), 0, 0.012, 0), C.rubber, M.rubber);
+  for (let k = 0; k < 4; k++) P.add(at(torus(0.0137, 0.0011, 3, 12), 0, 0.012, 0.138 + k * 0.012), C.darker, M.satin);
+  P.add(at(superEllipsoid(0.009, 0.028, 0.02, 0.5, 0.6, 6, 6), 0, 0.038, 0.156), C.dark, M.satin);
+  return {
+    kind: 'sp_jetgun', body: P.build(), ink: I.build(),
+    muzzle: new V3(0, yJ, 0.29),
+    hoseAt: port.clone(), hoseEnd: hEnd,
+    gripR: GRIP_PISTOL,
+    gripL: { pos: new V3(0, 0.012, 0.156), handZ: new V3(0, 0, 1), handY: new V3(0.8, -0.55, -0.1) },
+    twirl: new V3(0, 0.03, 0.03),
+  };
+}
+
+/** Mega Stamp: long shaft (roller hand stations, cream ball knob) ending in a knuckle hinge that carries a big cream
+ *  stamp block. The block is canted so that in the roller pose (weapon-space world-down ≈ STAMP_N) the face lies flat
+ *  on the ground where the roller's drum would touch: dark rubber mount, team-ink pad with a raised squid emblem
+ *  (mirrored, like a real stamp). Face 0.5 × 0.35, block 0.26 deep. `face` = { center, normal, size }; muzzle = centre. */
+const STAMP_N = new V3(0, -0.58, 0.815).normalize();
+/** Subdivide an indexed geometry until no edge is longer than maxLen (per-edge midpoint splits, so neighbours agree and
+ *  no T-junctions appear). For flat decals that get bent onto curved surfaces (the caps otherwise cut under the curve). */
+function refine(g, maxLen, maxIter = 10) {
+  const pos = Array.from(g.attributes.position.array); let idx = Array.from(g.index.array);
+  const m2 = maxLen * maxLen;
+  const d2 = (a, b) => { const x = pos[a * 3] - pos[b * 3], y = pos[a * 3 + 1] - pos[b * 3 + 1], z = pos[a * 3 + 2] - pos[b * 3 + 2]; return x * x + y * y + z * z; };
+  for (let it = 0; it < maxIter; it++) {
+    const mids = new Map(), out = []; let any = false;
+    const mid = (a, b) => {
+      if (d2(a, b) <= m2) return -1;
+      const k = a < b ? a * 1e7 + b : b * 1e7 + a;
+      let m = mids.get(k);
+      if (m === undefined) { m = pos.length / 3; pos.push((pos[a * 3] + pos[b * 3]) / 2, (pos[a * 3 + 1] + pos[b * 3 + 1]) / 2, (pos[a * 3 + 2] + pos[b * 3 + 2]) / 2); mids.set(k, m); }
+      return m;
+    };
+    for (let i = 0; i < idx.length; i += 3) {
+      let a = idx[i], b = idx[i + 1], c = idx[i + 2];
+      let mab = mid(a, b), mbc = mid(b, c), mca = mid(c, a);
+      const n = (mab >= 0) + (mbc >= 0) + (mca >= 0);
+      if (!n) { out.push(a, b, c); continue; }
+      any = true;
+      if (n === 3) { out.push(a, mab, mca, mab, b, mbc, mca, mbc, c, mab, mbc, mca); continue; }
+      // rotate so the pattern starts at edge ab
+      for (let r = 0; r < 3 && !(n === 1 ? mab >= 0 : mca < 0); r++) { [a, b, c] = [b, c, a]; [mab, mbc, mca] = [mbc, mca, mab]; }
+      if (n === 1) out.push(a, mab, c, mab, b, c);
+      else out.push(mab, b, mbc, a, mab, mbc, a, mbc, c);                      // ab + bc split, ca intact
+    }
+    idx = out;
+    if (!any) break;
+  }
+  const o = new THREE.BufferGeometry();
+  o.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); o.setIndex(idx); o.computeVertexNormals();
+  return o;
+}
+/** Rounded-rectangle Shape (w × h, corner radius r) centred on the origin. */
+function roundRect(w, h, r) {
+  const s = new THREE.Shape(), x = w / 2, y = h / 2;
+  s.moveTo(-x + r, -y); s.lineTo(x - r, -y); s.quadraticCurveTo(x, -y, x, -y + r); s.lineTo(x, y - r); s.quadraticCurveTo(x, y, x - r, y);
+  s.lineTo(-x + r, y); s.quadraticCurveTo(-x, y, -x, y - r); s.lineTo(-x, -y + r); s.quadraticCurveTo(-x, -y, -x + r, -y);
+  return s;
+}
+function buildStamp() {
+  const P = new Parts(), I = new Parts();
+  const HX = new V3(1, 0, 0), HU = STAMP_N.clone().negate(), HT = new V3().crossVectors(HU, HX).normalize();
+  const KZ = 0.644, K = new V3(0, 0, KZ);                                // hinge pin on the shaft axis
+  const F = K.clone().addScaledVector(HU, -0.262);                       // face centre (relief tips)
+  const head = (g) => placeXY(g, HX, HT, F);                             // head space: x across, y along HT, z up (HU)
+  const hp = (x, t, u) => F.clone().addScaledVector(HX, x).addScaledVector(HT, t).addScaledVector(HU, u);
+  // shaft, top grip (right hand) with a cream ball knob, mid grip (left hand) with dark collars, hazard band
+  P.add(latheZ([[0, -0.07], [0.0105, -0.07], [0.0105, KZ - 0.03], [0, KZ - 0.03]], 10), C.metal, M.metal);
+  P.add(latheZ(smoothProfile([[0, -0.086], [0.0116, -0.085], [0.0144, -0.076], [0.0138, -0.05], [0.0132, -0.02], [0.0136, 0.02], [0.0142, 0.046], [0.0156, 0.054], [0.0112, 0.06]], 10), 12), C.rubber, M.rubber);
+  P.add(at(superEllipsoid(0.026, 0.026, 0.024, 0.85, 1, 16, 10), 0, 0, -0.104), C.cream, M.gloss);
+  I.add(at(torus(0.0226, 0.0034, 5, 16), 0, 0, -0.098));
+  I.add(at(torus(0.0142, 0.0028, 5, 14), 0, 0, 0.062));
+  P.add(latheZ(smoothProfile([[0.0105, 0.13], [0.0136, 0.136], [0.0142, 0.15], [0.0138, 0.19], [0.0142, 0.235], [0.0136, 0.25], [0.0105, 0.256]], 8), 10), C.rubber, M.rubber);
+  for (const z of [0.126, 0.26]) P.add(at(latheZ([[0.0105, -0.005], [0.015, -0.004], [0.0158, 0.0], [0.015, 0.004], [0.0105, 0.005]], 12), 0, 0, z), C.dark, M.gloss);
+  // lower handle: fat cream sleeve (tapering into the knuckle) with a hazard band and a team ring
+  P.add(latheZ(smoothProfile([[0.0105, 0.29], [0.0152, 0.298], [0.0172, 0.33], [0.0178, 0.45], [0.0172, 0.55], [0.0158, 0.585], [0.0105, 0.594]], 12), 14), C.cream, M.gloss);
+  for (let k = 0; k < 5; k++) P.add(at(latheZ([[0.0181, 0], [0.0181, 0.012]], 14), 0, 0, 0.37 + k * 0.024), k % 2 ? C.dark : C.hazard, M.print);
+  I.add(at(torus(0.0176, 0.0032, 5, 16), 0, 0, 0.52));
+  // knuckle: collar + hub on the shaft end, pin, nut / fluted lock knob, gunmetal cheeks rising from the block's back
+  P.add(latheZ([[0.0105, KZ - 0.058], [0.0172, KZ - 0.056], [0.0178, KZ - 0.044], [0.0105, KZ - 0.042]], 12), C.metal, M.metal);
+  P.add(at(superEllipsoid(0.02, 0.022, 0.036, 0.5, 0.6, 10, 8), 0, 0, KZ - 0.012), C.dark, M.satin);
+  const pin = latheZ([[0, -0.052], [0.0095, -0.052], [0.0095, 0.052], [0, 0.052]], 10); pin.rotateY(Math.PI / 2); P.add(at(pin, 0, 0, KZ), C.metal, M.metal);
+  const nut = latheZ([[0, 0], [0.012, 0], [0.012, 0.007], [0.009, 0.0098], [0, 0.01]], 6); nut.rotateY(-Math.PI / 2); P.add(at(nut, -0.048, 0, KZ), C.metal, M.metal);
+  const knob = lathe(smoothProfile([[0, 0], [0.021, 0.0], [0.0235, 0.006], [0.0222, 0.015], [0.013, 0.021], [0, 0.0215]], 8), 42, (v) => {
+    const rr = Math.hypot(v.x, v.z);
+    if (rr > 0.007) { const a = Math.atan2(v.z, v.x); const k = 1 - 0.16 * Math.max(0, Math.cos(a * 7)) ** 2 * Math.min(1, (rr - 0.007) / 0.012); v.x *= k; v.z *= k; }
+  });
+  P.add(orient(knob, new V3(1, 0, 0), new V3(0.048, 0, KZ)), C.dark, M.gloss);
+  for (const sx of [1, -1]) {
+    const ch = superEllipsoid(0.0055, 0.036, 0.046, 0.5, 0.6, 6, 8, (q) => { if (q.z > 0) { const f = q.z / 0.046; q.y *= 1 - 0.45 * f * f; } });
+    P.add(placeXY(ch, HX, HT, K.clone().addScaledVector(HU, -0.024).addScaledVector(HX, sx * 0.0385)), C.gunmetal, M.metal);
+  }
+  // block stack (head space, z up from the face): squid relief + rim, ink pad, rubber mount, cream block, dark trim,
+  // back plate. The relief reads the right way round in the PRINT (seen from above, top away from the kid).
+  const W = 0.5, D = 0.35;
+  const rim = roundRect(W, D, 0.03); rim.holes.push(new THREE.Path(roundRect(W - 0.04, D - 0.04, 0.018).getPoints(4)));
+  I.add(head(decal(rim, 0.016)));
+  const emb = decal(squidShape(0.25), 0.016); emb.translate(0, -0.02, 0); emb.rotateZ(Math.PI); I.add(head(emb));
+  I.add(head(at(rbox(W, D, 0.03, 0.18, 16, 12), 0, 0, 0.03)));
+  P.add(head(at(rbox(W + 0.012, D + 0.012, 0.022, 0.25, 16, 12), 0, 0, 0.052)), C.rubber, M.rubber);
+  P.add(head(at(rbox(W - 0.004, D - 0.004, 0.16, 0.22, 18, 14), 0, 0, 0.14)), C.cream, M.gloss);
+  P.add(head(at(rbox(W + 0.006, D + 0.006, 0.016, 0.3, 18, 14), 0, 0, 0.104)), C.dark, M.gloss);
+  P.add(head(at(rbox(0.2, 0.16, 0.02, 0.35, 10, 8), 0, 0, 0.225)), C.dark, M.gloss);
+  // back: team print preview labels + index bar, corner screws, LED; hazard stripes on the long sides; ink windows on the ends
+  I.add(head(at(rbox(0.16, 0.012, 0.006, 0.5, 8, 4), 0, -0.12, 0.2195)));
+  for (const s of [1, -1]) {
+    const lab = decal(squidShape(0.07)); lab.rotateZ(Math.PI); I.add(head(at(lab, s * 0.165, 0, 0.2198)));
+    for (let k = 0; k < 7; k++) {
+      const st = superEllipsoid(0.0105, 0.0008, 0.024, 0.4, 0.4, 4, 4); st.rotateY(0.6);
+      P.add(head(at(st, -0.15 + k * 0.05, s * 0.1732, 0.165)), k % 2 ? C.dark : C.hazard, M.print);
+    }
+    P.add(placeXY(superEllipsoid(0.07, 0.028, 0.003, 0.45, 0.4, 12, 6), HT, HU, hp(s * 0.2482, 0, 0.162)), C.dark, M.gloss);
+    I.add(placeXY(superEllipsoid(0.062, 0.02, 0.0036, 0.55, 0.5, 12, 6), HT, HU, hp(s * 0.2482, 0, 0.162)));
+    for (const t of [1, -1]) screw(P, hp(s * 0.21, t * 0.135, 0.2195), HU, 0.005);
+  }
+  P.add(orient(superEllipsoid(0.005, 0.0024, 0.005, 1, 1, 8, 4), HU, hp(0.16, -0.12, 0.2195)), C.amber, M.led);
+  return {
+    kind: 'sp_stamp', body: P.build(), ink: I.build(),
+    muzzle: F.clone(),
+    face: { center: F.clone(), normal: STAMP_N.clone(), size: [W, D], across: HX.clone(), along: HT.clone() },
+    gripR: { pos: new V3(0, 0, -0.022), handZ: new V3(0, 0, 1), handY: new V3(-0.3, 1, 0) },
+    gripL: { pos: new V3(0, 0, 0.19), handZ: new V3(0, 0, 1), handY: new V3(0.5, 1, 0) },
+    twirl: new V3(0, 0, 0),
+  };
+}
+
 const _cache = new Map();
-const BUILDERS = { shooter: buildShooter, roller: buildRoller, charger: buildCharger, blaster: buildBlaster, dualies: buildDualies, slosher: buildSlosher, splatling: buildSplatling };
-export const WEAPON_KINDS = Object.keys(BUILDERS);
+const BUILDERS = {
+  shooter: buildShooter, roller: buildRoller, charger: buildCharger, blaster: buildBlaster,
+  dualies: buildDualies, slosher: buildSlosher, splatling: buildSplatling,
+  bucket: buildBucket, spinner: buildSpinner, twins: buildTwins, brush: buildBrush,
+  sp_zooka: buildZooka, sp_blower: buildBlower, sp_jetgun: buildJetgun, sp_stamp: buildStamp,
+};
+/** Main (selectable) weapons; the special-only held models are `SPECIAL_WEAPON_KINDS` (prefixed sp_). */
+export const WEAPON_KINDS = Object.keys(BUILDERS).filter((k) => !k.startsWith('sp_'));
+export const SPECIAL_WEAPON_KINDS = Object.keys(BUILDERS).filter((k) => k.startsWith('sp_'));
+// Kit weapons (src/game/kits/*.js) bring their own model + part animation: build() returns the same shape as the
+// builders above ({ kind, body, ink, parts?, gripR, gripL, … }); animate(w, st) runs after the built-in part animation.
+const KIT_ANIM = {};
+export function registerWeaponModel(kind, build, animate) {
+  BUILDERS[kind] = build; if (animate) KIT_ANIM[kind] = animate; _cache.delete(kind);
+  if (!kind.startsWith('sp_') && !WEAPON_KINDS.includes(kind)) WEAPON_KINDS.push(kind);
+}
 
 /** Hand bone frame (wrist origin) expressed in weapon space, from a grip spec and that hand's grip-hole offset. */
 function handInWeapon(grip, hole) {
@@ -674,6 +1345,7 @@ function sprE(S, i, target, hz, zeta, dt) {   // exact damped spring (stable for
 }
 
 export function animateWeapon(w, st) {
+  if (KIT_ANIM[w.def.kind]) { KIT_ANIM[w.def.kind](w, st); return; }   // kit weapons animate themselves
   const d = w.def, P = w.parts || {}, kind = d.kind, t = st.t, dt = Math.min(0.1, Math.max(0, st.dt || 0)), col = st.color;
   if (!w.ps) { w.ps = new Float32Array(12); w.ps[0] = 1.3; w.pump = 0; w.trig = 0; w.heat = 0; w.drumW = 0; w.drumA = 0; w.spinW = 0; w.spinA = 0; w.near = true; }
   const ps = w.ps, R = st.runner;
@@ -809,12 +1481,445 @@ function buildBomb() {
   const sq = decal(squidShape(0.026)); placeXY(sq, new V3(1, 0, 0), new V3(0, 1, 0), new V3(0, -0.075, 0.0548)); P.add(sq, C.decal, M.print);
   return { kind: 'bomb', body: P.build(), ink: I.build(), grip: { pos: new V3(0, 0, 0), handZ: new V3(0, 1, 0), handY: new V3(0.3, 0.1, -1) } };
 }
+
+// ---------------------------------------------------------------------------------------------- sub: world props
+// Every prop below (not the bomb) is authored in PROP SPACE: origin at the BOTTOM CENTRE (the point that rests or sticks
+// on a surface), +Y up away from that surface, +Z forward, metres. Each returns { kind, body, ink, grip } like the bomb
+// (grip = LEFT-fist spec around a Ø ≤ 3 cm handle) plus per-kind extras. `glow` (optional) = team-ink parts meant to be
+// lit (render with an emissive team material); the body always has an opaque socket behind them.
+/** Grip frames. BOMB: as the splat bomb — the thumb runs toward prop +Y, so with the arm cocked for the throw the prop
+ *  rides on top of the fist (upside down). UP: thumb toward prop -Y, the prop stays upright in the cocked fist. */
+const HOLD_BOMB = { handZ: new V3(0, 1, 0), handY: new V3(0.3, 0.1, -1) };
+const HOLD_UP = { handZ: new V3(0, -1, 0), handY: new V3(-0.3, -0.1, -1) };
+const gripAt = (hold, x, y, z) => ({ pos: new V3(x, y, z), handZ: hold.handZ.clone(), handY: hold.handY.clone() });
+/** Horizontal ring (axis +Y): radius R, tube r, at height y. */
+function hring(R, r, y, rs = 5, ts = 24) { const g = torus(R, r, rs, ts); g.rotateX(Math.PI / 2); return at(g, 0, y, 0); }
+/** Wrap a flat part around the +Y axis. Authored with x = along the surface, y = up, z = outward (decals: shape in XY,
+ *  extruded +Z); lands on the cylinder of radius r at azimuth az (0 = +Z, π/2 = +X), lifted by y0. */
+function wrapY(g, r, az, y0 = 0) {
+  return deformG(g, (v) => { const R = r + v.z, a = az + v.x / r; v.set(R * Math.sin(a), y0 + v.y, R * Math.cos(a)); });
+}
+/** Same around the +Z axis: x runs back along -Z, y around the axis (az 0 = +X side, π/2 = top), z outward; axis at height yc. */
+function wrapZ(g, r, az, z0, yc) {
+  return deformG(g, (v) => { const R = r + v.z, a = az + v.y / r; v.set(R * Math.cos(a), yc + R * Math.sin(a), z0 - v.x); });
+}
+/** Radius of a lathe profile [[r, h], ...] at height h (first profile segment spanning h, linear). */
+function profR(prof, h) {
+  for (let i = 1; i < prof.length; i++) { const [r0, h0] = prof[i - 1], [r1, h1] = prof[i]; if (h1 !== h0 && (h - h0) * (h - h1) <= 0) return r0 + (r1 - r0) * (h - h0) / (h1 - h0); }
+  return prof[h < prof[0][1] ? 0 : prof.length - 1][0];
+}
+/** wrapY onto a lathe wall of profile prof: the part's inner face follows the wall, `lift` off it. */
+function wrapLathe(g, prof, az, y0, lift = 0.0003) {
+  const r0 = profR(prof, y0);
+  return deformG(g, (v) => { const R = profR(prof, y0 + v.y) + lift + v.z, a = az + v.x / r0; v.set(R * Math.sin(a), y0 + v.y, R * Math.cos(a)); });
+}
+/** Bend a flat decal placed on the tangent plane at c + n·R onto that sphere (each vertex keeps its height off the plane). */
+function onSphere(g, c, n, R) {
+  const p0 = c.clone().addScaledVector(n, R), d = new V3();
+  return deformG(g, (v) => { const h = d.subVectors(v, p0).dot(n); d.subVectors(v, c).normalize(); v.copy(c).addScaledVector(d, R + h); });
+}
+/** Unit direction at azimuth az (0 = +Z) and elevation el on a sphere. */
+const sphDir = (az, el) => new V3(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el));
+/** Sphere-zone lathe profile between elevations e0 < e1 (closed to the axis at both ends). */
+function sphZone(R, yc, e0, e1, n = 8) {
+  const pr = [[0, yc + R * Math.sin(e0)]];
+  for (let i = 0; i <= n; i++) { const e = e0 + (e1 - e0) * i / n; pr.push([R * Math.cos(e), yc + R * Math.sin(e)]); }
+  pr.push([0, yc + R * Math.sin(e1)]);
+  return pr;
+}
+/** Swirl arms (comma-shaped Shapes) of radius ~r about the origin. */
+function swirlShapes(r, arms = 2, turns = 0.62) {
+  const out = [];
+  for (let k = 0; k < arms; k++) {
+    const a0 = (k / arms) * Math.PI * 2, n = 16, outer = [], inner = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n, a = a0 + t * turns * Math.PI * 2, rr = r * (0.16 + 0.84 * t), w = r * 0.15 * Math.sin(Math.PI * t) ** 0.8;
+      outer.push(new THREE.Vector2(Math.cos(a) * (rr + w), Math.sin(a) * (rr + w)));
+      inner.push(new THREE.Vector2(Math.cos(a) * (rr - w), Math.sin(a) * (rr - w)));
+    }
+    out.push(new THREE.Shape(outer.concat(inner.reverse())));
+  }
+  return out;
+}
+/** Chevrons centred on the origin, pointing along +x, or +y when up. */
+function chevrons(w, h, n, up = false, gap = 0.45) {
+  return chevronShape(w, h, n, gap).map((s) => { const g = decal(s); g.translate(-w / 2 - h * 0.25, -h / 2, 0); if (up) g.rotateZ(Math.PI / 2); return g; });
+}
+/** Knurled rubber knob / grip sleeve along +Y from y0 to y1 (radius ≈ 1.25 cm). */
+function gripSleeve(y0, y1, r = 0.0126) {
+  const L = y1 - y0;
+  return lathe(smoothProfile([[0, y0], [r - 0.0014, y0 + 0.0006], [r, y0 + 0.005], [r - 0.0004, y0 + L * 0.5], [r, y1 - 0.005], [r - 0.0014, y1 - 0.0006], [0, y1]], 10), 14);
+}
+/** Small LED dome facing n at p. */
+function led(P, p, n, col, r = 0.0034) { P.add(orient(superEllipsoid(r, r * 0.55, r, 1, 1, 8, 5), n, p), col, M.led); }
+
+/** Cling Charge: a squat cream charge on a big soft rubber suction pad, team goo squeezed out around the rim; ink windows
+ *  on both flanks, knurled knob on top (the fist's handle) capped by the red fuse light. ~0.21 wide, 0.16 tall. */
+function buildSticky() {
+  const P = new Parts(), I = new Parts();
+  // suction pad + adhesive goo (lumpy, flattened where it meets the surface at y = 0)
+  P.add(lathe(smoothProfile([[0, 0.003], [0.06, 0.0025], [0.095, 0.002], [0.1035, 0.005], [0.1045, 0.0105], [0.097, 0.0175], [0.082, 0.025], [0.062, 0.031], [0.036, 0.034], [0, 0.035]], 14), 30), C.rubber, M.rubber);
+  const Rg = 0.099;
+  I.add(deformG(hring(Rg, 0.0074, 0, 6, 44), (v) => {
+    const a = Math.atan2(v.z, v.x), cx = Math.cos(a) * Rg, cz = Math.sin(a) * Rg;
+    const k = 1 + 0.3 * Math.max(0, Math.sin(a * 5 + 0.7)) ** 2 + 0.1 * Math.sin(a * 13);
+    v.x = cx + (v.x - cx) * k; v.z = cz + (v.z - cz) * k; v.y = Math.max(0, 0.0064 + v.y * 0.85 * k);
+  }));
+  // dark base plate, cream dome, clamp tabs with screws
+  P.add(lathe([[0, 0.028], [0.08, 0.028], [0.0858, 0.031], [0.0866, 0.038], [0.0828, 0.0425], [0, 0.0425]], 30), C.dark, M.gloss);
+  const dome = smoothProfile([[0, 0.04], [0.0775, 0.041], [0.0822, 0.051], [0.0822, 0.069], [0.0765, 0.086], [0.061, 0.0995], [0.036, 0.1065], [0, 0.1085]], 14);
+  P.add(lathe(dome, 30), C.cream, M.satin);
+  for (const az of [Math.PI / 4, -Math.PI / 4, 3 * Math.PI / 4, -3 * Math.PI / 4]) {
+    P.add(wrapY(superEllipsoid(0.0085, 0.0125, 0.0036, 0.5, 0.55, 6, 6), 0.0838, az, 0.043), C.dark, M.satin);
+    screw(P, new V3(Math.sin(az) * 0.0872, 0.045, Math.cos(az) * 0.0872), new V3(Math.sin(az), 0, Math.cos(az)), 0.0028);
+  }
+  // ink windows on the flanks (dark gasket, bulging team pane)
+  for (const az of [Math.PI / 2, -Math.PI / 2]) {
+    P.add(wrapY(superEllipsoid(0.031, 0.0135, 0.003, 0.45, 0.4, 12, 6), 0.0818, az, 0.062), C.dark, M.gloss);
+    I.add(wrapY(superEllipsoid(0.0265, 0.0098, 0.0038, 0.55, 0.5, 12, 6), 0.0818, az, 0.062));
+  }
+  // squid decal (front), team chevrons pointing down at the pad (back)
+  P.add(wrapLathe(decal(squidShape(0.03)), dome, 0, 0.061), C.dark, M.print);
+  for (const g of chevrons(0.03, 0.012, 3)) { g.rotateZ(-Math.PI / 2); I.add(wrapLathe(g, dome, Math.PI, 0.062)); }
+  // top: collar + team ring, knurled knob, metal bezel, red fuse light
+  P.add(lathe([[0, 0.103], [0.021, 0.103], [0.0232, 0.107], [0.021, 0.1125], [0, 0.1135]], 16), C.dark, M.gloss);
+  I.add(hring(0.037, 0.0036, 0.1055, 5, 26));
+  P.add(gripSleeve(0.111, 0.1505), C.rubber, M.rubber);
+  P.add(lathe([[0, 0.15], [0.0142, 0.15], [0.0148, 0.1532], [0.0128, 0.1552], [0, 0.1556]], 14), C.metal, M.metal);
+  P.add(at(superEllipsoid(0.0104, 0.0068, 0.0104, 1, 1, 12, 6), 0, 0.1542, 0), C.red, M.led);
+  return { kind: 'sticky', body: P.build(), ink: I.build(), grip: gripAt(HOLD_BOMB, 0, 0.131, 0) };
+}
+
+/** Pop Pellet: a stubby capsule lying along Z — cream shells, a caged band of team ink core, a rubber contact-trigger
+ *  nub with a metal plunger on the nose (+Z), swept tail fins and a knurled tail stub (the fist's handle). ~0.15 long. */
+function buildBurst() {
+  const P = new Parts(), I = new Parts();
+  const yc = 0.0345, Z = (g) => at(g, 0, yc, 0);                     // capsule axis height (the gaskets touch the ground)
+  const rear = smoothProfile([[0.001, -0.047], [0.016, -0.0455], [0.026, -0.04], [0.0318, -0.031], [0.0334, -0.024], [0.0334, -0.018]], 9);
+  P.add(Z(latheZ([[0, -0.047]].concat(rear, [[0, -0.018]]), 20)), C.cream, M.gloss);
+  P.add(Z(latheZ([[0, 0.027]].concat(smoothProfile([[0.0334, 0.027], [0.0334, 0.033], [0.031, 0.042], [0.0245, 0.0498], [0.0165, 0.0545]], 8), [[0, 0.055]]), 20)), C.cream, M.gloss);
+  for (const z of [-0.0185, 0.0265]) P.add(Z(latheZ([[0, z - 0.0034], [0.0322, z - 0.0034], [0.0345, z - 0.0016], [0.0345, z + 0.0016], [0.0322, z + 0.0034], [0, z + 0.0034]], 20)), C.dark, M.gloss);
+  // ink core + cage bars
+  I.add(Z(latheZ(smoothProfile([[0, -0.018], [0.0302, -0.0178], [0.0316, -0.008], [0.0319, 0.004], [0.0316, 0.016], [0.0302, 0.0258], [0, 0.026]], 8), 20)));
+  for (let k = 0; k < 4; k++) { const a = Math.PI / 4 + k * Math.PI / 2; P.add(Z(at(superEllipsoid(0.0024, 0.0024, 0.0205, 0.6, 0.6, 4, 5), Math.cos(a) * 0.0323, Math.sin(a) * 0.0323, 0.004)), C.dark, M.satin); }
+  // nose: hazard collar, rubber trigger nub, metal plunger
+  P.add(Z(latheZ([[0, 0.0505], [0.0178, 0.0505], [0.0186, 0.0525], [0.0178, 0.0548], [0, 0.0548]], 16)), C.hazard, M.gloss);
+  P.add(Z(latheZ([[0, 0.052]].concat(smoothProfile([[0.0142, 0.0525], [0.0156, 0.057], [0.0146, 0.0615], [0.0105, 0.0648]], 6), [[0, 0.0652]]), 14)), C.rubber, M.rubber);
+  P.add(Z(latheZ([[0, 0.063], [0.0058, 0.063], [0.0058, 0.0678], [0.0074, 0.0688], [0.0074, 0.0718], [0.0048, 0.0735], [0, 0.0738]], 10)), C.metal, M.metal);
+  // tail: four swept fins (X pattern, clear of the ground), knurled stub, metal end cap
+  for (let k = 0; k < 4; k++) {
+    const a = Math.PI / 4 + k * Math.PI / 2;
+    const fin = superEllipsoid(0.0022, 0.0095, 0.0115, 0.6, 0.6, 4, 5, (q) => { q.z -= 0.45 * (q.y + 0.0095) * 0.5; });
+    fin.rotateZ(a - Math.PI / 2); P.add(Z(at(fin, Math.cos(a) * 0.0305, Math.sin(a) * 0.0305, -0.03)), C.cream, M.gloss);
+  }
+  const stub = latheZ(smoothProfile([[0, -0.0745], [0.0112, -0.074], [0.0126, -0.0695], [0.0122, -0.06], [0.0126, -0.051], [0.0118, -0.0465]], 8).concat([[0, -0.046]]), 12);
+  P.add(Z(stub), C.rubber, M.rubber);
+  P.add(Z(latheZ([[0, -0.0785], [0.0082, -0.0785], [0.0104, -0.0768], [0.0106, -0.0738], [0, -0.0738]], 12)), C.metal, M.metal);
+  // squid decal (left flank), armed LED on top
+  P.add(deformG(wrapZ(decal(squidShape(0.017)), 0.0334, 0, -0.029, yc), (v) => {
+    const a = Math.atan2(v.y - yc, v.x), R = Math.hypot(v.x, v.y - yc) - 0.0334 + profR(rear, v.z) + 0.0003;
+    v.set(R * Math.cos(a), yc + R * Math.sin(a), v.z);
+  }), C.dark, M.print);
+  led(P, new V3(0, yc + 0.0322, -0.029), new V3(0, 1, 0.12), C.amber, 0.0031);
+  return { kind: 'burst', body: P.build(), ink: I.build(), grip: { pos: new V3(0, yc, -0.0625), handZ: new V3(0, 0, -1), handY: new V3(0.3, -1, 0.1) } };
+}
+
+/** Skitter Bomb: a little ground-runner facing +Z — a bulbous team-ink shell on a dark chassis, four chunky lugged wheels
+ *  under cream fenders, a cream bumper and a cyclops sensor eye (red pupil) up front, a wind-up key on the roof and a tow
+ *  handle on the tail (the fist's handle). ~0.31 long incl. the handle, 0.155 tall; the wheels touch y = 0. */
+function buildSeeker() {
+  const P = new Parts(), I = new Parts();
+  const wr = 0.032, wx = 0.071, wz = 0.088;
+  // wheels: lugged rubber tyres, cream hub caps, metal nuts
+  for (const sx of [1, -1]) for (const sz of [1, -1]) {
+    const tyre = lathe(smoothProfile([[0, -0.0125], [0.022, -0.0127], [0.0282, -0.0104], [0.0295, -0.004], [0.0295, 0.004], [0.0282, 0.0104], [0.022, 0.0127], [0, 0.0125]], 10), 30, (v) => {
+      const rr = Math.hypot(v.x, v.z);
+      if (rr > 0.025) { const a = Math.atan2(v.z, v.x); const k = 1 + 0.085 * (0.5 + 0.5 * Math.max(-1, Math.min(1, Math.sin(a * 10) * 3))) * Math.min(1, (rr - 0.025) / 0.004); v.x *= k; v.z *= k; }
+    });
+    tyre.rotateZ(Math.PI / 2); P.add(at(tyre, sx * wx, wr, sz * wz), C.rubber, M.rubber);
+    P.add(orient(lathe([[0, 0], [0.0188, 0], [0.0198, 0.0036], [0.0145, 0.0082], [0, 0.0092]], 14), new V3(sx, 0, 0), new V3(sx * (wx + 0.011), wr, sz * wz)), C.cream, M.gloss);
+    P.add(orient(lathe([[0, 0], [0.0058, 0], [0.0058, 0.003], [0, 0.0038]], 6), new V3(sx, 0, 0), new V3(sx * (wx + 0.0195), wr, sz * wz)), C.metal, M.metal);
+    // fender: chunky arc over the wheel
+    const f = torus(0.0408, 0.0082, 5, 12, 2.3); f.rotateZ(Math.PI / 2 - 1.15); f.rotateY(Math.PI / 2); f.scale(1.9, 1, 1);
+    P.add(at(f, sx * wx, wr, sz * wz), C.cream, M.gloss);
+  }
+  // chassis, ink shell, rear block + tail lights, front bumper
+  P.add(at(superEllipsoid(0.056, 0.017, 0.118, 0.4, 0.45, 12, 6), 0, 0.04, 0), C.dark, M.gloss);
+  I.add(at(superEllipsoid(0.058, 0.044, 0.098, 0.75, 0.8, 18, 12, (q) => { if (q.z < 0) q.y *= 1 + 0.08 * (-q.z / 0.098); }), 0, 0.078, -0.004));
+  P.add(at(superEllipsoid(0.046, 0.016, 0.014, 0.45, 0.55, 10, 6), 0, 0.044, -0.124), C.dark, M.satin);
+  for (const sx of [1, -1]) led(P, new V3(sx * 0.028, 0.048, -0.1375), new V3(0, 0, -1), C.red, 0.0042);
+  P.add(at(superEllipsoid(0.052, 0.0145, 0.0135, 0.5, 0.6, 12, 6), 0, 0.041, 0.126), C.cream, M.gloss);
+  P.add(at(superEllipsoid(0.046, 0.0056, 0.006, 0.6, 0.6, 10, 4), 0, 0.041, 0.1385), C.rubber, M.rubber);
+  for (const sx of [1, -1]) screw(P, new V3(sx * 0.034, 0.0415, 0.1394), new V3(0, 0, 1), 0.0026);
+  for (const sx of [1, -1]) for (const z of [-0.035, 0.035]) screw(P, new V3(sx * 0.0555, 0.04, z), new V3(sx, 0, 0), 0.0025);
+  // cyclops sensor eye: cream bezel, black lens, red LED pupil, dark brow visor
+  const ey = 0.084, ez = 0.084;
+  P.add(at(torus(0.0192, 0.0046, 6, 20), 0, ey, ez + 0.008), C.cream, M.gloss);
+  P.add(at(superEllipsoid(0.0172, 0.0172, 0.0085, 1, 1, 14, 8), 0, ey, ez + 0.0065), C.lens, M.lens);
+  P.add(at(superEllipsoid(0.0056, 0.0056, 0.0026, 1, 1, 10, 5), 0, ey, ez + 0.0145), C.red, M.led);
+  const brow = superEllipsoid(0.03, 0.0058, 0.012, 0.5, 0.6, 10, 5); brow.rotateX(-0.35); P.add(at(brow, 0, ey + 0.024, ez - 0.001), C.dark, M.gloss);
+  // squid decals on both flanks of the shell
+  for (const sx of [1, -1]) {
+    const sq = decal(squidShape(0.024)); placeXY(sq, new V3(0, 0, -sx), new V3(0, 1, 0), new V3(0, 0.08, -0.03));
+    P.add(deformG(sq, (v) => { const lz = v.z + 0.004, ly = (v.y - 0.078) / (1 + 0.08 * Math.max(0, -lz / 0.098)); v.x += sx * (seX(0.058, 0.044, 0.098, 0.75, 0.8, ly, lz) + 0.0003); }), C.decal, M.print);
+  }
+  // wind-up key on the roof: dark boss, metal stem, cream bow
+  const kz = -0.052;
+  P.add(at(lathe([[0, -0.006], [0.0158, -0.006], [0.017, -0.001], [0.0152, 0.004], [0, 0.0045]], 14), 0, 0.118, kz), C.dark, M.gloss);
+  P.add(at(lathe([[0, 0.12], [0.0045, 0.12], [0.0045, 0.136], [0, 0.136]], 8), 0, 0, kz), C.metal, M.metal);
+  for (const sx of [1, -1]) P.add(at(superEllipsoid(0.0122, 0.0095, 0.0042, 0.7, 0.9, 12, 6), sx * 0.0115, 0.1435, kz), C.cream, M.gloss);
+  P.add(at(superEllipsoid(0.006, 0.006, 0.0054, 1, 1, 8, 6), 0, 0.1435, kz), C.metal, M.metal);
+  // tow handle on the tail (the fist's handle): dark D-loop from the shell to the rear block, rubber sleeve on its upright
+  const th = sweep([new V3(0, 0.104, -0.084), new V3(0, 0.113, -0.118), new V3(0, 0.1, -0.1515), new V3(0, 0.068, -0.1605), new V3(0, 0.036, -0.1535), new V3(0, 0.03, -0.132)], {
+    seg: 18, radial: 7, capSteps: 2, radius: () => 0.0064, flat: 1.25, outward: (Pp, o) => o.set(1, 0, 0),
+  });
+  P.add(th.geo, C.dark, M.satin);
+  const sl = []; for (let k = 0; k <= 6; k++) sl.push(th.curve.getPointAt(0.43 + k * 0.047));
+  P.add(sweep(sl, { seg: 12, radial: 8, capSteps: 2, radius: (t) => 0.0102 + 0.0006 * Math.cos(t * Math.PI * 10), flat: 1.05, outward: (Pp, o) => o.set(1, 0, 0) }).geo, C.rubber, M.rubber);
+  return { kind: 'seeker', body: P.build(), ink: I.build(), grip: gripAt(HOLD_UP, 0, 0.066, -0.16) };
+}
+
+/** Echo Orb: a white sphere with a glowing team band round its equator (dark gaskets, dark socket behind), sonar rings
+ *  and a team ring on the crown, a rubber foot, and a short antenna whose knurled base is the fist's handle. Ø 0.18. */
+function buildScan() {
+  const P = new Parts(), I = new Parts(), L = new Parts();
+  const R = 0.09, yc = 0.09, bh = 0.0088;                              // sphere radius / centre height, band half-height
+  const eb = Math.asin(bh / R);
+  P.add(lathe(sphZone(R, yc, eb, Math.PI / 2 - 0.02, 10), 30), C.white, M.gloss);
+  P.add(lathe(sphZone(R, yc, -Math.PI / 2 + 0.02, -eb, 10), 30), C.white, M.gloss);
+  P.add(lathe([[0, yc - bh - 0.001], [0.0888, yc - bh - 0.001], [0.0888, yc + bh + 0.001], [0, yc + bh + 0.001]], 30), C.darker, M.satin);   // socket
+  L.add(lathe([[0, yc - bh], [0.0902, yc - bh], [0.0935, yc - bh * 0.5], [0.0938, yc], [0.0935, yc + bh * 0.5], [0.0902, yc + bh], [0, yc + bh]], 36));
+  for (const s of [1, -1]) P.add(hring(Math.sqrt(R * R - (bh + 0.0012) ** 2), 0.0029, yc + s * (bh + 0.0012), 5, 32), C.dark, M.gloss);
+  // crown: team ring + two sonar grooves; bottom: rubber foot
+  for (const [el, col] of [[0.66, null], [0.92, C.darker], [1.14, C.darker]]) {
+    const g = hring(R * Math.cos(el), col ? 0.0019 : 0.0034, yc + R * Math.sin(el), 4, 28);
+    if (col) P.add(g, col, M.satin); else I.add(g);
+  }
+  P.add(lathe([[0, 0], [0.028, 0], [0.0322, 0.0022], [0.0322, 0.0068], [0, 0.0068]], 20), C.rubber, M.rubber);
+  // squid decal on the front of the upper shell
+  { const n = sphDir(0, 0.36), c = new V3(0, yc, 0); const sq = decal(squidShape(0.028)); placeXY(sq, new V3(1, 0, 0), new V3(0, Math.cos(0.36), -Math.sin(0.36)), c.clone().addScaledVector(n, R + 0.0003)); P.add(onSphere(sq, c, n, R), C.dark, M.print); }
+  // antenna: collar, knurled base (grip), metal whip, glowing tip
+  P.add(lathe([[0, 0.172], [0.0188, 0.172], [0.0206, 0.1768], [0.0196, 0.1832], [0.0146, 0.1862], [0, 0.1865]], 16), C.dark, M.gloss);
+  P.add(gripSleeve(0.185, 0.2155), C.rubber, M.rubber);
+  P.add(lathe([[0, 0.215], [0.0036, 0.215], [0.003, 0.2445], [0, 0.2455]], 8), C.metal, M.metal);
+  P.add(lathe([[0, 0.2425], [0.0058, 0.2425], [0.0058, 0.2455], [0, 0.2455]], 10), C.dark, M.gloss);
+  L.add(at(superEllipsoid(0.0078, 0.0078, 0.0078, 1, 1, 10, 7), 0, 0.2515, 0));
+  return { kind: 'scan', body: P.build(), ink: I.build(), glow: L.build(), grip: gripAt(HOLD_BOMB, 0, 0.2, 0) };
+}
+
+/** Drip Curtain emitter: a low cream rail (X) on a rubber foot strip — hazard-striped dark end caps, a long team-ink
+ *  window on the front, and a dark manifold with team feed lines along the top carrying seven metal nozzles (ink welling
+ *  in each, tips at y ≈ 0.10) that the curtain rises from. The back has a squid decal, team up-chevrons and a D-handle
+ *  (the fist's handle). ~0.42 × 0.1 × 0.12 (handle included: 0.14 deep); returns `width`. */
+function buildCurtain() {
+  const P = new Parts(), I = new Parts();
+  P.add(at(rbox(0.392, 0.012, 0.084, 0.3, 16, 4), 0, 0.006, 0), C.rubber, M.rubber);
+  P.add(at(superEllipsoid(0.178, 0.034, 0.04, 0.35, 0.4, 22, 8), 0, 0.044, 0), C.cream, M.satin);
+  for (const sx of [1, -1]) {
+    P.add(at(superEllipsoid(0.022, 0.044, 0.05, 0.4, 0.5, 8, 8), sx * 0.189, 0.046, 0), C.dark, M.gloss);
+    for (const [x, col] of [[0.155, C.hazard], [0.1605, C.dark], [0.166, C.hazard]]) P.add(at(superEllipsoid(0.0027, 0.0357, 0.0418, 0.35, 0.4, 4, 8), sx * x, 0.044, 0), col, M.print);
+    for (const y of [0.028, 0.064]) screw(P, new V3(sx * 0.2108, y, 0), new V3(sx, 0, 0), 0.003);
+    led(P, new V3(sx * 0.189, 0.07, 0.0496), new V3(0, 0, 1), C.green, 0.0036);
+  }
+  // long team window on the front
+  P.add(at(superEllipsoid(0.126, 0.0158, 0.004, 0.35, 0.4, 18, 5), 0, 0.042, 0.0392), C.dark, M.gloss);
+  I.add(at(superEllipsoid(0.1205, 0.0118, 0.0047, 0.5, 0.45, 18, 5), 0, 0.042, 0.0392));
+  for (const sx of [1, -1]) screw(P, new V3(sx * 0.14, 0.043, 0.0398), new V3(0, 0, 1), 0.0028);
+  // manifold + nozzles (ink domes welling in the mouths)
+  P.add(at(superEllipsoid(0.166, 0.0078, 0.0172, 0.4, 0.45, 18, 4), 0, 0.0795, 0), C.dark, M.gloss);
+  for (const s of [1, -1]) I.add(at(superEllipsoid(0.158, 0.0032, 0.0034, 0.6, 0.6, 18, 4), 0, 0.083, s * 0.0118));
+  for (let i = 0; i < 7; i++) {
+    const x = -0.15 + i * 0.05;
+    P.add(at(lathe([[0, 0], [0.0078, 0], [0.0078, 0.004], [0.0058, 0.006], [0.0052, 0.0128], [0.0067, 0.0142], [0.0067, 0.0172], [0.0044, 0.0182], [0, 0.018]], 10), x, 0.0832, 0), C.metal, M.metal);
+    I.add(at(superEllipsoid(0.0041, 0.0022, 0.0041, 1, 1, 8, 4), x, 0.1004, 0));
+  }
+  // back D-handle (vertical rubber grip) + mounts; decals on the back face
+  const hd = sweep([new V3(0, 0.068, -0.036), new V3(0, 0.074, -0.058), new V3(0, 0.063, -0.0735), new V3(0, 0.043, -0.077), new V3(0, 0.023, -0.0735), new V3(0, 0.012, -0.058), new V3(0, 0.018, -0.036)], {
+    seg: 18, radial: 7, capSteps: 2, radius: () => 0.0066, flat: 1.25, outward: (Pp, o) => o.set(1, 0, 0),
+  });
+  P.add(hd.geo, C.dark, M.satin);
+  const sl = []; for (let k = 0; k <= 6; k++) sl.push(hd.curve.getPointAt(0.3 + k * 0.0667));
+  P.add(sweep(sl, { seg: 12, radial: 8, capSteps: 2, radius: (t) => 0.0104 + 0.0006 * Math.cos(t * Math.PI * 10), flat: 1.05, outward: (Pp, o) => o.set(1, 0, 0) }).geo, C.rubber, M.rubber);
+  for (const y of [0.066, 0.02]) P.add(at(superEllipsoid(0.013, 0.0095, 0.0055, 0.5, 0.6, 8, 5), 0, y, -0.0418), C.dark, M.gloss);
+  const sq = decal(squidShape(0.034)); placeXY(sq, new V3(-1, 0, 0), new V3(0, 1, 0), new V3(0.095, 0.0425, -0.0399)); P.add(sq, C.dark, M.print);
+  for (const g of chevrons(0.036, 0.014, 3, true)) { placeXY(g, new V3(-1, 0, 0), new V3(0, 1, 0), new V3(-0.095, 0.0425, -0.0399)); I.add(g); }
+  const body = P.build(); body.computeBoundingBox();
+  return { kind: 'curtain', body, ink: I.build(), width: +(body.boundingBox.max.x - body.boundingBox.min.x).toFixed(3), grip: gripAt(HOLD_UP, 0, 0.043, -0.077) };
+}
+
+/** Twirl Sprinkler: a cream mounting base (rubber foot, team ring, three bolted lugs) with a riser whose knurled sleeve is
+ *  the fist's handle. The head — hub, team-ink dome, three hooked arms with nozzles — is the separate `spin` mesh
+ *  (+ `spinInk`), authored in prop space, turning about the +Y axis through `spinAt`. Base Ø 0.16, arms Ø ~0.17. */
+function buildSprinkler() {
+  const P = new Parts(), I = new Parts(), S = new Parts(), SI = new Parts();
+  P.add(lathe([[0, 0], [0.0765, 0], [0.0802, 0.003], [0.0795, 0.0085], [0, 0.0085]], 32), C.rubber, M.rubber);
+  P.add(lathe(smoothProfile([[0, 0.0065], [0.0742, 0.0065], [0.0768, 0.012], [0.0735, 0.02], [0.059, 0.0285], [0.036, 0.0335], [0.016, 0.0355], [0, 0.036]], 12), 32), C.cream, M.satin);
+  I.add(hring(0.0596, 0.0034, 0.0272, 5, 30));
+  for (let k = 0; k < 3; k++) {
+    const az = Math.PI / 3 + k * Math.PI * 2 / 3, d = new V3(Math.sin(az), 0, Math.cos(az));
+    const lug = superEllipsoid(0.0118, 0.0068, 0.0145, 0.5, 0.6, 8, 5); lug.rotateY(az); P.add(at(lug, d.x * 0.0735, 0.0125, d.z * 0.0735), C.dark, M.satin);
+    screw(P, new V3(d.x * 0.0765, 0.0192, d.z * 0.0765), new V3(0, 1, 0), 0.0032);
+  }
+  const sq = decal(squidShape(0.022)); placeXY(sq, new V3(1, 0, 0), new V3(0, 0.6, -1), new V3(0, 0.0252, 0.0672)); P.add(sq, C.dark, M.print);
+  // riser: collar, metal tube, knurled grip sleeve, bearing collar
+  P.add(lathe([[0, 0.0335], [0.0182, 0.0335], [0.0198, 0.0375], [0.0182, 0.0418], [0, 0.042]], 16), C.dark, M.gloss);
+  P.add(lathe([[0, 0.04], [0.0085, 0.04], [0.0085, 0.1], [0, 0.1]], 10), C.metal, M.metal);
+  P.add(gripSleeve(0.0415, 0.0925), C.rubber, M.rubber);
+  P.add(lathe([[0, 0.092], [0.0152, 0.092], [0.0162, 0.0948], [0.0152, 0.0985], [0, 0.0985]], 16), C.metal, M.metal);
+  // spinning head (prop space, pivot spinAt on the +Y axis)
+  const hy = 0.0985;
+  S.add(lathe(smoothProfile([[0, hy], [0.0205, hy + 0.0005], [0.0245, hy + 0.0048], [0.0248, hy + 0.0128], [0.021, hy + 0.0178]], 7).concat([[0, hy + 0.018]]), 22), C.dark, M.gloss);
+  SI.add(lathe(smoothProfile([[0, hy + 0.017], [0.019, hy + 0.0172], [0.0178, hy + 0.0228], [0.0115, hy + 0.0282], [0, hy + 0.0296]], 8), 20));
+  S.add(at(lathe([[0, 0], [0.0042, 0], [0.0042, 0.0022], [0, 0.0032]], 8), 0, hy + 0.0292, 0), C.metal, M.metal);
+  const ay = hy + 0.0095;
+  for (let k = 0; k < 3; k++) {
+    const a = k * Math.PI * 2 / 3, u = new V3(Math.cos(a), 0, Math.sin(a)), t = new V3(-Math.sin(a), 0, Math.cos(a));
+    const pt = (r, s, dy = 0) => new V3(0, ay + dy, 0).addScaledVector(u, r).addScaledVector(t, s);
+    const pts = [pt(0.018, 0), pt(0.042, 0.002, 0.0015), pt(0.063, 0.009, 0.002), pt(0.0735, 0.022, 0.001), pt(0.0712, 0.034)];
+    S.add(sweep(pts, { seg: 14, radial: 6, capSteps: 2, radius: () => 0.0054, flat: 1, outward: (Pp, o) => o.set(0, 1, 0) }).geo, C.gunmetal, M.metal);
+    const dir = pts[4].clone().sub(pts[3]).normalize(), tip = pts[4].clone().addScaledVector(dir, 0.002);
+    S.add(orient(lathe([[0, 0], [0.0072, 0], [0.0072, 0.0042], [0.0054, 0.0068], [0.0054, 0.0112], [0, 0.0112]], 8), dir, tip), C.metal, M.metal);
+    SI.add(orient(superEllipsoid(0.0042, 0.0024, 0.0042, 1, 1, 8, 4), dir, tip.clone().addScaledVector(dir, 0.0112)));
+    const w = superEllipsoid(0.0085, 0.0085, 0.0085, 1, 1, 8, 6); S.add(at(w, pts[2].x, pts[2].y, pts[2].z), C.cream, M.gloss);   // balance knuckle
+  }
+  // hazard index mark on the hub rim (makes the rotation readable)
+  { const a = Math.PI / 3; const m = superEllipsoid(0.0022, 0.0045, 0.006, 0.6, 0.6, 5, 5); m.rotateY(-a + Math.PI / 2); S.add(at(m, Math.cos(a) * 0.0248, hy + 0.009, Math.sin(a) * 0.0248), C.hazard, M.print); }
+  return {
+    kind: 'sprinkler', body: P.build(), ink: I.build(), spin: S.build(), spinInk: SI.build(), spinAt: new V3(0, hy, 0),
+    grip: gripAt(HOLD_UP, 0, 0.067, 0),
+  };
+}
+
+/** Lurk Mine: a flat dark disc on a rubber foot, cream deck, a metal pressure plate (rubber gasket, red LED) in the middle,
+ *  team-ink seams (radial + rings) and ink slots round the rim; a small rim lug at the back is the fist's handle.
+ *  Ø 0.3 (lug to 0.18 behind), 0.06 tall — sits flush in ink. */
+function buildMine() {
+  const P = new Parts(), I = new Parts();
+  P.add(lathe([[0, 0], [0.1365, 0], [0.1412, 0.003], [0.1395, 0.0075], [0, 0.0075]], 40), C.rubber, M.rubber);
+  P.add(lathe(smoothProfile([[0, 0.0052], [0.1405, 0.0052], [0.1486, 0.0105], [0.15, 0.021], [0.1472, 0.0305], [0.1385, 0.0365], [0.122, 0.0392]], 10).concat([[0, 0.0395]]), 40), C.dark, M.gloss);
+  const deckY = (r) => 0.0502 - 0.078 * Math.max(0, r - 0.062) ** 1.6;
+  const dk = [[0, 0.038]]; for (const r of [0.132, 0.1335, 0.13, 0.12, 0.1, 0.08, 0.062]) dk.push([r, r > 0.131 ? 0.0405 : deckY(r)]);
+  dk.splice(1, 0, [0.128, 0.0378]); dk.push([0, 0.0502]);
+  P.add(lathe(dk, 40), C.cream, M.satin);
+  // pressure plate: rubber gasket, metal plate with grip grooves, red LED
+  P.add(hring(0.0532, 0.0032, 0.0508, 5, 28), C.rubber, M.rubber);
+  P.add(lathe(smoothProfile([[0, 0.05], [0.0492, 0.0502], [0.0506, 0.0536], [0.0478, 0.0566], [0.03, 0.0578], [0, 0.058]], 8), 28), C.metal, M.metal);
+  for (const [r, y] of [[0.0385, 0.0572], [0.0245, 0.0578]]) P.add(hring(r, 0.0011, y, 3, 24), C.darker, M.satin);
+  P.add(at(superEllipsoid(0.0068, 0.0032, 0.0068, 1, 1, 10, 5), 0, 0.0582, 0), C.red, M.led);
+  // ink seams: ring round the plate, ring at the deck edge, six radial seams
+  I.add(hring(0.059, 0.0034, 0.0497, 4, 30));
+  I.add(hring(0.1318, 0.0036, 0.0402, 4, 44));
+  for (let k = 0; k < 6; k++) {
+    const az = Math.PI / 6 + k * Math.PI / 3, r = 0.094;
+    const s = superEllipsoid(0.0036, 0.0019, 0.0295, 0.6, 0.6, 4, 6); s.rotateX(0.075); s.rotateY(az);
+    I.add(at(s, Math.sin(az) * r, deckY(r) + 0.0004, Math.cos(az) * r));
+  }
+  // ink slots round the rim (none behind, where the lug is), screws and LEDs on the deck, squid decal up front
+  for (const az of [0, Math.PI / 3, -Math.PI / 3, 2 * Math.PI / 3, -2 * Math.PI / 3]) I.add(wrapY(superEllipsoid(0.021, 0.0062, 0.0032, 0.5, 0.45, 10, 5), 0.1492, az, 0.0212));
+  for (let k = 0; k < 6; k++) { const az = k * Math.PI / 3, r = 0.121; screw(P, new V3(Math.sin(az) * r, deckY(r) - 0.0004, Math.cos(az) * r), new V3(0, 1, 0), 0.003); }
+  for (const s of [1, -1]) led(P, new V3(Math.sin(s * 2 * Math.PI / 3 + 0.2) * 0.106, deckY(0.106), Math.cos(s * 2 * Math.PI / 3 + 0.2) * 0.106), new V3(0, 1, 0), C.amber, 0.0036);
+  const sq = decal(squidShape(0.034)); placeXY(sq, new V3(1, 0, 0), new V3(0, 0.07, -1), new V3(0, deckY(0.094) + 0.0003, 0.094)); P.add(sq, C.dark, M.print);
+  // back rim lug: dark bracket with a short vertical rubber grip
+  const lug = sweep([new V3(0, 0.012, -0.143), new V3(0, 0.009, -0.163), new V3(0, 0.017, -0.1735), new V3(0, 0.031, -0.1755), new V3(0, 0.045, -0.1735), new V3(0, 0.052, -0.163), new V3(0, 0.046, -0.141)], {
+    seg: 16, radial: 7, capSteps: 2, radius: () => 0.0056, flat: 1.3, outward: (Pp, o) => o.set(1, 0, 0),
+  });
+  P.add(lug.geo, C.dark, M.satin);
+  const sl = []; for (let k = 0; k <= 5; k++) sl.push(lug.curve.getPointAt(0.33 + k * 0.068));
+  P.add(sweep(sl, { seg: 10, radial: 8, capSteps: 2, radius: (t) => 0.0098 + 0.0005 * Math.cos(t * Math.PI * 8), flat: 1.1, outward: (Pp, o) => o.set(1, 0, 0) }).geo, C.rubber, M.rubber);
+  P.add(at(superEllipsoid(0.015, 0.0205, 0.0065, 0.5, 0.6, 8, 6), 0, 0.027, -0.1465), C.dark, M.gloss);
+  return { kind: 'mine', body: P.build(), ink: I.build(), grip: gripAt(HOLD_UP, 0, 0.031, -0.1755) };
+}
+
+/** Hop Beacon: a weighted base (rubber foot, cream band with squid + team up-chevrons, dark dome, team ring), a metal mast
+ *  with a knurled grip (the fist's handle) and a hop spring, and a cream dish crowned with team-tipped prongs around a
+ *  glowing team light (`glow`, dark socket behind it). ~0.15 wide, 0.28 tall. */
+function buildBeacon() {
+  const P = new Parts(), I = new Parts(), L = new Parts();
+  P.add(lathe([[0, 0], [0.0705, 0], [0.0745, 0.0032], [0.0735, 0.0092], [0, 0.0092]], 30), C.rubber, M.rubber);
+  const band = [[0, 0.0082], [0.0726, 0.0082], [0.0742, 0.012], [0.0742, 0.0282], [0.0726, 0.032], [0, 0.032]];
+  P.add(lathe(band, 30), C.cream, M.satin);
+  P.add(lathe(smoothProfile([[0, 0.0305], [0.0702, 0.0305], [0.0716, 0.0345], [0.0645, 0.0432], [0.045, 0.0512], [0.024, 0.0556], [0.012, 0.0562]], 10).concat([[0, 0.0562]]), 30), C.dark, M.gloss);
+  P.add(hring(0.0728, 0.0028, 0.0312, 4, 32), C.gunmetal, M.metal);
+  I.add(hring(0.0512, 0.0034, 0.0498, 5, 28));
+  P.add(wrapLathe(decal(squidShape(0.0158)), band.slice(1, 5), 0, 0.0196), C.dark, M.print);
+  for (const az of [2 * Math.PI / 3, -2 * Math.PI / 3]) for (const g of chevrons(0.0165, 0.0095, 2, true, 0.4)) I.add(wrapLathe(g, band.slice(1, 5), az, 0.0202));
+  // mast: collars, knurled grip, hop spring
+  P.add(lathe([[0, 0.05], [0.0082, 0.05], [0.0082, 0.212], [0, 0.212]], 10), C.metal, M.metal);
+  for (const [y0, y1] of [[0.052, 0.061], [0.083, 0.0895], [0.1465, 0.153]]) P.add(lathe([[0, y0], [0.0142, y0], [0.0154, y0 + 0.002], [0.0154, y1 - 0.002], [0.0142, y1], [0, y1]], 14), C.dark, M.gloss);
+  P.add(gripSleeve(0.089, 0.147), C.rubber, M.rubber);
+  const coil = []; for (let i = 0; i <= 40; i++) { const t = i / 40, a = t * Math.PI * 2 * 5; coil.push(new V3(Math.cos(a) * 0.0138, 0.1555 + t * 0.0435, Math.sin(a) * 0.0138)); }
+  P.add(sweep(coil, { seg: 90, radial: 5, capSteps: 2, radius: () => 0.0026, curveType: 'catmullrom' }).geo, C.metal, M.metal);
+  // dish + crown prongs with team tips, dark socket, glowing light, metal tip
+  P.add(lathe([[0, 0.1985], [0.0158, 0.1985], [0.0176, 0.2025], [0.0158, 0.2068], [0, 0.207]], 16), C.dark, M.gloss);
+  P.add(lathe([[0, 0.204], [0.018, 0.2048], [0.034, 0.2105], [0.05, 0.2208], [0.0592, 0.2305], [0.0612, 0.2352], [0.0585, 0.2385], [0.0505, 0.2352], [0.036, 0.2282], [0.022, 0.2242], [0, 0.2232]], 30), C.cream, M.gloss);
+  P.add(lathe([[0, 0.2226], [0.0272, 0.2232], [0.0292, 0.2262], [0, 0.2266]], 20), C.darker, M.satin);
+  for (let k = 0; k < 5; k++) {
+    const a = (k / 5) * Math.PI * 2, d = new V3(Math.sin(a), 0, Math.cos(a));
+    const up = new V3(d.x * 0.42, 1, d.z * 0.42).normalize(), base = new V3(d.x * 0.0555, 0.2338, d.z * 0.0555);
+    P.add(orient(superEllipsoid(0.0052, 0.0118, 0.0052, 0.7, 0.8, 8, 6), up, base.clone().addScaledVector(up, 0.0085)), C.cream, M.gloss);
+    I.add(at(superEllipsoid(0.0058, 0.0058, 0.0058, 1, 1, 8, 6), ...base.clone().addScaledVector(up, 0.0215).toArray()));
+  }
+  L.add(at(superEllipsoid(0.0262, 0.035, 0.0262, 0.9, 1, 18, 12), 0, 0.245, 0));
+  return { kind: 'beacon', body: P.build(), ink: I.build(), glow: L.build(), grip: gripAt(HOLD_UP, 0, 0.118, 0) };
+}
+
+/** Murk Bomb: a round dark bomb with a proud cream vent collar (team ink glinting in its eight slots), three murky team
+ *  portholes with dark swirls round its belly (metal bezels), a squid decal and a knurled cap on top like the splat
+ *  bomb's (the fist's handle), sitting on a rubber foot. Ø ~0.2, 0.235 tall. */
+function buildMist() {
+  const P = new Parts(), I = new Parts();
+  const R = 0.094, yc = 0.1, C0 = new V3(0, yc, 0);
+  P.add(lathe([[0, 0], [0.034, 0], [0.0396, 0.0038], [0.0418, 0.0115], [0.0398, 0.0168], [0, 0.0168]], 22), C.rubber, M.rubber);
+  P.add(lathe(sphZone(R, yc, -Math.PI / 2 + 0.02, 0.02, 11), 32), C.dark, M.gloss);
+  P.add(lathe(sphZone(R, yc, 0.33, Math.PI / 2 - 0.02, 8), 32), C.dark, M.gloss);
+  // vent collar with slots
+  P.add(lathe(smoothProfile([[0, 0.0975], [0.0945, 0.0978], [0.0984, 0.1025], [0.0988, 0.1145], [0.0975, 0.1265], [0.0918, 0.1325]], 8).concat([[0, 0.133]]), 32), C.cream, M.satin);
+  for (let k = 0; k < 8; k++) {
+    const az = Math.PI / 8 + k * Math.PI / 4;
+    P.add(wrapY(superEllipsoid(0.0072, 0.0104, 0.0024, 0.5, 0.5, 6, 6), 0.0986, az, 0.1152), C.darker, M.satin);
+    I.add(wrapY(superEllipsoid(0.0048, 0.0078, 0.0028, 0.6, 0.6, 6, 6), 0.0986, az, 0.1152));
+  }
+  for (let k = 0; k < 4; k++) { const az = k * Math.PI / 2; screw(P, new V3(Math.sin(az) * 0.0988, 0.1148, Math.cos(az) * 0.0988), new V3(Math.sin(az), 0, Math.cos(az)), 0.0028); }
+  // murky portholes: metal bezel, bulging team pane with swirl bumps, dark swirl streaks bent onto the pane
+  const pr = 0.0262, ph = 0.0062;
+  for (const az of [0, 2 * Math.PI / 3, -2 * Math.PI / 3]) {
+    const n = sphDir(az, -0.42), c = C0.clone().addScaledVector(n, R - 0.0022);
+    const bz = torus(0.0292, 0.0046, 6, 26); bz.rotateX(-Math.PI / 2); P.add(orient(bz, n, c), C.metal, M.metal);
+    const pane = superEllipsoid(pr, ph, pr, 1, 1, 18, 8, (q) => { const rr = Math.hypot(q.x, q.z), a = Math.atan2(q.z, q.x); if (q.y > 0) q.y += 0.0011 * Math.sin(a * 2 + rr * 260) * (rr / pr); });
+    I.add(orient(pane, n, c));
+    const tU = new V3(0, 1, 0).addScaledVector(n, -n.y).normalize(), tX = new V3().crossVectors(tU, n);
+    for (const s of swirlShapes(0.0205, 2, 0.6)) {
+      const g = decal(s, 0.0005); g.rotateZ(az * 0.7);
+      deformG(g, (v) => { const rr = Math.min(0.98, Math.hypot(v.x, v.y) / pr); v.z = ph * Math.sqrt(1 - rr * rr) + 0.0002 + v.z; });
+      g.applyMatrix4(new THREE.Matrix4().makeBasis(tX, tU, n).setPosition(c)); g.computeVertexNormals();
+      P.add(g, C.darker, M.print);
+    }
+  }
+  // squid decal + amber LED on the upper shell
+  { const n = sphDir(0, 0.62); const sq = decal(squidShape(0.03)); placeXY(sq, new V3(1, 0, 0), new V3(0, Math.cos(0.62), -Math.sin(0.62)), C0.clone().addScaledVector(n, R + 0.0003)); P.add(onSphere(sq, C0, n, R), C.decal, M.print); }
+  { const n = sphDir(Math.PI * 0.72, 0.9); led(P, C0.clone().addScaledVector(n, R), n, C.amber, 0.0036); }
+  // cap: dark collar, knurled knob (grip), metal valve
+  P.add(lathe([[0, 0.185], [0.0272, 0.185], [0.0296, 0.1892], [0.0272, 0.1952], [0.02, 0.197], [0, 0.197]], 18), C.dark, M.gloss);
+  I.add(hring(0.0305, 0.003, 0.1868, 4, 24));
+  P.add(gripSleeve(0.1955, 0.2275), C.rubber, M.rubber);
+  P.add(lathe([[0, 0.2272], [0.0052, 0.2272], [0.0052, 0.2318], [0.0072, 0.2332], [0.0072, 0.2358], [0, 0.2366]], 10), C.metal, M.metal);
+  return { kind: 'mist', body: P.build(), ink: I.build(), grip: gripAt(HOLD_BOMB, 0, 0.2115, 0) };
+}
+
+const SUB_BUILDERS = {
+  bomb: buildBomb, sticky: buildSticky, burst: buildBurst, seeker: buildSeeker, scan: buildScan,
+  curtain: buildCurtain, sprinkler: buildSprinkler, mine: buildMine, beacon: buildBeacon, mist: buildMist,
+};
+export const SUB_KINDS = Object.keys(SUB_BUILDERS);
+/** Kit subs (src/game/kits/*.js): build() returns { kind, body, ink, glow?, grip, … } like the builders above. */
+export function registerSubModel(kind, build) { SUB_BUILDERS[kind] = build; _subCache.delete(kind); if (!SUB_KINDS.includes(kind)) SUB_KINDS.push(kind); }
 const _subCache = new Map();
-/** Sub-weapon prop for the LEFT hand: { body, ink, handL:{pos,quat} (hand in prop space), inHandL:{pos,quat} (prop in hand space) }.
- *  Attach like a weapon: prop group under handL at inHandL (plastic body + team ink material). */
+/** Sub-weapon prop for the LEFT hand: { body, ink, handL:{pos,quat} (hand in prop space), inHandL:{pos,quat} (prop in hand space) }
+ *  plus the kind's extras (see the builders). Attach like a weapon: prop group under handL at inHandL (plastic body + team
+ *  ink material). Unknown kinds fall back to the splat bomb. */
 export function getSubDef(kind = 'bomb') {
   if (!_subCache.has(kind)) {
-    const d = buildBomb();
+    const d = (SUB_BUILDERS[kind] || buildBomb)();
     d.handL = handInWeapon(d.grip, GRIP_HOLE_L);
     const inv = new THREE.Matrix4().compose(d.handL.pos, d.handL.quat, new V3(1, 1, 1)).invert();
     d.inHandL = { pos: new V3(), quat: new THREE.Quaternion() };
@@ -863,3 +1968,10 @@ export function getWeaponDef(kind) {
   }
   return _cache.get(kind);
 }
+
+/** Shared modelling kit (Parts merger, palette, surface classes and shape helpers) for other procedural prop modules
+ *  (special-props.js). Read-only use. */
+export const GEO_KIT = {
+  Parts, C, M, latheZ, torus, at, rbox, orient, screw, decal, placeXY, squidShape, chevronShape, chevrons, deformG, rng, seX,
+  hring, wrapY, wrapZ, profR, wrapLathe, onSphere, sphDir, sphZone, swirlShapes, gripSleeve, led, roundRect, refine,
+};

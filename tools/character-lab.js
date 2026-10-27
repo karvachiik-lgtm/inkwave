@@ -143,7 +143,7 @@ const L = {
   palette: +(params.get('pal') ?? 0), side: 'a',
   style: { hair: 0, skin: 0, outfit: 0, eyes: 0 }, weapon: 'shooter',
   loco: 'idle', dance: null, hurt: 0, lineup: false, frozen: false, circle: false, isLocal: true,
-  terrain: 'flat', travel: false, follow: false,
+  terrain: 'flat', travel: false, follow: false, lod: params.get('lod') || null,
 };
 // the lab plays the actor's WeaponRunner for the new kinds (splatling spin-up/stream, dualies hands + dodge lock)
 const RUN = { charging: false, charge: 0, streaming: false, burstFrac: 0, lockT: 0, dodge: null, rollsLeft: 2, hand: 1, sinceHand: [99, 99] };
@@ -161,18 +161,19 @@ function makeHero() {
   scene.add(hero.root);
   hero.setDance(L.dance);
   hero.setHurt(L.hurt, enemyColor());
+  if (L.lod) hero.setLod(L.lod);
   puddleMat.color.set(teamColor());
 }
 
 const LINEUP = [
-  { name: 'Squiddo', side: 'a', weapon: 'shooter', style: { hair: 0, skin: 0, outfit: 0, eyes: 0 }, pose: 'lobby_pose' },
-  { name: 'Marlo', side: 'a', weapon: 'roller', style: { hair: 1, skin: 2, outfit: 1, eyes: 1 }, pose: 'menu_idle' },
-  { name: 'Pip', side: 'a', weapon: 'charger', style: { hair: 2, skin: 1, outfit: 2, eyes: 2 }, pose: 'aim' },
-  { name: 'Coral', side: 'a', weapon: 'blaster', style: { hair: 3, skin: 3, outfit: 3, eyes: 3 }, pose: 'victory' },
-  { name: 'Nori', side: 'b', weapon: 'blaster', style: { hair: 2, skin: 3, outfit: 0, eyes: 1 }, pose: 'lobby_pose' },
-  { name: 'Riptide', side: 'b', weapon: 'shooter', style: { hair: 1, skin: 1, outfit: 3, eyes: 0 }, pose: 'aim' },
-  { name: 'Suki', side: 'b', weapon: 'charger', style: { hair: 3, skin: 0, outfit: 1, eyes: 3 }, pose: 'menu_idle' },
-  { name: 'Kelp', side: 'b', weapon: 'roller', style: { hair: 0, skin: 2, outfit: 2, eyes: 2 }, pose: 'idle' },
+  { name: 'Squiddo', side: 'a', weapon: 'shooter', style: { hair: 0, skin: 0, outfit: 0, eyes: 0, hat: 0, brows: 0 }, pose: 'lobby_pose' },
+  { name: 'Marlo', side: 'a', weapon: 'roller', style: { hair: 1, skin: 2, outfit: 1, eyes: 1, hat: 1, brows: 1 }, pose: 'menu_idle' },
+  { name: 'Pip', side: 'a', weapon: 'charger', style: { hair: 2, skin: 4, outfit: 4, eyes: 2, hat: 0, brows: 2 }, pose: 'aim' },
+  { name: 'Coral', side: 'a', weapon: 'blaster', style: { hair: 3, skin: 3, outfit: 3, eyes: 3, hat: 2, brows: 3 }, pose: 'victory' },
+  { name: 'Nori', side: 'b', weapon: 'dualies', style: { hair: 4, skin: 6, outfit: 5, eyes: 4, hat: 0, brows: 1 }, pose: 'lobby_pose' },
+  { name: 'Riptide', side: 'b', weapon: 'splatling', style: { hair: 5, skin: 1, outfit: 6, eyes: 5, hat: 3, brows: 0 }, pose: 'aim' },
+  { name: 'Suki', side: 'b', weapon: 'slosher', style: { hair: 6, skin: 8, outfit: 7, eyes: 6, hat: 0, brows: 2 }, pose: 'menu_idle' },
+  { name: 'Kelp', side: 'b', weapon: 'roller', style: { hair: 7, skin: 5, outfit: 8, eyes: 7, hat: 0, brows: 3 }, pose: 'idle' },
 ];
 function makeCrowd() {
   for (const c of crowd) c.ch.dispose();
@@ -183,6 +184,7 @@ function makeCrowd() {
     ch.root.position.set((i - 3.5) * 0.95, 0, i < 4 ? 0 : 0);
     ch.root.rotation.y = 0;
     if (d.pose !== 'aim' && d.pose !== 'idle') ch.setDance(d.pose);
+    if (L.lod) ch.setLod(L.lod);
     scene.add(ch.root);
     crowd.push({ ch, d, st: { ...S, localMove: { x: 0, z: 0 }, form: 'kid', firing: d.pose === 'aim', charge: d.weapon === 'charger' && d.pose === 'aim' ? 0.7 : 0, aimPitch: 0.05, ink: 0.35 + 0.08 * i, special: i === 3 ? 1 : 0 } });
   });
@@ -343,7 +345,7 @@ function render() {
   if (params.get('bloom') === '0') renderer.render(scene, camera); else composer.render();
   if (!document.body.classList.contains('hide')) {
     const e = hero?.ikErr || [0, 0, 0, 0];
-    hud.innerHTML = `<b>${fps.toFixed(0)}</b> fps · calls <b>${renderer.info.render.calls}</b><br>hero draws <b>${hero ? drawCalls(hero.root) : 0}</b> · hero tris <b>${hero ? (countTriangles(hero.root) / 1000).toFixed(1) : 0}k</b> · scene <b>${(renderer.info.render.triangles / 1000).toFixed(0)}k</b><br>` +
+    hud.innerHTML = `<b>${fps.toFixed(0)}</b> fps · calls <b>${renderer.info.render.calls}</b><br>hero draws <b>${hero ? drawCalls(hero.root) : 0}</b> · hero tris <b>${hero ? (countTriangles(hero.root) / 1000).toFixed(1) : 0}k</b> · lod <b>${hero ? hero.lodTier : '—'}</b> ${hero ? (hero.lod.px | 0) + 'px' : ''} · scene <b>${(renderer.info.render.triangles / 1000).toFixed(0)}k</b><br>` +
       `form <b>${S.form}</b> · loco <b>${L.loco}</b> · dance <b>${L.dance || '—'}</b><br>ik err L/R arm <b>${(e[0] * 100).toFixed(1)}/${(e[1] * 100).toFixed(1)}</b>cm legs <b>${(e[2] * 100).toFixed(1)}/${(e[3] * 100).toFixed(1)}</b><br>t <b>${labT.toFixed(2)}</b>${L.frozen ? ' (frozen)' : ''}`;
   }
 }
@@ -402,7 +404,8 @@ function refreshUI() {
       slider('hp', 0, 1, 0.01, () => S.hp ?? 1, (v) => { S.hp = v; }),
       row(check('low ink', () => S.lowInk, (v) => { S.lowInk = v; }), check('invuln', () => S.invuln, (v) => { S.invuln = v; }), check('enemy ink', () => !!S.inEnemyInk, (v) => { S.inEnemyInk = v; }), check('bomb aim', () => !!S.subAim, (v) => { S.subAim = v; }), check('isLocal', () => L.isLocal, (v) => { L.isLocal = v; makeHero(); }))),
     sec('Camera <kbd>F B S G</kbd>', row(...Object.keys(CAMS).map((c) => btn(c, L.cam === c, () => setCam(c))))),
-    sec('Scene', row(btn('lineup (8)', L.lineup, () => { L.lineup = !L.lineup; makeCrowd(); if (hero) hero.root.visible = !L.lineup; setCam(L.lineup ? 'lineup' : 'front'); }), btn('freeze', L.frozen, () => { L.frozen = !L.frozen; }), btn('step 1/30', false, () => simulate(1 / 30)), btn('muzzle dot', muzzleDot.visible, () => { muzzleDot.visible = !muzzleDot.visible; }))),
+    sec('Scene', row(btn('lineup (8)', L.lineup, () => { L.lineup = !L.lineup; makeCrowd(); if (hero) hero.root.visible = !L.lineup; setCam(L.lineup ? 'lineup' : 'front'); }), btn('freeze', L.frozen, () => { L.frozen = !L.frozen; }), btn('step 1/30', false, () => simulate(1 / 30)), btn('muzzle dot', muzzleDot.visible, () => { muzzleDot.visible = !muzzleDot.visible; })),
+      row(...['auto', 'hero', 'game', 'far'].map((t) => btn('lod ' + t, (L.lod || 'auto') === t, () => window.lab.lod(t === 'auto' ? null : t))))),
   );
 }
 function applyColors() {
@@ -433,6 +436,10 @@ window.lab = {
   team(i, side = 'a') { L.palette = i; L.side = side; applyColors(); refreshUI(); },
   style(o) { Object.assign(L.style, o); makeHero(); refreshUI(); },
   hurt(a) { L.hurt = a; hero.setHurt(a, enemyColor()); },
+  /** LOD tier: 'hero' | 'game' | 'far' | null (automatic, by screen height) — applies to the hero and the line-up */
+  lod(t = null) { L.lod = t; hero.setLod(t); for (const c of crowd) c.ch.setLod(t); refreshUI(); },
+  /** start a dither cross-fade of the hero to tier t ('hero' | 'game' | 'far'); step to watch it */
+  fadeTo(t) { hero.lod.force = -1; hero._startFade(['hero', 'game', 'far'].indexOf(t)); },
   lineup(on = true) { L.lineup = on; makeCrowd(); hero.root.visible = !on; setCam(on ? 'lineup' : 'front'); },
   freeze(on = true) { L.frozen = on; refreshUI(); },
   step(sec) { simulate(sec); render(); },
@@ -456,7 +463,9 @@ window.lab = {
     Object.assign(RUN, { charging: false, charge: 0, streaming: false, burstFrac: 0, lockT: 0, dodge: null, hand: 1, cyc: 0 }); RUN.sinceHand[0] = RUN.sinceHand[1] = 99; DG.t = -1;
     L.style = { hair: 0, skin: 0, outfit: 0, eyes: 0, ...(o.style || {}) };
     L.weapon = o.weapon || 'shooter'; L.dance = o.dance || null; L.hurt = o.hurt || 0; L.palette = o.pal ?? L.palette; L.side = o.side || 'a';
-    L.isLocal = o.isLocal ?? true; L.circle = !!o.circle;
+    L.isLocal = o.isLocal ?? true; L.circle = !!o.circle; if (o.lod !== undefined) L.lod = o.lod;
+    // menu mode: no physics world → the kid behaves as in the showcase (looks at the viewer, neighbours, glances)
+    G.physics = o.menu ? null : labPhys;
     L.travel = !!o.travel || !!o.move; L.follow = o.follow ?? L.travel; E.vel.set(0, 0, 0); E.move.set(0, 0); E.spd = o.spd ?? PLAYER.runSpeed; E.face = o.face || 'move'; E.faceYaw = o.yaw || 0; E.turn = o.turn || 0; E.air = false; E.vy = 0;
     if ((o.terrain || 'flat') !== L.terrain) { L.terrain = o.terrain || 'flat'; buildTerrain(); }
     makeHero();
@@ -476,8 +485,16 @@ window.lab = {
     refreshUI(); render();
     return this.info();
   },
+  /** per-tier, per-part triangle counts of the hero (builds every tier) */
+  lodInfo() {
+    const out = {};
+    for (let t = 0; t < 3; t++) { const S = hero._tierSet(t); const o = out[['hero', 'game', 'far'][t]] = { total: 0 }; for (const m of S.list) { const n = countTriangles.call(null, { traverseVisible: (f) => f({ isMesh: true, geometry: m.geometry }) }) | 0; o[m.name.split(':')[1]] = n; o.total += n; } }
+    return out;
+  },
+  /** face/life probe: blink per eye, gaze, attention kind, pupil, breath, tier */
+  face() { const h = hero, f = h.face; return { t: +labT.toFixed(2), bl: [+f.blinkL.toFixed(2), +f.blinkR.toFixed(2)], gz: [+f.gazeX.toFixed(3), +f.gazeY.toFixed(3)], att: h.att.kind, on: h.att.on, pup: +f.pupil.toFixed(2), br: +f.breath.toFixed(2), sac: h.gz.st >= 0 }; },
   info() {
-    return { calls: renderer.info.render.calls, heroMeshes: hero ? drawCalls(hero.root) : 0, heroTris: hero ? countTriangles(hero.root) : 0, weaponTris: hero ? countTriangles(hero.weapon.pivot) : 0, ikErr: hero?.ikErr.map((v) => +(v * 100).toFixed(2)), t: +labT.toFixed(3) };
+    return { calls: renderer.info.render.calls, lod: hero?.lodTier, px: hero ? Math.round(hero.lod.px) : 0, heroMeshes: hero ? drawCalls(hero.root) : 0, heroTris: hero ? countTriangles(hero.root) : 0, weaponTris: hero ? countTriangles(hero.weapon.pivot) : 0, ikErr: hero?.ikErr.map((v) => +(v * 100).toFixed(2)), t: +labT.toFixed(3) };
   },
 };
 

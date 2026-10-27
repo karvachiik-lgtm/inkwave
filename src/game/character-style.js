@@ -1,4 +1,4 @@
-// Character style catalog. Everything a squidkid can look like: skin tones, hair styles
+// Character style catalog (owner: appearance stream). Everything a squidkid can look like: skin tones, hair styles
 // (built by character-geo.js getHairStyle(i)), outfits, eye colours, headgear, brows and named preset looks. The
 // Character constructor resolves a style through resolveStyle(); the locker menu lists the same tables.
 //
@@ -111,7 +111,7 @@ export function styleSwatch(st) {
 
 /**
  * Write a resolved style's colours into a character uniform bundle (makeCharUniforms()): outfit colourway + pattern,
- * iris gradient, and the optional face uniforms. The Character constructor calls this.
+ * iris gradient, and the optional face uniforms. The Character constructor calls this (see docs/HALYARD.md request).
  */
 export function applyStyleUniforms(u, st) {
   const o = OUTFITS[st.outfit] || OUTFITS[0];

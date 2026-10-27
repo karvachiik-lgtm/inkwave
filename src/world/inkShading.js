@@ -1,4 +1,4 @@
-// INKWAVE — the wet-ink layer of the level surface shader (ink VFX stream). levelMaterial.js splices these GLSL chunks
+// INKWAVE — the wet-ink layer of the level surface shader. levelMaterial.js splices these GLSL chunks
 // into its MeshPhysicalMaterial at the `${INK_*}` markers and merges inkUniforms() / calls inkBeforeRender().
 //
 // Paint atlas (src/world/paint.js), premultiplied by coverage — divide by A to read a channel:

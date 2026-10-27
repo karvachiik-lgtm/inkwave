@@ -7,7 +7,8 @@ const _v2 = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
 
 export class Level {
-  // extra: collision-only boxes from set dressing ({min,max}) — solid, un-inkable, never rendered (the prop mesh is)
+  // extra: collision-only boxes from set dressing ({min,max}, or {obox, center, size, rotY} for a turned prop; optional
+  // roof / rail / perch flags) — solid, un-inkable, never rendered (the prop mesh is)
   constructor(layout, extra = []) {
     this.extra = extra;
     this.layout = layout;
@@ -24,8 +25,11 @@ export class Level {
   _build() {
     const L = this.layout;
     const defs = [...L.single, ...L.half, ...L.half.map(mirrorDef),
-      ...this.extra.map((c) => ({ kind: 'box', min: c.min, max: c.max, paint: false, hidden: true, color: '#888888' }))];
+      ...this.extra.map((c) => (c.obox
+        ? { kind: 'obox', center: c.center, size: c.size, rotY: c.rotY, paint: false, hidden: true, color: '#888888', roof: !!c.roof, rail: !!c.rail, perch: !!c.perch }
+        : { kind: 'box', min: c.min, max: c.max, paint: false, hidden: true, color: '#888888', roof: !!c.roof, rail: !!c.rail, perch: !!c.perch }))];
     for (const d of defs) this._addBlock(d);
+    this.hasRails = this.blocks.some((b) => b.rail);   // (actors only run the railing foot check where there are rails)
     this._buildHash();
     for (const b of this.blocks) this._buildFaces(b);
   }
@@ -37,14 +41,20 @@ export class Level {
       half: new THREE.Vector3(),
       axes: [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)],
       aabbMin: new THREE.Vector3(), aabbMax: new THREE.Vector3(),
-      paint: d.paint !== false && !d.grate, solid: d.solid !== false,
+      paint: d.paint !== false && !d.grate && !d.rail, solid: d.solid !== false,
       color: new THREE.Color(d.color || '#dddddd'),
       pattern: d.pattern ?? PATTERN.plain,
       tag: d.tag || null,
       mural: d.mural || null,
       noPaint: d.noPaint || null,
-      grate: !!d.grate,            // walkable for kids, squids + ink + shots pass through, never inkable
-      hidden: !!d.hidden,          // collision-only (prop colliders)
+      grate: !!d.grate || !!d.rail, // walkable for kids, squids + ink + shots pass through, never inkable
+      roof: !!d.roof,              // off-limits top (roofs, crane legs …): never inkable, anyone landing on it slides off
+      perch: !!d.perch,            // a top you can stand on (overhead steel reached by a super jump) but never ink
+      noNav: !!d.noNav,            // no route runs along its top (narrow walls a bot would only fall off)
+      // rail: railings / fences — kids can't walk through (but can hop up and stand on top), shots + ink + squids pass.
+      // Collision-only (the railing you see is a prop): a grate block that is never drawn or inked
+      rail: !!d.rail,
+      hidden: !!d.hidden || !!d.rail, // collision-only (prop colliders, rails)
       bevel: d.bevel,
       faces: [-1, -1, -1, -1, -1, -1],
       aligned: true,
@@ -52,6 +62,13 @@ export class Level {
     if (d.kind === 'box') {
       b.center.set((d.min[0] + d.max[0]) / 2, (d.min[1] + d.max[1]) / 2, (d.min[2] + d.max[2]) / 2);
       b.half.set((d.max[0] - d.min[0]) / 2, (d.max[1] - d.min[1]) / 2, (d.max[2] - d.min[2]) / 2);
+    } else if (d.kind === 'obox') {
+      // box turned about the vertical axis by rotY degrees (a stage laid out at an angle, turned props)
+      const a = (d.rotY * Math.PI) / 180, c = Math.cos(a), s = Math.sin(a);
+      b.center.set(d.center[0], d.center[1], d.center[2]);
+      b.half.set(d.size[0] / 2, d.size[1] / 2, d.size[2] / 2);
+      b.axes = [new THREE.Vector3(c, 0, -s), new THREE.Vector3(0, 1, 0), new THREE.Vector3(s, 0, c)];
+      b.aligned = false;
     } else {
       // Ramp: a thick tilted slab whose top surface runs from low → high and whose underside reaches the floor.
       const L0 = new THREE.Vector3(...d.low), H0 = new THREE.Vector3(...d.high);
@@ -177,6 +194,7 @@ export class Level {
         face.mural = -1;
         if (b.mural) for (const m of b.mural) if (n.x * m.n[0] + n.y * m.n[1] + n.z * m.n[2] > 0.9) face.mural = m.id;
         if (b.noPaint) for (const m of b.noPaint) if (n.x * m[0] + n.y * m[1] + n.z * m[2] > 0.9) face.paintable = false;
+        if ((b.roof || b.perch) && n.y > 0.5) face.paintable = false;
         if (face.wall) {
           _v.copy(origin).addScaledVector(u, su / 2).addScaledVector(v, -0.06).addScaledVector(n, 0.06);
           face.groundedBottom = this.pointInside(_v, 0, b.id) || _v.y < 0.02;
@@ -367,12 +385,13 @@ export class Level {
   }
 
   // Highest walkable surface under (x,z) below yMax (used by nav + spawns). Returns y or -Infinity.
-  groundHeight(x, z, yMax = 50) {
+  // skipGrates: what a squid would land on (squids drop straight through grates)
+  groundHeight(x, z, yMax = 50, skipGrates = false) {
     let best = -Infinity;
     const ids = this.queryBlocks(x - 0.01, z - 0.01, x + 0.01, z + 0.01, this._qtmp2 || (this._qtmp2 = []));
     for (const id of ids) {
       const b = this.blocks[id];
-      if (!b.solid) continue;
+      if (!b.solid || (skipGrates && b.grate)) continue;
       // intersect vertical line with the block's top face plane
       const n = b.axes[1];
       if (n.y < 0.5) continue;
@@ -392,5 +411,6 @@ function mirrorDef(d) {
   if (d.kind === 'box') {
     return { ...d, mural, noPaint, min: [-d.max[0], d.min[1], -d.max[2]], max: [-d.min[0], d.max[1], -d.min[2]] };
   }
+  if (d.kind === 'obox') return { ...d, mural, noPaint, center: [-d.center[0], d.center[1], -d.center[2]] };
   return { ...d, mural, noPaint, low: [-d.low[0], d.low[1], -d.low[2]], high: [-d.high[0], d.high[1], -d.high[2]] };
 }

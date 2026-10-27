@@ -21,10 +21,12 @@
 //
 // API: splat(center, radius, team, { seed, stretch: Vector3, stretchAmt, kind, instant, cosmetic }) → m² claimed
 //      speck(center, radius, team, seed)  — cosmetic micro-splat (landing droplets), GPU only
+//      flood(region, team, { center, y, reach, dur, ease }) — ink a whole region (Zone Control), or wipe it (team -1)
 //      ripple(pos, amp, wavelength, speed, life) · setView(camPos) · flush(dt) · sample/sampleWorld/coverage/regionStats
 // kind: 'shot' 'line' 'blast' 'bomb' 'trail' 'drop' 'roll' 'speck' (inferred from radius/stretch when omitted;
 //       'roll' needs `stretch` = the roll direction and paints a straight-edged band segment instead of a blob)
 import * as THREE from 'three';
+import { G } from '../core/ctx.js';
 
 const MAX_QUADS = 6000;
 const RIP_N = 24;
@@ -211,6 +213,56 @@ void main() {
   gl_FragColor = vec4(team, 1.0, hsh(seed * 1.73), a);   // premultiplied by the blend: team share, wet, tone
 }`;
 
+// Region floods (Zone Control): one quad per face the region's cells lie on (their cell bounds + a cell, in atlas
+// space), carrying the world position. A texel is flooded when it passes the region's own cell test — inside one of
+// its outlines and within [y0, y1] — and the front (r0 < r ≤ r1 from the centre) is crossing it this frame.
+const FLOOD_MAXV = 64, FLOOD_MAXP = 6;
+const FLOOD_VS = /* glsl */`
+attribute vec2 aPos;
+attribute vec3 aW;
+varying vec3 vW;
+void main() { vW = aW; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+const FLOOD_FS = /* glsl */`
+precision highp float;
+uniform vec2 uPoly[${FLOOD_MAXV}];
+uniform int uPart[${FLOOD_MAXP + 1}];
+uniform int uParts;
+uniform vec2 uY;        // floor heights that count
+uniform vec2 uC;        // front centre (x, z)
+uniform vec2 uR;        // this frame's band of the front: r0 < r <= r1
+uniform float uTeam;    // 0 | 1, or -1 = wipe
+varying vec3 vW;
+float hsh(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hsh(i), hsh(i + vec2(1.0, 0.0)), f.x), mix(hsh(i + vec2(0.0, 1.0)), hsh(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+void main() {
+  if (vW.y < uY.x || vW.y > uY.y) discard;
+  float r = length(vW.xz - uC);
+  if (r <= uR.x || r > uR.y) discard;
+  bool inside = false;
+  for (int p = 0; p < ${FLOOD_MAXP}; p++) {
+    if (p >= uParts) break;
+    int a = uPart[p], b = min(uPart[p + 1], ${FLOOD_MAXV});
+    bool c = false;
+    int j = b - 1;
+    for (int k = 0; k < ${FLOOD_MAXV}; k++) {                 // (constant bound: a part is uPoly[a .. b))
+      int i = a + k;
+      if (i >= b) break;
+      vec2 P = uPoly[i], Q = uPoly[j];
+      if ((P.y > vW.z) != (Q.y > vW.z) && vW.x < (Q.x - P.x) * (vW.z - P.y) / (Q.y - P.y) + P.x) c = !c;
+      j = i;
+    }
+    if (c) { inside = true; break; }
+  }
+  if (!inside) discard;
+  if (uTeam < -0.5) { gl_FragColor = vec4(0.0); return; }   // wiped: bare floor (written straight, no blending)
+  // fresh (wet) ink with a soft, blotchy tone field so the flood isn't one flat sheet
+  float tone = clamp(0.5 + 0.6 * (vnoise(vW.xz * 0.6) - 0.5) + 0.3 * (vnoise(vW.xz * 1.9 + 7.0) - 0.5), 0.0, 1.0);
+  gl_FragColor = vec4(uTeam, 1.0, tone, 1.0);
+}`;
+
 export class PaintSystem {
   constructor(renderer, level, { atlasSize = 4096, maxDensity = 30, cell = 0.25 } = {}) {
     this.renderer = renderer;
@@ -231,6 +283,8 @@ export class PaintSystem {
     this.ripP = new Float32Array(RIP_N * 4);
     this._ripS = new Float32Array(RIP_N);
     this._dryAcc = 0;
+    this._floods = [];         // region floods in progress (flood())
+    this._floodPrep = new Map();   // region → its cells sorted by distance from the front's centre + atlas quads
     this._initGPU();
   }
 
@@ -353,6 +407,23 @@ export class PaintSystem {
     this.scene.add(this.dryMesh);
     this.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     this.quads = 0;
+    // region floods: one mesh, its geometry / material swapped per flood. Ink blends like a splat (RGB over, A max);
+    // a wipe writes bare floor straight into the atlas.
+    const fu = {
+      uPoly: { value: new Float32Array(FLOOD_MAXV * 2) }, uPart: { value: new Int32Array(FLOOD_MAXP + 1) }, uParts: { value: 0 },
+      uY: { value: new THREE.Vector2() }, uC: { value: new THREE.Vector2() }, uR: { value: new THREE.Vector2() }, uTeam: { value: 0 },
+    };
+    const fmat = (o) => new THREE.ShaderMaterial({ uniforms: fu, vertexShader: FLOOD_VS, fragmentShader: FLOOD_FS, transparent: true, depthTest: false, depthWrite: false, toneMapped: false, ...o });
+    this._floodInk = fmat({
+      blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendEquationAlpha: THREE.MaxEquation,
+      blendSrc: THREE.SrcAlphaFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneFactor,
+    });
+    this._floodWipe = fmat({ blending: THREE.NoBlending });
+    this._floodU = fu;
+    this._floodMesh = new THREE.Mesh(new THREE.BufferGeometry(), this._floodInk);
+    this._floodMesh.frustumCulled = false;
+    this._floodScene = new THREE.Scene();
+    this._floodScene.add(this._floodMesh);
     this.clear();
   }
 
@@ -371,6 +442,9 @@ export class PaintSystem {
     if (this.growing) this.growing.length = 0;
     if (this.rip) { for (let i = 0; i < RIP_N; i++) { this.rip[i * 4 + 3] = -99; this.ripP[i * 4 + 3] = 0.01; this._ripS[i] = 0; } }
     this._dryAcc = 0;
+    this._floods.length = 0;
+    for (const p of this._floodPrep.values()) p.geo.dispose();
+    this._floodPrep.clear();
     this.version++;
   }
 
@@ -390,6 +464,12 @@ export class PaintSystem {
   // center: Vector3, radius (m), team 0|1, opts: { stretch: Vector3 dir, stretchAmt, seed, kind, instant, cosmetic }
   // Returns the area (m²) newly claimed by `team` (for turf points / special gauge).
   splat(center, radius, team, opts = {}) {
+    // online: other players' ghost rounds never paint (their owner's splats arrive instead); yours are recorded
+    const nm = G.netm;
+    if (nm && !opts.cosmetic) {
+      if (nm.mute > 0) return 0;
+      if (!nm.applying) { if (opts.seed === undefined) opts.seed = Math.random(); nm.recSplat(center, radius, team, opts); }
+    }
     const seed = opts.seed ?? Math.random();
     const cosmetic = !!opts.cosmetic;
     const st = opts.stretch;
@@ -619,8 +699,146 @@ export class PaintSystem {
       this._dryU.uDry.value = k / 255;
       this.dryMesh.visible = true;
     }
+    const floods = this._floods.length > 0;
+    if (floods) { this._floodSettle(); this.texture.generateMipmaps = false; }   // (one mip rebuild: after the floods)
     this._drawQuads();
     this.dryMesh.visible = false;
+    if (floods) { this.texture.generateMipmaps = true; this._floodStep(dt); }
+  }
+
+  // ------------------------------------------------------------ region floods (Zone Control)
+  // flood(region, team, { center: [x, z], y, reach, dur = 0.5, ease = 'out' | 'linear' }): ink a whole region with one
+  // team's ink (team 0 | 1), or wipe it back to bare floor (team -1), as a front running out from `center` (radius =
+  // reach · ease(t / dur); everything left is done at dur, so dur 0 = at once). region = { cells: Int32Array (its live
+  // turf cells), polys: [[[x, z], …], …] (outlines), y0, y1 }. The atlas is flooded with the same test the cells were
+  // picked with (inside an outline, y0 ≤ y ≤ y1), and the gameplay grid, the coverage counts and `version` (→ the
+  // minimap) change with it as the front passes each cell, so what you see and what you swim in agree. Nobody is
+  // credited: no turf points, no special gauge. A new flood of a region replaces one still running there.
+  flood(region, team, opts = {}) {
+    if (!region || !region.cells || !region.cells.length) return null;
+    const c = opts.center || [0, 0];
+    const P = this._floodPrepFor(region, c[0], c[1]);
+    for (let k = this._floods.length - 1; k >= 0; k--) if (this._floods[k].region === region) this._floods.splice(k, 1);
+    const J = {
+      region, prep: P, team: team === 0 || team === 1 ? team : -1, t: 0, dur: Math.max(0, +opts.dur || 0), r: -1, i: 0,
+      reach: Math.max(0.1, opts.reach ?? (P.n ? P.dist[P.n - 1] + 0.2 : 1)), ease: opts.ease === 'linear' ? 'linear' : 'out', cx: c[0], cz: c[1],
+    };
+    if (opts.dur == null) J.dur = 0.5;
+    this._floods.push(J);
+    // a flood sends a swell out across the fresh ink, riding the front
+    if (J.team >= 0 && opts.y != null) this.ripple(_rel.set(c[0], opts.y, c[1]), 0.03, 0.45, J.reach / Math.max(0.2, J.dur) * 0.85, Math.max(0.6, J.dur * 1.6));
+    return J;
+  }
+
+  // a region's cells (live turf only) sorted by distance from the front's centre, plus its atlas quads + outlines
+  _floodPrepFor(region, cx, cz) {
+    let P = this._floodPrep.get(region);
+    if (P && P.cx === cx && P.cz === cz) return P;
+    const faces = this.paintFaces, cells = region.cells;
+    const faceOf = (k) => { let a = 0, b = faces.length - 1; while (a < b) { const m = (a + b + 1) >> 1; if (faces[m].grid <= k) a = m; else b = m - 1; } return faces[a]; };
+    const ids = [], ds = [], box = new Map();
+    for (let n = 0; n < cells.length; n++) {
+      const k = cells[n], f = faceOf(k);
+      if (!f || !f.atlas || k < f.grid || k >= f.grid + f.nu * f.nv) continue;
+      const l = k - f.grid, i = l % f.nu, j = (l - i) / f.nu;
+      const b = box.get(f);
+      if (!b) box.set(f, [i, i, j, j]);
+      else { if (i < b[0]) b[0] = i; if (i > b[1]) b[1] = i; if (j < b[2]) b[2] = j; if (j > b[3]) b[3] = j; }
+      if (!f.turf || this.dead[k]) continue;                       // (counts only ever track live turf cells)
+      const s = (i + 0.5) * f.cu, t = (j + 0.5) * f.cv;
+      ids.push(k); ds.push(Math.hypot(f.origin.x + f.u.x * s + f.v.x * t - cx, f.origin.z + f.u.z * s + f.v.z * t - cz));
+    }
+    const ord = ids.map((_, n) => n).sort((a, b) => ds[a] - ds[b]);
+    if (!P) {
+      // one quad per face: the region's cell bounds on it + a cell (the outline can run up to half a cell past them),
+      // clamped to the face's atlas rect incl. its padding (like a splat)
+      const pos = [], w = [], index = [], S = this.size;
+      for (const [f, b] of box) {
+        const a = f.atlas, padM = (a.pad - 0.5) / a.ppm;
+        const u0 = Math.max(-padM, (b[0] - 1) * f.cu), u1 = Math.min(f.su + padM, (b[1] + 2) * f.cu);
+        const v0 = Math.max(-padM, (b[2] - 1) * f.cv), v1 = Math.min(f.sv + padM, (b[3] + 2) * f.cv);
+        const base = pos.length / 2;
+        for (const [u, v] of [[u0, v0], [u1, v0], [u1, v1], [u0, v1]]) {
+          pos.push(((a.x + a.pad + u * a.ppm) / S) * 2 - 1, ((a.y + a.pad + v * a.ppm) / S) * 2 - 1);
+          w.push(f.origin.x + f.u.x * u + f.v.x * v, f.origin.y + f.u.y * u + f.v.y * v, f.origin.z + f.u.z * u + f.v.z * v);
+        }
+        index.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('aPos', new THREE.Float32BufferAttribute(pos, 2));
+      geo.setAttribute('aW', new THREE.Float32BufferAttribute(w, 3));
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array((pos.length / 2) * 3), 3));
+      geo.setIndex(index);
+      geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e9);
+      const poly = new Float32Array(FLOOD_MAXV * 2), part = new Int32Array(FLOOD_MAXP + 1);
+      let nv = 0, np = 0;
+      for (const p of region.polys || []) {
+        if (!p || p.length < 3) continue;
+        if (np >= FLOOD_MAXP || nv + p.length > FLOOD_MAXV) { console.warn('[paint] flood region outline too detailed; extra parts ignored'); break; }
+        part[np++] = nv;
+        for (const [x, z] of p) { poly[nv * 2] = x; poly[nv * 2 + 1] = z; nv++; }
+      }
+      part[np] = nv;
+      P = { geo, poly, part, parts: np, y0: region.y0 ?? -2, y1: region.y1 ?? 6 };
+      this._floodPrep.set(region, P);
+    }
+    P.cx = cx; P.cz = cz;
+    P.order = Int32Array.from(ord, (n) => ids[n]); P.dist = Float32Array.from(ord, (n) => ds[n]); P.n = ord.length;
+    return P;
+  }
+
+  // splats still spreading where a front is running finish now, so they are drawn before (under) the flood and never
+  // keep growing over it after the front has passed (the grid already holds their final shape)
+  _floodSettle() {
+    for (let i = this.growing.length - 1; i >= 0; i--) {
+      const g = this.growing[i];
+      for (const J of this._floods) {
+        const reach = J.reach + g.R * (g.dripDur ? DRIP_REACH : REACH[g.kind]) + 0.5;
+        const dx = g.cx - J.cx, dz = g.cz - J.cz;
+        if (dx * dx + dz * dz < reach * reach && g.cy > J.prep.y0 - 4 && g.cy < J.prep.y1 + 4) {
+          this._emitGrowth(g, 3, 1, false);
+          this.growing[i] = this.growing[this.growing.length - 1]; this.growing.pop();
+          break;
+        }
+      }
+    }
+  }
+
+  // advance every front: flip the cells it reached (grid + counts), then draw the band it crossed into the atlas
+  _floodStep(dt) {
+    const r = this.renderer, prev = r.getRenderTarget(), ac = r.autoClear, U = this._floodU;
+    r.autoClear = false;
+    r.setRenderTarget(this.rt);
+    let drew = false, changed = false;
+    for (let k = 0; k < this._floods.length; k++) {
+      const J = this._floods[k], P = J.prep;
+      J.t += dt;
+      const done = J.t >= J.dur, x = done ? 1 : J.t / J.dur;
+      const rad = done ? 1e9 : J.reach * (J.ease === 'linear' ? x : 1 - (1 - x) * (1 - x));
+      const val = J.team + 1;
+      while (J.i < P.n && P.dist[J.i] <= rad) {
+        const c = P.order[J.i++], was = this.grid[c];
+        if (was === val) continue;
+        this.grid[c] = val;
+        if (was) this.counts[was - 1]--;
+        if (val) this.counts[val - 1]++;
+        changed = true;
+      }
+      if (rad > J.r && P.parts > 0) {
+        U.uPoly.value = P.poly; U.uPart.value = P.part; U.uParts.value = P.parts;
+        U.uY.value.set(P.y0, P.y1); U.uC.value.set(J.cx, J.cz); U.uR.value.set(J.r, rad); U.uTeam.value = J.team;
+        this._floodMesh.geometry = P.geo;
+        this._floodMesh.material = J.team < 0 ? this._floodWipe : this._floodInk;
+        r.render(this._floodScene, this.cam);
+        drew = true;
+      }
+      J.r = rad;
+      if (done) this._floods.splice(k--, 1);
+    }
+    if (!drew) { this._floodMesh.visible = false; r.render(this._floodScene, this.cam); this._floodMesh.visible = true; }   // (mips)
+    r.setRenderTarget(prev);
+    r.autoClear = ac;
+    if (changed) this.version++;
   }
 
   _drawQuads() {
@@ -651,7 +869,7 @@ export class PaintSystem {
   sample(faceId, u, v) {
     if (faceId < 0) return 0;
     const f = this.level.faces[faceId];
-    if (!f.atlas) return 0;
+    if (!f || !f.atlas) return 0;   // (a face id from a stage being swapped in under a still-running match)
     const i = Math.min(f.nu - 1, Math.max(0, Math.floor(u / f.cu)));
     const j = Math.min(f.nv - 1, Math.max(0, Math.floor(v / f.cv)));
     return this.grid[f.grid + j * f.nu + i];
@@ -702,5 +920,10 @@ export class PaintSystem {
     return out;
   }
 
-  dispose() { this.rt.dispose(); this.geo.dispose(); this.mat.dispose(); this.dryMesh.geometry.dispose(); this.dryMesh.material.dispose(); }
+  dispose() {
+    this.rt.dispose(); this.geo.dispose(); this.mat.dispose(); this.dryMesh.geometry.dispose(); this.dryMesh.material.dispose();
+    for (const p of this._floodPrep.values()) p.geo.dispose();
+    this._floodPrep.clear(); this._floods.length = 0;
+    this._floodInk.dispose(); this._floodWipe.dispose();
+  }
 }

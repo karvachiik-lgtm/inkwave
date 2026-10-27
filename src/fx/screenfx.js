@@ -1,4 +1,4 @@
-// INKWAVE — screen FX. One full-screen composite pass inserted after the grade pass, before OutputPass
+// INKWAVE — screen FX (stream 6). One full-screen composite pass inserted after the grade pass, before OutputPass
 // (linear HDR), plus a GPU "lens ink" field: glossy metaball ink blobs on the camera lens that splat, drip and slide.
 //
 //   const sfx = new ScreenFX(R, G)      // R = core/renderer.js wrapper; installs itself with R.setExtraPass()
@@ -623,7 +623,7 @@ export class ScreenFX {
       this.s.chroma = Math.min(1, this.s.chroma + 0.25);
       if (id === 'storm') this.s.aura = Math.max(this.s.aura, 0.9);
     });
-    // explosions: typed events when the weapons emit them, otherwise the positional 'shake' requests (bombs, slams)
+    // explosions: typed events when stream 4 emits them, otherwise the positional 'shake' requests (bombs, slams)
     const blast = (pos, amount, color) => {
       if (!pos || !live()) return;
       const lb = this.s.lastBlast;

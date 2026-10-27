@@ -1,6 +1,19 @@
 dist/
 node_modules/
+# screenshot / audit output from the tools (docs/CONTRACTS.md tells tools to write here)
+shots/
 .vercel/
 .wrangler/
 .env*
 .DS_Store
+# botlab scratch (profiles, locks)
+.botlab/
+# your own music: drop files into songs/ (see songs/README.md); they and the generated manifest stay local
+songs/**/*.mp3
+songs/**/*.m4a
+songs/**/*.aac
+songs/**/*.ogg
+songs/**/*.opus
+songs/**/*.wav
+songs/**/*.flac
+songs/manifest.json

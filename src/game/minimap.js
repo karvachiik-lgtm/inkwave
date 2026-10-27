@@ -1,4 +1,4 @@
-// Top-down turf map. The HUD frames `canvas` (corner + TAB-expanded) and draws player dots / super-jump
+// Top-down turf map (stream 6). The HUD frames `canvas` (corner + TAB-expanded) and draws player dots / super-jump
 // beacons on top in normalised canvas space, so `w/h` === canvas size and `toCanvas` is the only projection.
 //
 // Layers (all 2D canvas, allocation-free per frame):
@@ -6,8 +6,12 @@
 //                                      soft sun shadows cast by tall blocks, contact AO, crisp rims, grates, props
 //   ink    (≤ 6 Hz, on paint.version)  bilinear team field → smooth anti-aliased blobs, glossy embossed rims
 //   flash  (with ink)                  freshly claimed pixels, faded out over ~0.4 s
-//   live   (every frame)               spawn pads, bombs (arming blink), tempest clouds + rain radius, slam shock rings,
-//                                      super-jump landing targets, respawn pulses, splat bursts
+//   live   (~20 Hz, see MAP_COMPOSE_EVERY)  spawn pads, bombs (arming blink), tempest clouds + rain radius, slam shock rings,
+//                                      super-jump landing targets + your team's jump travel lines (_jumpLines),
+//                                      respawn pulses (splats: the HUD's death markers)
+
+// How many frames to accumulate between minimap recomposes (3 = ~20 Hz at 60 fps).
+const MAP_COMPOSE_EVERY = 3;
 import { G, on } from '../core/ctx.js';
 import { SPECIALS, SUB } from '../config.js';
 
@@ -18,15 +22,44 @@ const live = () => { const m = G.match; return !!(m && !m.attract); };
 function pushFx(fx) { if (!CURRENT || !live()) return; if (fxList.length > 40) fxList.shift(); fxList.push(fx); }
 on('special:slam', ({ actor, pos, radius }) => pushFx({ kind: 'slam', x: pos.x, z: pos.z, team: actor ? actor.team : 0, r: radius || SPECIALS.slam.radius, t: 0, life: 0.9 }));
 on('bomb:explode', ({ pos, team, radius }) => pushFx({ kind: 'boom', x: pos.x, z: pos.z, team: team | 0, r: radius || SUB.bomb.radius, t: 0, life: 0.7 }));
-on('superjump', ({ actor, phase, to }) => { if (phase === 'flight' && to) pushFx({ kind: 'jump', x: to.x, z: to.z, team: actor.team, actor, t: 0, life: 3 }); });
+on('superjump', ({ actor, phase, to, home }) => { if (phase === 'flight' && to && !home) pushFx({ kind: 'jump', x: to.x, z: to.z, team: actor.team, actor, t: 0, life: 3 }); });
 on('superjump:land', ({ actor }) => { for (const f of fxList) if (f.kind === 'jump' && f.actor === actor) f.life = Math.min(f.life, f.t + 0.35); });
 on('respawn', ({ actor }) => { const p = G.level?.spawnPads?.[actor.team]; if (p) pushFx({ kind: 'spawn', x: p.x, z: p.z, team: actor.team, t: 0, life: 0.8 }); });
-on('splatted', ({ victim, attacker }) => { if (victim && victim.pos) pushFx({ kind: 'splat', x: victim.pos.x, z: victim.pos.z, team: attacker ? attacker.team : 1 - victim.team, t: 0, life: 1.6 }); });
+// (splats: the HUD draws the death markers over this canvas — a squid-skull in the victim's ink, main.js deathMarks)
+
+// ---- live super jumps (the travel line on this map and the TAB map diorama). Mirrors Actor.superJump /
+// _updateSuperJump: a 0.75 s charge in place, then a flight of s.dur s from s.from to s.to (horizontal ease-in-out,
+// vertical sine lob). While charging, the landing is the target's: a teammate's jumpAnchor() or a fixed point.
+// superJumpInfo(actor, from, to, out) fills from / to ({x,y,z}) and out = { phase, k (0..1 of the phase), e (horizontal
+// progress 0..1, flight only), home } and returns out — or null when the actor isn't super jumping. No allocation.
+export const SJ_CHARGE = 0.75;
+export const sjEase = (k) => (k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
+export function superJumpInfo(a, from, to, out) {
+  const s = a && a.superJumpState;
+  if (!s) return null;
+  let f, d;
+  if (s.phase === 'flight') { f = s.from; d = s.to; }
+  else {
+    const tg = s.target;
+    d = tg && tg.pos && tg.pos.isVector3 ? (tg.jumpAnchor ? tg.jumpAnchor() : tg.pos) : tg;
+    f = a.pos;
+  }
+  if (!f || !d || !Number.isFinite(d.x + d.z)) return null;
+  from.x = f.x; from.y = f.y; from.z = f.z; to.x = d.x; to.y = d.y; to.z = d.z;
+  const flight = s.phase === 'flight';
+  out.phase = flight ? 'flight' : 'charge';
+  out.k = Math.min(1, Math.max(0, flight ? s.t / (s.dur || 1) : s.t / SJ_CHARGE));
+  out.e = flight ? sjEase(out.k) : 0;
+  out.home = !!s.home;
+  return out;
+}
+const _jf = { x: 0, y: 0, z: 0 }, _jt = { x: 0, y: 0, z: 0 }, _ji = { phase: '', k: 0, e: 0, home: false }, _ja = { x: 0, y: 0 }, _jb = { x: 0, y: 0 };
 
 // linear → sRGB 0..255
 function lin2s(c) { return Math.round(255 * (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055)); }
 const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
 
+const _a = { x: 0, y: 0 }, _b = { x: 0, y: 0 };
 export class Minimap {
   constructor(level, paint, pxPerM = 7) {
     this.level = level; this.paint = paint;
@@ -58,6 +91,7 @@ export class Minimap {
   }
 
   setViewerTeam(team) {
+    this.viewerTeam = team;
     const f = team === 1;
     if (f === this.flip && this._built) { this.version = -1; return; }
     this.flip = f;
@@ -87,6 +121,7 @@ export class Minimap {
     // 1) rasterise every solid block's top surface (ramps included) → height + owning block + normal
     for (const b of lvl.blocks) {
       if (!b.solid) continue;
+      if (b.hidden && (b.roof || b.perch) && b.aabbMin.y > 3) continue;   // overhead steel (crane girders, booms): not over the turf
       const n = b.axes[1];
       if (n.y < 0.45) continue;
       const tx = b.center.x + n.x * b.half.y, ty = b.center.y + n.y * b.half.y, tz = b.center.z + n.z * b.half.y;
@@ -328,7 +363,15 @@ export class Minimap {
       else { this._drawInk(0, Math.floor(this.h / BANDS)); this._band = 1; }
     }
     this.flashT += dt;
-    this._compose(dt);
+    // Recompose at ~20 Hz, not every frame. Each compose blits the whole map canvas twice — and because that canvas
+    // is a live DOM element, every frame it changes costs a full canvas -> GPU re-upload on top. A map does not need
+    // 60 Hz to read as live. This is the largest single per-frame cost on a phone (measured 8.8 ms/frame average and
+    // 189 ms peak on an Adreno 730) and, crucially, it runs AFTER main.js stops its perf.sim / perf.render timers —
+    // which is why every earlier probe missed it while 3D scene objects kept measuring free.
+    // dt is accumulated rather than dropped so the compose's own time-based effects keep their real speed.
+    this._cAcc = (this._cAcc || 0) + dt;
+    this._cN = (this._cN || 0) + 1;
+    if (this._cN >= MAP_COMPOSE_EVERY) { this._cN = 0; const acc = this._cAcc; this._cAcc = 0; this._compose(acc); }
   }
 
   _compose(dt) {
@@ -339,6 +382,10 @@ export class Minimap {
     if (this.flashT < 0.45) { c.globalAlpha = (1 - this.flashT / 0.45) * 0.85; c.drawImage(this.flashC, 0, 0); c.globalAlpha = 1; }
     const hex = G.teamHex || ['#ff8a14', '#2f5bff'];
     const t = this.time;
+    // Zone Control: every zone's outline — the operational objective in its holder's ink (white while neutral), the
+    // others as faint dashed ghosts
+    const Zc = G.match && !G.match.attract ? G.match.zones : null;
+    if (Zc) this._drawZones(c, Zc, hex, t);
     const tc = this._tc || (this._tc = { x: 0, y: 0 });
     // spawn pads
     const pads = this.level.spawnPads || [];
@@ -366,6 +413,8 @@ export class Minimap {
         c.globalAlpha = 1 - k; c.lineWidth = f.kind === 'slam' ? 4 : 3; c.strokeStyle = '#ffffff'; c.stroke();
         c.globalAlpha = 1;
       } else if (f.kind === 'jump') {
+        // (your team's jumps in the air: the travel line below draws this landing target)
+        if (f.actor && f.actor.superJumpState && f.actor.team === (this.viewerTeam ?? 0)) continue;
         const pulse = 0.5 + 0.5 * Math.sin(t * 10);
         const r = s * (1.1 + 0.35 * pulse);
         c.lineWidth = 3; c.strokeStyle = '#15121c'; c.beginPath(); c.arc(tc.x, tc.y, r + 1, 0, TAU); c.stroke();
@@ -375,13 +424,6 @@ export class Minimap {
       } else if (f.kind === 'spawn') {
         const r = s * (2 + 5 * k);
         c.globalAlpha = 1 - k; c.lineWidth = 3; c.strokeStyle = '#ffffff'; c.beginPath(); c.arc(tc.x, tc.y, r, 0, TAU); c.stroke(); c.globalAlpha = 1;
-      } else if (f.kind === 'splat') {
-        const a = k < 0.15 ? k / 0.15 : 1 - (k - 0.15) / 0.85;
-        const r = s * 0.9;
-        c.globalAlpha = Math.max(0, a);
-        c.lineWidth = 4; c.strokeStyle = '#15121c'; this._cross(c, tc.x, tc.y, r);
-        c.lineWidth = 2.2; c.strokeStyle = col; this._cross(c, tc.x, tc.y, r);
-        c.globalAlpha = 1;
       }
     }
     // ink tempest clouds
@@ -413,8 +455,135 @@ export class Minimap {
       c.beginPath(); c.arc(tc.x, tc.y, r, 0, TAU); c.fillStyle = col; c.fill();
       c.beginPath(); c.arc(tc.x - r * 0.3, tc.y - r * 0.3, r * 0.3, 0, TAU); c.fillStyle = 'rgba(255,255,255,.75)'; c.fill();
     }
+    // sub devices: your team's beacons + mines (mines stay secret from the other side), everyone's sprinklers,
+    // curtains and clouds
+    const S = G.subs, me = this.viewerTeam ?? 0;
+    if (S) for (const it of S.items) {
+      const st = it.state;
+      if (st === 'dead' || st === 'fly') continue;
+      if ((st === 'beacon' || st === 'mine') && it.team !== me) continue;
+      this.toCanvas(it.pos.x, it.pos.z, tc);
+      const col = hex[it.team] || '#fff';
+      if (st === 'curtain') {
+        this.toCanvas(it.pos.x + it.tan.x * it.sub.width / 2, it.pos.z + it.tan.z * it.sub.width / 2, _a);
+        this.toCanvas(it.pos.x - it.tan.x * it.sub.width / 2, it.pos.z - it.tan.z * it.sub.width / 2, _b);
+        c.lineCap = 'round'; c.lineWidth = s * 0.55 + 2; c.strokeStyle = '#15121c'; c.beginPath(); c.moveTo(_a.x, _a.y); c.lineTo(_b.x, _b.y); c.stroke();
+        c.lineWidth = s * 0.55; c.strokeStyle = col; c.stroke();
+        continue;
+      }
+      if (st === 'cloud' || st === 'mist') {
+        c.globalAlpha = 0.3; c.fillStyle = st === 'mist' ? '#6b4a8c' : col;
+        c.beginPath(); c.arc(tc.x, tc.y, it.sub.radius * s, 0, TAU); c.fill(); c.globalAlpha = 1;
+        continue;
+      }
+      const r = s * (st === 'beacon' ? 0.75 : 0.55);
+      c.beginPath(); c.arc(tc.x, tc.y, r + 1.5, 0, TAU); c.fillStyle = '#15121c'; c.fill();
+      c.beginPath();
+      if (st === 'beacon') { c.moveTo(tc.x, tc.y - r * 1.2); c.lineTo(tc.x + r, tc.y + r * 0.7); c.lineTo(tc.x - r, tc.y + r * 0.7); c.closePath(); }
+      else c.arc(tc.x, tc.y, r, 0, TAU);
+      c.fillStyle = col; c.fill();
+      if (st === 'spray') { c.lineWidth = 1.5; c.strokeStyle = col; c.globalAlpha = 0.5; c.beginPath(); c.arc(tc.x, tc.y, it.sub.sprayRadius * s * 0.8, 0, TAU); c.stroke(); c.globalAlpha = 1; }
+    }
+    // specials: vortex targets + funnels, sound beams, bubbles, cheer orbs, the local strike cursor
+    G.specials?.drawMap(c, this, tc, s, hex, t);
     c.globalAlpha = 1;
+    this._jumpLines(c, s, hex, t, me);
     void W; void H;
+  }
+
+  // Super jumps in progress on your team: a travel line from the take-off to the landing spot. While charging it
+  // reaches out to the landing (the target ring closing in on it); in flight ink dots stream toward the landing ahead
+  // of the jumper and the flown part fades to a thin trail (your own dot rides the line). Yours bold, teammates' thin.
+  // Widths are in metres (× s): the corner map shows this canvas at roughly ⅓ scale.
+  _jumpLines(c, s, hex, t, team) {
+    const acts = G.match && !G.match.attract ? G.match.actors : null;
+    if (!acts) return;
+    const A = _ja, B = _jb, J = _ji;
+    for (const a of acts) {
+      if (!a.alive || a.team !== team || !a.superJumpState || !superJumpInfo(a, _jf, _jt, J)) continue;
+      this.toCanvas(_jf.x, _jf.z, A); this.toCanvas(_jt.x, _jt.z, B);
+      const dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy);
+      const self = !!a.isLocal, col = hex[a.team] || '#ffffff', w = self ? 1 : 0.62;
+      const flight = J.phase === 'flight';
+      // landing target: a crosshair ring sized to show round the destination teammate's dot (≈ 9 px on the corner
+      // map), closing in on the landing while the jump charges; the line stops at its rim
+      const pulse = 0.5 + 0.5 * Math.sin(t * 10);
+      const lock = flight ? 0 : Math.pow(1 - J.k, 2);
+      const r = J.home ? 0 : s * (self ? 4.6 + 0.6 * pulse : 4.4 + 0.3 * pulse) * (1 + lock * 1.3);
+      const done = flight ? J.e : 0;
+      const reach = Math.max(done, Math.min(flight ? 1 : 1 - Math.pow(1 - J.k, 3), 1 - (r * 0.9) / Math.max(1, len)));   // charge: draws out
+      const px = A.x + dx * done, py = A.y + dy * done, rx = A.x + dx * reach, ry = A.y + dy * reach;
+      c.save();
+      c.lineCap = 'round'; c.lineJoin = 'round';
+      if (len > 2) {
+        if (done > 0.002) {
+          c.globalAlpha = self ? 0.7 : 0.4; c.lineWidth = 0.85 * s * w; c.strokeStyle = col;
+          c.beginPath(); c.moveTo(A.x, A.y); c.lineTo(px, py); c.stroke();
+        }
+        if (reach - done > 0.002) {
+          c.globalAlpha = self ? 0.62 : 0.4; c.lineWidth = 2.7 * s * w; c.strokeStyle = '#15121c';
+          c.beginPath(); c.moveTo(px, py); c.lineTo(rx, ry); c.stroke();
+          // dots anchored to the line (not to its moving start), streaming toward the landing
+          const gap = 3.1 * s * w;
+          c.setLineDash([0.001, gap]); c.lineDashOffset = ((len * done - t * 5.5 * s) % gap + gap) % gap;
+          c.globalAlpha = 1; c.lineWidth = 1.55 * s * w; c.strokeStyle = self ? '#ffffff' : col;
+          c.stroke();
+          if (self) { c.lineWidth = 0.85 * s; c.strokeStyle = col; c.stroke(); }
+          c.setLineDash([]);
+        }
+      }
+      if (!J.home) {
+        c.globalAlpha = self ? 0.22 : 0.12; c.fillStyle = col; c.beginPath(); c.arc(B.x, B.y, r, 0, TAU); c.fill();
+        c.globalAlpha = self ? 1 : 0.7;
+        c.lineWidth = (self ? 1.15 : 0.7) * s; c.strokeStyle = '#15121c'; c.stroke();
+        c.lineWidth = (self ? 0.6 : 0.36) * s; c.strokeStyle = self ? '#ffffff' : col; c.stroke();
+        if (self) {
+          const a0 = r * 1.12, a1 = r * 1.5;
+          c.beginPath();
+          c.moveTo(B.x - a1, B.y); c.lineTo(B.x - a0, B.y); c.moveTo(B.x + a0, B.y); c.lineTo(B.x + a1, B.y);
+          c.moveTo(B.x, B.y - a1); c.lineTo(B.x, B.y - a0); c.moveTo(B.x, B.y + a0); c.lineTo(B.x, B.y + a1);
+          c.lineWidth = 0.95 * s; c.strokeStyle = '#15121c'; c.stroke();
+          c.lineWidth = 0.48 * s; c.strokeStyle = col; c.stroke();
+        }
+      }
+      c.restore();
+    }
+  }
+
+  _drawZones(c, Z, hex, t) {
+    if (this._zFor !== Z || this._zFlip !== this.flip) {
+      this._zFor = Z; this._zFlip = this.flip;
+      const tc = { x: 0, y: 0 };
+      this._zPaths = Z.zones.map((z) => {
+        const p = new Path2D();
+        for (const part of z.def.polys || [z.def.poly]) {
+          part.forEach(([x, zz], i) => { this.toCanvas(x, zz, tc); if (i) p.lineTo(tc.x, tc.y); else p.moveTo(tc.x, tc.y); });
+          p.closePath();
+        }
+        return p;
+      });
+    }
+    const act = Z.active.zones, s = this.s;          // line widths in metres: the corner map shows the canvas at ~⅓ scale
+    c.save();
+    c.lineJoin = 'round';
+    c.setLineDash([1.5 * s, 1.1 * s]);
+    for (let i = 0; i < Z.zones.length; i++) {
+      if (act.includes(Z.zones[i])) continue;
+      const path = this._zPaths[i];
+      c.globalAlpha = 0.5; c.lineWidth = 0.95 * s; c.strokeStyle = '#15121c'; c.stroke(path);
+      c.globalAlpha = 0.85; c.lineWidth = 0.45 * s; c.strokeStyle = '#ffffff'; c.stroke(path);
+    }
+    c.setLineDash([]);
+    const pulse = 0.5 + 0.5 * Math.sin(t * 4);
+    for (const z of act) {
+      const path = this._zPaths[Z.zones.indexOf(z)];
+      const held = z.owner === 0 || z.owner === 1, col = held ? hex[z.owner] : '#ffffff';
+      c.globalAlpha = (held ? 0.36 : 0.3) + 0.1 * pulse; c.fillStyle = col; c.fill(path);
+      c.globalAlpha = 1; c.lineWidth = 1.15 * s; c.strokeStyle = '#15121c'; c.stroke(path);
+      c.lineWidth = 0.6 * s; c.strokeStyle = col; c.stroke(path);
+      if (!held) { c.setLineDash([0.9 * s, 0.9 * s]); c.lineDashOffset = -t * 2 * s; c.strokeStyle = '#bdb6cc'; c.stroke(path); c.setLineDash([]); }
+    }
+    c.restore();
   }
 
   _cross(c, x, y, r) { c.beginPath(); c.moveTo(x - r, y - r); c.lineTo(x + r, y + r); c.moveTo(x + r, y - r); c.lineTo(x - r, y + r); c.stroke(); }

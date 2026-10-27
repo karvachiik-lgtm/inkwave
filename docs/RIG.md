@@ -25,7 +25,7 @@ lists them. Mirror rule for L/R pairs: rotations about local X keep their sign, 
 |---|---|---|---|---|
 | `tank` | chest | (0, 0.848, −0.176) = tank centre | backpack: caps, collars, rails, bolts, back plate, gauge, valve + the back ends of the shoulder straps are skinned to it; character.js re-parents the glass/fill group to it | spring sway/bounce, small angles (≤ 0.12 rad) |
 | `hemF`, `hemB` | hips | (0, 0.712, ±0.082/−0.1) | bottom band of the tee (weight ramps in below y≈0.76, strongest at the hem centre front/back) | rotation.x flap ±0.25 with stride/accel; z sway |
-| `jaw` | head | head centre + (0, −0.035, −0.035) | chin / lower face (max weight 0.92 at the chin; mouth shape itself is the shader decal `uMouth`) | rotation.x 0 … 0.35 × mouthOpen (as coded) gives a gentle chin drop |
+| `jaw` | head | head centre + (0, −0.035, −0.035) (`JAW_PIVOT`, character-face.js) | lower face below the lip line: lower lip + inner lip, lower half of the mouth cavity, lower teeth, tongue, chin (FACE rework). Weights are capped at 0.65 (`JAW_GAIN`): the head is so big that the lower lip sits ~19 cm from the pivot | rotation.x 0 … 0.35 × mouthOpen (as coded) opens the modelled mouth ≈ 3.5 cm at 0.3 rad (a wide booyah D); 0.1 ≈ a talking gap |
 | `cheekL/R` | head | on the cheek puff, 2 cm inside | cheek puffs (max weight 0.55) | position.y +0.002…0.004 when smiling, small scale 1.0–1.06 |
 | `earL/R` | head | ear root (az ±1.5) | pointed ears (weight ramps 0→1 over the first 20 % of the ear) | droop/perk: rotation.z ∓0.3 … ±0.2 (L: − droops), wiggle on hits/landing |
 | `toeL/R` | foot | (±0.084, 0.028, 0.09) = ball of the foot | front 40 % of the sneaker (sole, upper, laces) | rotation.x −0.5 … 0 (toe stays planted while the heel lifts at push-off) |
@@ -47,8 +47,24 @@ lists them. Mirror rule for L/R pairs: rotations about local X keep their sign, 
   `rotation.z = side * (rest − g)` with the values above (side = +1 for L, −1 for R).
 
 ### Not added (and why)
-- `lidL/lidR`: the eyes sit inside the painted goggle mask; a rigid lid would show on the forehead at rest or stay
-  hidden inside the head. Blinks keep using the eye bones' Y scale (works as coded).
+- `lidL/lidR` (re-evaluated): the lids ARE modelled now, but they are not bones. Each lid closes in the skin
+  vertex shader by rotating its vertices about the eyeball's own horizontal axis *in eye space* (the eyeball is an
+  ellipsoid = unit sphere under an affine map), with a per-vertex travel that is exactly "this column's lid edge → the
+  closed line". A rigid bone rotation can't do that: it keeps one travel for the whole lid (the corners over-close) and
+  linear-blend skinning with partial weights shrinks the lid into the ball. Drivers, no bone needed:
+  - the eye bones' **Y scale** (character.js blink / wink / squint / gaze-follow, as coded) — the shaders read it from
+    the bone texture: close = (1 − scaleY) / 0.93;
+  - the per-kid uniform **`uLid`** (upper L, upper R, lower L, lower R, 0…1), combined with the bones by max().
+  character.js' optional `xb.lidL/lidR` path therefore stays inert.
+
+### Face helpers after the FACE rework
+- `eyeL/eyeR` carry no geometry any more (the eyeballs are skinned to `head` and turned in the eye material by
+  `uLook` / `uGaze`); their Y scale is the blink signal above. Rest positions unchanged.
+- `mouth` / `mouthO` carry no geometry (the mouth is modelled and shaped by `uMouth` / `uMouth2` + `jaw`). FACE pass 2
+  moved the mouth up (`MOUTH.el` −0.45 → −0.41), so these two helpers' rest positions are ~7 mm higher.
+- `cheekL/R` weights now fade to 0 inside the eye patch (a cheek raise must not push the lower lid into the ball).
+- `earL/R`: the rebuilt ears keep the old frame (root, axis, width profile — `earFrame(sx)` in character-face.js), so the
+  punk hoops still pierce the rim.
 
 ### Proportion / rest-position notes
 - Existing bone rest positions are unchanged. The face helpers (`eyeL/R`, `browL/R`, `mouth`, `mouthO`) are derived

@@ -8,7 +8,7 @@
 // fx.update(dt, camera) · fx.clear() · fx.setLighting(env.getSkyColors()) · fx.stats()
 //
 // Contract API (docs/CONTRACTS.md §4): burst · drop · ring · explosion · splatted · wake · muzzle · spawnFlash · rain
-// Effect recipes (all colours: THREE.Color | hex | css string; vectors are read, never kept):
+// Recipes added by the VFX stream (all colours: THREE.Color | hex | css string; vectors are read, never kept):
 //   footstep(pos, color, surface 0 dry|1 own ink|2 enemy ink, dir, speed)   land(pos, color, surface, speed)
 //   jumpOff(pos, color, surface, swim)   formPop(pos, color, toSquid, inInk)   dive(pos, color, speed)   emerge(pos, color, speed)
 //   bubbles(pos, color, n)   climbDrip(pos, wallNormal, color)   climbPop(pos, dir, color)   hurtDrip(pos, color, size)
@@ -1483,7 +1483,7 @@ export class FX {
     }
   }
 
-  // =================================================================== Effect recipes
+  // =================================================================== VFX-stream recipes
   // Foot plant. surface: 0 dry, 1 own ink, 2 enemy ink (color = the ink under the foot). dir: unit horizontal heading.
   // In ink the foot squelches: a few droplets kicked back and a ripple through the ink surface (no decals).
   footstep(pos, color, surface = 0, dir = null, speed = 5) {

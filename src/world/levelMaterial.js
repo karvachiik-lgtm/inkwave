@@ -1,8 +1,39 @@
 // Level surface material: MeshPhysicalMaterial + injected procedural surface patterns and the wet ink layer.
 import * as THREE from 'three';
+import { STAGE_SURFACES, FIRST_STAGE_SLOT, LAST_STAGE_SLOT } from './stages/surfaces.js';
 import { TEXLIB_GLSL } from './texlib.js';
 import { G } from '../core/ctx.js';
 import { inkUniforms, inkBeforeRender, INK_PARS, INK_COLOR, INK_ROUGH, INK_GEL, INK_SLOPE, INK_EMISSIVE, INK_LIGHTS, INK_LIGHT_MAPS, INK_SHADE } from './inkShading.js';
+
+// Street lamps light the deck at dusk: each bulb is a real punctual light through the material's own BRDF (diffuse +
+// the ink's wet coat, so fresh ink glints under a lamp), windowed to a few metres and culled per pixel in world space
+// (only fragments inside a pool pay for it). No shadows: the pools are soft and the bulbs sit over open deck.
+const MAX_LAMPS = 12, LAMP_R = 10, LAMP_HEX = '#ffc48a', LAMP_I = 16;
+const LAMP_LIGHTS = /* glsl */`
+for (int i = 0; i < ${MAX_LAMPS}; i++) {
+  if (i >= uLampN) break;
+  vec3 lw = uLamps[i] - vWPos;
+  float d2 = dot(lw, lw);
+  if (d2 > ${(LAMP_R * LAMP_R).toFixed(2)}) continue;
+  float w = clamp(1.0 - d2 * d2 / ${(LAMP_R ** 4).toFixed(1)}, 0.0, 1.0);
+  IncidentLight lampL;
+  lampL.direction = normalize((viewMatrix * vec4(lw, 0.0)).xyz);
+  lampL.color = uLampCol * (w * w / max(d2, 0.35));
+  lampL.visible = true;
+  RE_Direct(lampL, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight);
+}`;
+
+// Bulb positions of the stage's street lamps (same placement rule as decor.js _buildLamps: mirrored pairs, the arm
+// reaching 0.92 m toward the arena centre, bulb 4.9 m up) → uniforms; k = environment night factor (0 = off).
+export function setLevelLamps(mat, level, k = 0) {
+  const u = mat && mat.userData && mat.userData.uniforms;
+  if (!u || !u.uLamps) return;
+  const L = (level && level.layout && level.layout.decor && level.layout.decor.lamps) || [];
+  const pts = k > 0.01 ? [...L, ...L.map(([x, z]) => [-x, -z])].slice(0, MAX_LAMPS) : [];
+  pts.forEach(([x, z], i) => u.uLamps.value[i].set(x + 0.92 * (x > 0 ? -1 : 1), Math.max(0, level.groundHeight(x, z)) + 4.9, z));
+  u.uLampN.value = pts.length;
+  u.uLampCol.value.set(LAMP_HEX).multiplyScalar(LAMP_I * k);
+}
 
 export function createLevelMaterial(paintTexture, atlasSize, muralTexture = null, opts = {}) {
   const mat = new THREE.MeshPhysicalMaterial({
@@ -25,6 +56,8 @@ export function createLevelMaterial(paintTexture, atlasSize, muralTexture = null
     uSeeFeet: { value: 0 },                  // local player's feet height (set per draw below)
     uSeeA2C: { value: 0 },                   // 1 when drawing into a multisampled target (alpha-to-coverage fade)
     uAO: { value: opts.lightmap ? 1.0 : 0.0 },
+    // dusk lamp pools (setLevelLamps, driven by main._applyNight): bulb positions (world) + warm colour × strength
+    uLamps: { value: Array.from({ length: MAX_LAMPS }, () => new THREE.Vector3()) }, uLampN: { value: 0 }, uLampCol: { value: new THREE.Color(0, 0, 0) },
     uAtlasSize: { value: atlasSize },
     uPpm: { value: opts.ppm || 20 },          // atlas texels per metre (from the paint system, set per draw)
     ...inkUniforms(),                        // wet-ink layer (inkShading.js): paint clock + ripple table
@@ -47,20 +80,44 @@ export function createLevelMaterial(paintTexture, atlasSize, muralTexture = null
       'asphalt', 'metalpanel', 'grate', 'brick', 'rubber', 'glasstile', 'pavers',
       /* 17 planks … 23 render (marina set) */ 'planks', 'hullpaint', 'nonslip', 'gelcoat', 'yard', 'weatherboard', 'render',
       /* 24 treads … 27 gangdeck (stairs + ramps) */ 'treads', 'stonestep', 'rampboard', 'gangdeck',
+      /* 28 … LAST_STAGE_SLOT: stage-owned surfaces (stages/<id>/surfaces.js), concrete where a slot is unused */
+      ...Array.from({ length: LAST_STAGE_SLOT - FIRST_STAGE_SLOT + 1 }, (_, k) => (STAGE_SURFACES.find((s) => s.slot === FIRST_STAGE_SLOT + k) || { name: 'concrete' }).name),
       /* TL_SIDE */ 'concrete'];
     const SIDE = map.length - 1;
     // ramp / asphalt / yard sides → concrete; car-deck edge → hull plating; stair / ramp sides → steel stringer plating,
     // rendered cheek wall, timber skirting, painted steel
     const onWall = { 4: SIDE, 10: SIDE, 21: SIDE, 19: 18, 24: 18, 25: 23, 26: 17, 27: 11 };
     const onTop = { 20: 17 };                                  // gelcoat hulls get a planked deck on top
+    for (const s of STAGE_SURFACES) { if (s.onWall != null) onWall[s.slot] = s.onWall; if (s.onTop != null) onTop[s.slot] = s.onTop; }
     uniforms.tAlbedo = { value: lib.albedo };
     uniforms.tNormal = { value: lib.normal };
     uniforms.tOrm = { value: lib.orm };
     uniforms.uTexSize = { value: lib.stats?.size || 512 };
-    uniforms.uTL = { value: map.map((n) => new THREE.Vector4(L[n] ?? 0, 1 / ((M[n] && M[n].scale) || 4), (M[n] && M[n].mode) ?? 1, (M[n] && M[n].sym) ?? 7)) };
-    uniforms.uTLt = { value: map.map((n, i) => new THREE.Vector4(M[n] && M[n].mask ? 2 : (M[n] && M[n].tint === false ? 0 : 1), n === 'grate' ? 0.6 : 1.0, onWall[i] ?? i, onTop[i] ?? i)) };
-    // stair / ramp slots (meta.stair): top faces are sampled in the ramp's own frame, phase-locked so whole steps fit
-    uniforms.uTLs = { value: map.map((n) => new THREE.Vector4(...((M[n] && M[n].stair) || [0, 0, 0, 0]))) };
+    // The three per-slot tables live in ONE float texture, not three uniform arrays.
+    //
+    // GLSL ES rounds every array element up to a full vec4 uniform slot whatever its type, so `uTL[50] + uTLt[50] +
+    // uTLs[50]` alone cost 150 of a phone's 256 fragment uniform vectors. Add the wake (60), mural (36) and lamp (12)
+    // tables and the level shader went over the limit and FAILED TO LINK on an Adreno 730 — the ground and the sea
+    // simply were not drawn, while a desktop GPU (1024 slots) never showed a symptom. A texture costs one sampler.
+    //
+    // Rows: 0 = uTL (layer, 1/scale, anti-tiling mode, sym), 1 = uTLt (tint mode, grate, onWall, onTop), 2 = uTLs (stair).
+    const tlRows = [
+      map.map((n) => [L[n] ?? 0, 1 / ((M[n] && M[n].scale) || 4), (M[n] && M[n].mode) ?? 1, (M[n] && M[n].sym) ?? 7]),
+      map.map((n, i) => [M[n] && M[n].mask ? 2 : (M[n] && M[n].tint === false ? 0 : 1), n === 'grate' ? 0.6 : 1.0, onWall[i] ?? i, onTop[i] ?? i]),
+      map.map((n) => { const st = (M[n] && M[n].stair) || [0, 0, 0, 0]; return [st[0], st[1], st[2], st[3]]; }),
+    ];
+    const tlData = new Float32Array(map.length * 3 * 4);
+    for (let row = 0; row < 3; row++) {
+      for (let i = 0; i < map.length; i++) {
+        const o = (row * map.length + i) * 4, r = tlRows[row][i];
+        tlData[o] = r[0]; tlData[o + 1] = r[1]; tlData[o + 2] = r[2]; tlData[o + 3] = r[3];
+      }
+    }
+    const tlTex = new THREE.DataTexture(tlData, map.length, 3, THREE.RGBAFormat, THREE.FloatType);
+    tlTex.magFilter = tlTex.minFilter = THREE.NearestFilter;   // exact texel fetch: no interpolation, no mips
+    tlTex.generateMipmaps = false;
+    tlTex.needsUpdate = true;
+    uniforms.uTLTex = { value: tlTex };
     uniforms.uGel.value = L.gel ?? -1;
     mat.defines = { ...(mat.defines || {}), USE_TEXLIB: 1, TL_SLOTS: map.length };
   }
@@ -124,6 +181,9 @@ uniform float uInkGlow;
 uniform sampler2D uMural;
 uniform sampler2D uLight;
 uniform float uAO;
+uniform vec3 uLamps[${MAX_LAMPS}];
+uniform int uLampN;
+uniform vec3 uLampCol;
 uniform vec3 uSeeA;
 uniform vec3 uSeeB;
 uniform float uSeeOn;
@@ -166,9 +226,10 @@ uniform sampler2DArray tAlbedo;
 uniform sampler2DArray tNormal;
 uniform sampler2DArray tOrm;
 uniform float uTexSize;
-uniform vec4 uTL[TL_SLOTS];
-uniform vec4 uTLt[TL_SLOTS];
-uniform vec4 uTLs[TL_SLOTS];
+uniform sampler2D uTLTex;   // the uTL / uTLt / uTLs tables as one float texture (row 0 / 1 / 2) — see createLevelMaterial
+vec4 tlSlot(int i, int row) {
+  return texture2D(uTLTex, vec2((float(i) + 0.5) / float(TL_SLOTS), (float(row) + 0.5) / 3.0));
+}
 ${TEXLIB_GLSL}
 #endif
 uniform vec4 uMurA[12];
@@ -255,12 +316,12 @@ float gWake = 0.0;`)
     int pid = int(pattern + 0.5);
     bool vertical = abs(vWNorm.y) < 0.5;
     // per-slot remaps: ramp / asphalt / yard sides → concrete, car-deck edge → plating, gelcoat tops → planks
-    if (vertical) pid = int(uTLt[pid].z + 0.5); else if (vWNorm.y > 0.5) pid = int(uTLt[pid].w + 0.5);
-    vec4 tl = uTL[pid]; vec4 tt = uTLt[pid];
+    if (vertical) pid = int(tlSlot(pid, 1).z + 0.5); else if (vWNorm.y > 0.5) pid = int(tlSlot(pid, 1).w + 0.5);
+    vec4 tl = tlSlot(pid, 0); vec4 tt = tlSlot(pid, 1);
     // stairs / ramps: sample in the ramp's own frame — u across, v downhill from the top landing — with v phase-locked so
     // a whole number of steps fits the visible flight (the slab runs 0.6 m on under the floor at its low end, level.js)
     vec2 tuv = fu * tl.y;
-    vec4 sp = uTLs[pid];
+    vec4 sp = tlSlot(pid, 2);
     vec2 tA = vec2(1.0, 0.0), tD = vec2(0.0, 1.0);
     if (sp.x > 0.0 && vWNorm.y > 0.5) {
       bool alongU = abs(vFaceTan.y) > 0.02;                                   // x-running ramps: face u runs up/down the slope
@@ -316,23 +377,6 @@ float gWake = 0.0;`)
     base = mix(base, grass, bed);
     rough = mix(rough, 0.95, bed);
     gTexStr *= 1.0 - bed;
-  } else if (pattern > 9.5 && pattern < 10.5 && abs(vWNorm.y) >= 0.5) {
-      vec2 wp = vWPos.xz;
-      float ax = abs(wp.x), az = abs(wp.y);
-      float mw = fwidth(ax) + 1e-4;
-      float dash = step(0.45, fract(az / 3.0));
-      float lane = (1.0 - smoothstep(0.07 - mw, 0.07 + mw, abs(ax - 11.5))) * dash * step(4.0, az);
-      float bay = (1.0 - smoothstep(0.05 - mw, 0.05 + mw, abs(fract((ax - 2.0) / 2.6) - 0.5) * 2.6)) * step(24.5, az) * step(az, 27.0) * step(ax, 8.0);
-      float sx = wp.x * sign(wp.y);
-      vec2 hz = vec2(sx - 4.0, az - 17.0);
-      float inZone = step(abs(hz.x), 2.0) * step(abs(hz.y), 1.0);
-      float hatch = step(0.5, fract((wp.x + wp.y) * 1.25)) * inZone;
-      float border = inZone * (1.0 - step(abs(hz.x), 1.9) * step(abs(hz.y), 0.9));
-      float wear = 0.9 + 0.1 * smoothstep(0.2, 0.5, vnoise(wp * 3.0));
-      float paintM = clamp(lane + hatch * 0.9 + border, 0.0, 1.0) * wear;
-      base = mix(base, vec3(0.95, 0.74, 0.18), paintM);
-      base = mix(base, vec3(0.93, 0.93, 0.9), bay * wear);
-      rough = mix(rough, 0.7, max(paintM, bay));
   }
   // ---- modelled detail (shader-only, no layout change) ----
   {
@@ -523,24 +567,6 @@ float gWake = 0.0;`)
     } else {
       base *= 0.92 + 0.08 * vnoise(fu * 3.0) + 0.04 * (vnoise(fu * 37.0) - 0.5) * (1.0 - smoothstep(0.02, 0.06, length(fwidth(fu))));
       rough = 0.92;
-      // container-yard markings (world space, symmetric under the map's 180° rotation)
-      vec2 wp = vWPos.xz;
-      float ax = abs(wp.x), az = abs(wp.y);
-      float mw = fwidth(ax) + 1e-4;
-      // dashed yellow lane dividers at x = ±11.5
-      float dash = step(0.45, fract(az / 3.0));
-      float lane = (1.0 - smoothstep(0.07 - mw, 0.07 + mw, abs(ax - 11.5))) * dash * step(4.0, az);
-      // white bay lines beside the base containers
-      float bay = (1.0 - smoothstep(0.05 - mw, 0.05 + mw, abs(fract((ax - 2.0) / 2.6) - 0.5) * 2.6)) * step(24.5, az) * step(az, 27.0) * step(ax, 8.0);
-      // hatched safety zone at the foot of each central ramp
-      float sx = wp.x * sign(wp.y);           // 180°-rotation-symmetric x (ramps sit at x=-4,z<0 and x=+4,z>0)
-      vec2 hz = vec2(sx - 4.0, az - 17.0);
-      float inZone = step(abs(hz.x), 2.0) * step(abs(hz.y), 1.0);
-      float hatch = step(0.5, fract((wp.x + wp.y) * 1.25)) * inZone;
-      float border = inZone * (1.0 - step(abs(hz.x), 1.9) * step(abs(hz.y), 0.9));
-      float wear = 0.9 + 0.1 * smoothstep(0.2, 0.5, vnoise(wp * 3.0));
-      base = mix(base, vec3(0.95, 0.74, 0.18), clamp(lane + hatch * 0.9 + border, 0.0, 1.0) * wear);
-      base = mix(base, vec3(0.93, 0.93, 0.9), bay * wear);
     }
   } else if (pattern > 10.5 && pattern < 11.5) {
     // painted steel panels: 1.2 m panels with seams + bolt rows
@@ -687,6 +713,7 @@ ${INK_SLOPE}
   vec3 wn = normalize(nBase - slope.x * T - slope.y * Bt);
   normal = normalize((viewMatrix * vec4(wn, 0.0)).xyz);
 }`)
+      .replace('#include <lights_fragment_begin>', `#include <lights_fragment_begin>${LAMP_LIGHTS}`)
       .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>${INK_SHADE}`)
       .replace('#include <aomap_fragment>', `#include <aomap_fragment>
 if (uAO > 0.0 && vLightUv.x >= 0.0) {
@@ -709,6 +736,6 @@ ${INK_EMISSIVE}`)
     mat.side = THREE.DoubleSide;
     mat.defines = { ...(mat.defines || {}), GRATE: 1 };
   }
-  mat.customProgramCacheKey = () => 'inkwave-level-v5' + (opts.grate ? '-grate' : '');
+  mat.customProgramCacheKey = () => 'inkwave-level-v6' + (opts.grate ? '-grate' : '');
   return mat;
 }

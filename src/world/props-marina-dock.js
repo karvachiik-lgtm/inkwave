@@ -1,4 +1,4 @@
-// Halyard Marina — dock / shore prop pack. Pilings, cleats, fenders, fuel pumps, dock boxes,
+// Halyard Marina — dock / shore prop pack (owner: docks stream). Pilings, cleats, fenders, fuel pumps, dock boxes,
 // clubhouse + quay furniture, boatyard kit, the harbour beacon. Registered into the PropKit by props.js; placements go
 // in DRESSING.halyard (src/world/dressing.js).
 //
@@ -91,7 +91,7 @@ export function registerMarinaDock(D, H) {
         const wx = x + lx * c + lz * s, wz = z - lx * s + lz * c;
         x0 = Math.min(x0, wx); x1 = Math.max(x1, wx); z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
       }
-      B.cols[i] = [x0, b[1] + y, z0, x1, b[4] + y, z1];
+      B.cols[i] = b.length > 6 ? [x0, b[1] + y, z0, x1, b[4] + y, z1, b[6]] : [x0, b[1] + y, z0, x1, b[4] + y, z1];   // keep roof / rail flags
     }
   }
   // local-frame collider helper: centre + size
@@ -577,7 +577,7 @@ export function registerMarinaDock(D, H) {
 
   // ---- pump-out / water service station: open-fronted shelter (1.6 wide × 1.8 deep local, 2.2 tall), front +Z
   D.pumpout = {
-    desc: 'Marina service station (collider 1.6 × 2.2 × 1.8 local, front +Z): timber-clad shelter with a mono-pitch roof and PUMP OUT fascia letters, yellow vacuum pump-out unit with gauge and buttons, suction hose on a reel, blue potable-water standpipe with brass taps and a coiled hose, notice + lamp.',
+    desc: 'Marina service station (collider 1.6 × 2.2 × 1.8 local, front +Z; back 1.25 solid, open front 0.55 behind the barrier = rail): timber-clad shelter with a mono-pitch roof and PUMP OUT fascia letters, yellow vacuum pump-out unit with gauge and buttons, suction hose on a reel, blue potable-water standpipe with brass taps and a coiled hose, notice + lamp.',
     params: {}, variants: 1, mount: 'ground',
     build(B, o) {
       const W = 1.6, Dd = 1.8, clad = mixc(K.cladding, K.white, 0.25), trim = K.white, pumpC = '#d8b04f';
@@ -630,7 +630,7 @@ export function registerMarinaDock(D, H) {
       for (let i = 0; i < 3; i++) B.tor('rubber', '#5a8fc9', 0.17 - (i % 2) * 0.012, 0.017, 0.0, 0.34 + i * 0.02, 0.2, { rx: HP * 0.25, rs: 4, ts: 12 });
       B.box('metal', K.galvDk, 0.05, 0.05, 0.14, 0, 0.44, 0.1, { r: 0.012 });
       B.pop();
-      // front barrier: posts + rails + a chain gate (the whole footprint is solid)
+      // front barrier: posts + rails + a chain gate (the open front half is a rail collider, the back half solid)
       for (const x of [-W / 2 + 0.05, -0.05, W / 2 - 0.05]) B.box('metal', K.fuelYel, 0.07, 1.05, 0.07, x, 0.62, Dd / 2 - 0.05, { r: 0.02 });
       for (const yy of [0.62, 1.1]) B.cyl('metal', K.fuelYel, 0.022, W / 2 - 0.1, -W / 4 - 0.02, yy, Dd / 2 - 0.05, { rz: HP, seg: 6 });
       B.tube('metal', K.galvDk, arcPts(0.37, 1.02, Dd / 2 - 0.05, 0.37, PI, TAU, 8).map((p, i, a) => P3(p[0], 1.02 - Math.sin((i / (a.length - 1)) * PI) * 0.12, p[2])), 0.01, { radial: 3 });
@@ -638,7 +638,8 @@ export function registerMarinaDock(D, H) {
       // notice on the back wall
       B.box('paint', K.white, 0.36, 0.5, 0.01, 0.25, 1.55, -Dd / 2 + 0.08, { r: 0.01 });
       B.decal('pst9', 0.32, 0.46, 0.25, 1.55, -Dd / 2 + 0.086);
-      B.col(-W / 2, 0, -Dd / 2, W / 2, 2.2, Dd / 2);
+      B.col(-W / 2, 0, -Dd / 2, W / 2, 2.2, 0.35);                     // walls, pump-out unit, standpipe: solid cover
+      B.col(-W / 2, 0, 0.35, W / 2, 2.2, Dd / 2, { rail: true });       // open front behind the barrier rail + chain gate
     },
   };
 
@@ -1108,9 +1109,9 @@ export function registerMarinaDock(D, H) {
       B.pop();
       for (const sx of [-1, 1]) { B.push(sx * 24.02, 0, (FZ + BZ) / 2, sx * HP); for (const x of [-1.5, 1.5]) windowUnit(B, x, 5.3, 1.0, 1.4, { frame: trim, mull: 1, sill: false, ns: true }); B.pop(); }
       // colliders: upper storey + pavilion + cupola/mast (camera-safe, all behind the wall face)
-      B.col(-24.3, WT, BZ - 0.3, 24.3, EW + 1.75, FZ);
-      B.col(-PW, EW, BZ - 0.2, PW, PE + PR, FZ);
-      B.col(-1.0, PE + PR - 0.3, cz - 1.0, 1.0, CY + 3.2, cz + 1.0);
+      B.col(-24.3, WT, BZ - 0.3, 24.3, EW + 1.75, FZ, { roof: true });   // roofs: off limits (slide off)
+      B.col(-PW, EW, BZ - 0.2, PW, PE + PR, FZ, { roof: true });
+      B.col(-1.0, PE + PR - 0.3, cz - 1.0, 1.0, CY + 3.2, cz + 1.0, { roof: true });
     },
   };
 
@@ -1546,7 +1547,7 @@ export function registerMarinaDock(D, H) {
 
   // ---- aluminium mobile scaffold tower (1.3 × 1.1): castors, frames, braces, timber platform, guard rails, tins
   D.scaffold = {
-    desc: 'Mobile aluminium scaffold tower (1.3 × 1.1 × 4.2): castor wheels, ladder-frame ends, diagonal braces, timber-boarded platform at 3.2 m with toe boards and double guard rails, paint tin + roller tray up top. Collides as a solid block (too tall to climb onto).',
+    desc: 'Mobile aluminium scaffold tower (1.3 × 1.1 × 4.2): castor wheels, ladder-frame ends, diagonal braces, timber-boarded platform at 3.2 m with toe boards and double guard rails, paint tin + roller tray up top. Collides as a rail block (see-through frame: kids blocked, shots / ink / squids pass, nobody perches).',
     params: {}, variants: 1, mount: 'ground',
     build(B, o) {
       const W = 1.3, Dd = 1.1, Hp = 3.2, Ht = 4.2, c = '#c3cad0';
@@ -1566,7 +1567,7 @@ export function registerMarinaDock(D, H) {
       B.lathe('gloss', K.white, [[0, 0], [0.09, 0], [0.09, 0.16], [0, 0.16]], 0.35, Hp + 0.04, 0.25, { seg: 10 });
       B.cyl('metal', K.galvDk, 0.092, 0.012, 0.35, Hp + 0.205, 0.25, { seg: 10 });
       pbox(B, 'paint', '#2f5f9e', 0.28, 0.04, 0.34, -0.3, Hp + 0.06, -0.2);
-      B.col(-W / 2, 0, -Dd / 2, W / 2, Ht, Dd / 2);
+      B.col(-W / 2, 0, -Dd / 2, W / 2, Ht, Dd / 2, { rail: true });   // open frame: kids blocked, shots / ink / squids pass
     },
   };
 
@@ -1673,8 +1674,8 @@ export function registerMarinaDock(D, H) {
       // railing colliders hug the very edge (≥ 0.04 outboard of the level's face-visibility samples, so the block's top
       // face is never culled and the baked lightmap stays valid)
       const e0 = S / 2 - 0.04, e1 = S / 2 + 0.02;
-      B.col(-e1, top, e0, e1, top + 1.05, e1); B.col(-e1, top, -e1, e1, top + 1.05, -e0);
-      B.col(e0, top, -e1, e1, top + 1.05, e1); B.col(-e1, top, -e1, -e0, top + 1.05, e1);
+      B.col(-e1, top, e0, e1, top + 1.05, e1, { rail: true }); B.col(-e1, top, -e1, e1, top + 1.05, -e0, { rail: true });   // gallery rails
+      B.col(e0, top, -e1, e1, top + 1.05, e1, { rail: true }); B.col(-e1, top, -e1, -e0, top + 1.05, e1, { rail: true });
     },
   };
 
@@ -1753,15 +1754,27 @@ export function registerMarinaDock(D, H) {
     },
   };
 
-  // ================================================================================================ ramps (non-colliding)
+  // ================================================================================================ ramps
   // All three dress level ramps whose top surface runs along local +Z from (0, 0, 0) to (0, rise, run); everything sits
-  // outside the walking width (|x| ≥ width / 2) and nothing collides.
+  // outside the walking width (|x| ≥ width / 2). The handrails carry `rail` colliders (kids can't walk through or off the
+  // side, shots / ink / squids pass); the masonry newels are solid.
   const slopeY = (rise, run, t) => (rise * t) / run;
+  // Rail colliders along a sloped handrail: local x0…x1 (keep ≥ 0.045 outboard of the ramp's side face so the level's
+  // face / bevel samples never land inside them), from z = za to zb in `n` stepped boxes; each box starts 0.06 above the
+  // slope at its low end (clear of the deck samples) and reaches `top` above the slope at its high end. bot: fixed bottom
+  // instead (a full-depth fence beside a solid stair side, so no nav node / edge survives across it).
+  function slopeRail(B, x0, x1, za, zb, rise, run, top, n, bot) {
+    for (let i = 0; i < n; i++) {
+      const s0 = za + ((zb - za) * i) / n, s1 = za + ((zb - za) * (i + 1)) / n;
+      const y0 = bot ?? Math.max(0, slopeY(rise, run, Math.min(s0, s1))) + 0.06, y1 = slopeY(rise, run, Math.max(s0, s1)) + top;
+      B.col(x0, y0, Math.min(s0, s1), x1, y1, Math.max(s0, s1), { rail: true });
+    }
+  }
   // ---- marina gangway: aluminium side trusses (bottom chord / kick plate, stanchions, sloped top + mid rail, N-bracing),
   //      hinge brackets + pins at the pier end, landing rollers at the far end. Same alloy language as the vessels pack.
   D.gangwayrails = {
-    desc: 'Marina gangway dressing for a thin level ramp (local +Z from (0,0,0) up to (0,rise,run), width W centred): aluminium side trusses outside the walking width — bottom chord doubling as kick plate, stanchions, sloped top rail + mid rail, N-bracing — hinge brackets with pins at the pier end, landing rollers on forks at the far end. Non-colliding.',
-    params: { run: 'm (3.85)', rise: 'm (1.3)', width: 'm (3.4)', thick: 'plank thickness (0.22)', posts: 'stanchions per side (5)' }, variants: 1, mount: 'ground',
+    desc: 'Marina gangway dressing for a thin level ramp (local +Z from (0,0,0) up to (0,rise,run), width W centred): aluminium side trusses outside the walking width — bottom chord doubling as kick plate, stanchions, sloped top rail + mid rail, N-bracing — hinge brackets with pins at the pier end, landing rollers on forks at the far end. Rail colliders along both trusses (the walkway stays open end to end).',
+    params: { run: 'm (3.85)', rise: 'm (1.3)', width: 'm (3.4)', thick: 'plank thickness (0.22)', posts: 'stanchions per side (5)', land0: 'low deck edge along the run (0.2)', land1: 'high deck edge along the run (run - 0.05)' }, variants: 1, mount: 'ground',
     build(B, o) {
       B.aoBase = null;
       const run = o.run ?? 3.85, rise = o.rise ?? 1.3, W = o.width ?? 3.4, th = o.thick ?? 0.22, n = Math.max(2, o.posts ?? 5);
@@ -1805,13 +1818,21 @@ export function registerMarinaDock(D, H) {
         B.cyl('rubber', '#26282d', 0.07, 0.07, x, yr, zr, { rz: HP, seg: 10 });
         B.cyl('metal', aluLt, 0.03, 0.09, x, yr, zr, { rz: HP, seg: 6 });
       }
+      // rail colliders along both trusses (never across the walkway). They stop 0.25 m short of the deck edge at each end:
+      // no rail end pokes onto a deck (bots walking along the pier edge), and a kid (r 0.38) still can't squeeze past the
+      // end over the water — past it you are already standing on the deck. They reach 0.5 m out over the water so a kid
+      // whose feet still hold the walkway edge (squid surfacing on the lip) is inboard of the box centre and gets pushed
+      // back onto the walkway, never off it.
+      const la = (o.land0 ?? 0.2) + 0.25, lb = (o.land1 ?? run - 0.05) - 0.25, nR = Math.max(1, Math.ceil((lb - la) / 1.3));
+      slopeRail(B, W / 2 + 0.045, W / 2 + 0.5, la, lb, rise, run, HR + 0.03, nR);
+      slopeRail(B, -W / 2 - 0.5, -W / 2 - 0.045, la, lb, rise, run, HR + 0.03, nR);
     },
   };
 
   // ---- grand stair balustrade: render cheek stringers with stone coping along both sides, navy steel stanchions,
   //      varnished teak handrail + two rod rails, newel pillars at the foot (with lanterns) and at the terrace (finials)
   D.grandstair = {
-    desc: 'Grand-stair dressing (local +Z from the foot (0,0,0) up to (0,rise,run), width W centred): render cheek stringers + stone coping outside the walking width covering the upper band of the ramp sides, navy stanchions with a varnished teak handrail and two rod rails, square newel pillars with lanterns at the foot and ball finials at the top. Non-colliding.',
+    desc: 'Grand-stair dressing (local +Z from the foot (0,0,0) up to (0,rise,run), width W centred): render cheek stringers + stone coping outside the walking width covering the upper band of the ramp sides, navy stanchions with a varnished teak handrail and two rod rails, square newel pillars with lanterns at the foot and ball finials at the top. Balustrade = rail colliders, newels = solid (off-limits tops).',
     params: { run: 'm (6.1)', rise: 'm (2.4)', width: 'm (6)' }, variants: 1, mount: 'ground',
     build(B, o) {
       B.aoBase = null;
@@ -1852,6 +1873,13 @@ export function registerMarinaDock(D, H) {
         };
         newel(-0.02, 0, 1.0, true);
         newel(run + 0.14, rise, 0.95, false);
+        // colliders: see-through balustrade between the newels = rail; the render newels are solid (nobody perches)
+        // (full depth down to the quay beside the solid stair side: no quay nav node survives next to it, so bots never
+        //  plan a drop off the stair through the balustrade; ends 6 cm short of the terrace front so its lip keeps its bevel)
+        const a = sx * (W / 2 + 0.045), b = sx * (W / 2 + 0.2), n0 = sx * (W / 2 + 0.045), n1 = sx * (W / 2 + 0.28);
+        slopeRail(B, Math.min(a, b), Math.max(a, b), 0.12, run - 0.06, rise, run, HR + 0.08, 4, 0.06);
+        B.col(Math.min(n0, n1), 0, -0.16, Math.max(n0, n1), 1.08, 0.12, { roof: true });
+        B.col(Math.min(n0, n1), rise, run, Math.max(n0, n1), rise + 1.03, run + 0.28, { roof: true });
       }
     },
   };

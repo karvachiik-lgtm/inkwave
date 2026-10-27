@@ -7,8 +7,20 @@ const W = 344, H = 160;
 function expand(layout) {
   const mirror = (d) => d.kind === 'box'
     ? { ...d, min: [-d.max[0], d.min[1], -d.max[2]], max: [-d.min[0], d.max[1], -d.min[2]] }
+    : d.kind === 'obox' ? { ...d, center: [-d.center[0], d.center[1], -d.center[2]], oct: d.oct && [-d.oct[0], -d.oct[1], d.oct[2]] }
     : { ...d, low: [-d.low[0], d.low[1], -d.low[2]], high: [-d.high[0], d.high[1], -d.high[2]] };
-  return [...layout.single, ...layout.half, ...layout.half.map(mirror)];
+  // (rails are collision-only railings: nothing to draw)
+  const all = [...layout.single, ...layout.half, ...layout.half.map((d) => (d.oct && d.kind === 'box' ? { ...mirror(d), oct: [-d.oct[0], -d.oct[1], d.oct[2]] } : mirror(d)))].filter((d) => !d.rail);
+  // octagon platforms (maps.js OCT) are drawn as one octagon instead of their plus + corner-slab parts
+  const out = [], seen = new Set();
+  for (const d of all) {
+    if (!d.oct) { out.push(d); continue; }
+    const key = d.oct.map((v) => v.toFixed(2)).join(',') + ':' + (d.kind === 'box' ? d.max[1] : d.center[1] + d.size[1] / 2).toFixed(1);
+    if (seen.has(key) || d.kind !== 'box') continue;
+    seen.add(key);
+    out.push({ ...d, kind: 'octagon', top: d.max[1] });
+  }
+  return out;
 }
 
 export function layoutThumbSVG(layout, theme = 'day', teams = ['#18c7e8', '#ff4a5a']) {
@@ -28,7 +40,24 @@ export function layoutThumbSVG(layout, theme = 'day', teams = ['#18c7e8', '#ff4a
   for (let i = 0; i < 6; i++) { const y = 14 + i * 26, x = (i * 53) % 300; parts.push(`<path d="M${x} ${y} q8 -5 16 0 t16 0" stroke="#fff" stroke-opacity=".35" stroke-width="2.4" fill="none" stroke-linecap="round"/>`); }
   const blocks = expand(layout).map((d) => {
     if (d.kind === 'box') return { x0: d.min[0], x1: d.max[0], z0: d.min[2], z1: d.max[2], top: d.max[1], d };
+    if (d.kind === 'octagon') {
+      const [cx, cz, R] = d.oct;
+      const poly = Array.from({ length: 8 }, (_, i) => { const a = Math.PI / 8 + (i * Math.PI) / 4; return [cx + R * Math.cos(a), cz + R * Math.sin(a)]; });
+      return { poly, top: d.top, d };
+    }
+    if (d.kind === 'obox') {
+      // rotated footprint → polygon (x, z corners)
+      const a = (d.rotY * Math.PI) / 180, c = Math.cos(a), sn = Math.sin(a), hx = d.size[0] / 2, hz = d.size[2] / 2;
+      const poly = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([i, k]) => [d.center[0] + c * hx * i + sn * hz * k, d.center[2] - sn * hx * i + c * hz * k]);
+      return { poly, top: d.center[1] + d.size[1] / 2, d };
+    }
     const dx = d.high[0] - d.low[0], dz = d.high[2] - d.low[2];
+    if (Math.abs(dx) > 1e-3 && Math.abs(dz) > 1e-3) {
+      // a ramp running at an angle: its own quad (the along/across box below only fits axis-aligned ramps)
+      const l = Math.hypot(dx, dz), px = (-dz / l) * (d.width / 2), pz = (dx / l) * (d.width / 2);
+      const poly = [[d.low[0] + px, d.low[2] + pz], [d.high[0] + px, d.high[2] + pz], [d.high[0] - px, d.high[2] - pz], [d.low[0] - px, d.low[2] - pz]];
+      return { poly, top: d.high[1], ramp: true, d };
+    }
     const along = Math.abs(dz) > Math.abs(dx);
     const hw = d.width / 2;
     return along
@@ -36,8 +65,17 @@ export function layoutThumbSVG(layout, theme = 'day', teams = ['#18c7e8', '#ff4a
       : { x0: Math.min(d.low[0], d.high[0]), x1: Math.max(d.low[0], d.high[0]), z0: d.low[2] - hw, z1: d.low[2] + hw, top: d.high[1], ramp: true, d };
   }).sort((a, b) => a.top - b.top);
   for (const b of blocks) {
-    const x = X(b.z0), y = Y(b.x1), w = (b.z1 - b.z0) * s, h = (b.x1 - b.x0) * s;
     const top = b.top;
+    if (b.poly) {
+      const pts = (dx, dy) => b.poly.map(([px, pz]) => `${(X(pz) + dx).toFixed(1)},${(Y(px) + dy).toFixed(1)}`).join(' ');
+      if (top > 0.2 && !b.ramp && !b.d.grate) parts.push(`<polygon points="${pts(1.2 + top * 0.35, 1.2 + top * 0.45)}" fill="#1b2a44" opacity=".28"/>`);
+      const k = Math.min(1, Math.max(0, top) / 5);
+      const tint = b.d.pattern === 5 && b.d.color ? b.d.color : null;   // containers keep their colour
+      const fill = tint || (b.d.grate ? `url(#tgr${layout.id})` : b.ramp ? `url(#tst${layout.id})` : top <= 0.05 ? (sunset ? '#f1cfae' : golden ? '#f4e6cf' : '#f3ecdd') : mix(sunset ? '#e8bf99' : golden ? '#ead6b6' : '#e7dcc6', sunset ? '#fbe6d0' : golden ? '#fff8ec' : '#ffffff', k));
+      parts.push(`<polygon points="${pts(0, 0)}" fill="${fill}" stroke="#2a3552" stroke-opacity="${top > 0.05 ? 0.35 : 0.15}" stroke-width="1" stroke-linejoin="round"/>`);
+      continue;
+    }
+    const x = X(b.z0), y = Y(b.x1), w = (b.z1 - b.z0) * s, h = (b.x1 - b.x0) * s;
     if (top > 0.2 && !b.ramp && !b.d.grate) parts.push(`<rect x="${(x + 1.2 + top * 0.35).toFixed(1)}" y="${(y + 1.2 + top * 0.45).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="1.2" fill="#1b2a44" opacity=".28"/>`);
     let fill;
     if (b.d.grate) fill = `url(#tgr${layout.id})`;

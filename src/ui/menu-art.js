@@ -1,5 +1,6 @@
-// INKWAVE UI — menu art + helpers (menus stream).
+// INKWAVE UI — menu art + helpers.
 //   computeAwards(players, { win, percents }) → { byPlayer: [[award…]…], match: [tag…] }
+//   computeBossAwards(players) → same shape for Boss Battle (damage, weak hits, crablets, survival)
 //   awardIcon(id) · medalMarkup(award) · awardBadge(award) · rankEmblem(tier) · RANK_TIERS
 //   inkBurst(parent, { x, y, color, count, dist, size, splat, ring })     — DOM ink splash (auto-removes)
 //   InkWipe(host, { isFrozen })  .run({ a, b, mode:'full'|'light'|'fade', dir, onMid, onDone })
@@ -7,7 +8,7 @@
 import {
   h, clamp, lerp, easeInOutCubic, easeOutBack, easeOutCubic, rng, splatShape, splatSVG, shade, fmtInt, safeCall,
 } from './ui-util.js';
-import { SQUID, GLYPHS, WEAPON_ICONS, SPLAT_ICON, SPECIAL_ICONS, mouseGlyph, padGlyph, keycap } from './ui-icons.js';
+import { SQUID, SQUID_PATH, GLYPHS, WEAPON_ICONS, SPLAT_ICON, SPECIAL_ICONS, mouseGlyph, padGlyph, keycap } from './ui-icons.js';
 
 const K = '#15121c';
 const TAU = Math.PI * 2;
@@ -42,6 +43,15 @@ export const AWARD_ICONS = {
     <path class="iw-ico-cut" d="M32 36 L32 23 M32 36 L40.5 41" fill="none" stroke-width="4.6" stroke-linecap="round"/>`),
   wave: svg(`<path d="M4 50 Q10 22 34 14 Q52 9 59 22 Q48 18 42 24 Q37 30 43 36 Q49 41 58 38 Q55 52 36 56 Q18 59 4 50 Z" fill="currentColor"/>
     <path class="iw-ico-cut" d="M14 44 Q22 34 32 30" fill="none" stroke-width="3.4" stroke-linecap="round"/>`),
+  // boss mode
+  crit: svg(`<circle cx="32" cy="32" r="17" fill="none" stroke="currentColor" stroke-width="7"/>
+    <path d="M32 3 V17 M32 47 V61 M3 32 H17 M47 32 H61" stroke="currentColor" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="32" cy="32" r="6.5" fill="currentColor"/><circle class="iw-ico-cut" cx="29.5" cy="29.5" r="2.2" stroke="none"/>`),
+  pow: svg(`<path d="M32.0 4.0 L36.2 18.6 L47.7 8.6 L45.6 21.2 L58.4 21.0 L46.8 30.9 L60.7 37.1 L48.4 40.5 L53.9 52.0 L40.1 45.6 L40.2 60.8 L32.0 51.0 L23.8 60.8 L23.9 45.6 L10.1 52.0 L15.6 40.5 L3.3 37.1 L17.2 30.9 L5.6 21.0 L18.4 21.2 L16.3 8.6 L27.8 18.6 Z" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"/>
+    <path class="iw-ico-cut" d="M26 24 L33 32 L28 36 L37 44" fill="none" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>`),
+  anchor: svg(`<circle cx="32" cy="11" r="6" fill="none" stroke="currentColor" stroke-width="5.5"/>
+    <path d="M32 17 V56 M20 26 H44" stroke="currentColor" stroke-width="6.5" stroke-linecap="round"/>
+    <path d="M8 36 Q10 54 32 57 Q54 54 56 36 L48 42 M8 36 L16 42" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>`),
 };
 export const awardIcon = (id) => AWARD_ICONS[id] || AWARD_ICONS.star;
 
@@ -56,6 +66,44 @@ export const AWARDS = {
   pure: { label: 'PURE PAINTER', metal: 'bronze', icon: 'brush', desc: 'Top-3 turf without splatting anyone' },
 };
 const AWARD_ORDER = ['mvp', 'turf', 'splats', 'inker', 'untouchable', 'survivor', 'pure'];
+// boss mode (co-op: one squad, no team split — the MVP is given win or lose)
+export const BOSS_AWARDS = {
+  mvp: { label: 'MVP', metal: 'gold', icon: 'star', desc: 'Best all-round score against HULLBREAKER' },
+  heavy: { label: 'HEAVY HITTER', metal: 'gold', icon: 'pow', desc: 'Dealt the most damage to the boss' },
+  crit: { label: 'SHELL CRACKER', metal: 'silver', icon: 'crit', desc: 'Most weak-point hits' },
+  brood: { label: 'BROOD BUSTER', metal: 'silver', icon: 'splat', desc: 'Popped the most crablets' },
+  unsinkable: { label: 'UNSINKABLE', metal: 'bronze', icon: 'anchor', desc: 'Never got splatted' },
+  survivor: { label: 'SURVIVOR', metal: 'bronze', icon: 'buoy', desc: 'Splatted the fewest times' },
+  cleaner: { label: 'CLEANUP CREW', metal: 'bronze', icon: 'roller', desc: 'Painted over the most boss ink' },
+};
+const BOSS_ORDER = ['mvp', 'heavy', 'crit', 'brood', 'unsinkable', 'survivor', 'cleaner'];
+/** Boss-mode awards from the final stats: players [{ damage, weakHits, splats, deaths, turf, isSelf }]. */
+export function computeBossAwards(players = []) {
+  const P = players.map((p, i) => ({ i, dmg: Math.max(0, +p.damage || 0), weak: Math.max(0, +p.weakHits || 0), splats: Math.max(0, +p.splats || 0), deaths: Math.max(0, +p.deaths || 0), turf: Math.max(0, +p.turf || 0) }));
+  const by = P.map(() => []);
+  const give = (p, id, value) => { if (!by[p.i].some((a) => a.id === id)) by[p.i].push({ id, ...BOSS_AWARDS[id], value }); };
+  const maxOf = (k) => (P.length ? Math.max(...P.map((p) => p[k])) : 0);
+  if (P.length) {
+    const md = maxOf('dmg'), mw = maxOf('weak'), ms = maxOf('splats'), mt = maxOf('turf'), mD = Math.max(1, maxOf('deaths'));
+    if (md > 0) P.filter((p) => p.dmg === md).forEach((p) => give(p, 'heavy', `${fmtInt(p.dmg)} damage`));
+    if (mw >= 3) P.filter((p) => p.weak === mw).forEach((p) => give(p, 'crit', `${mw} weak-point hits`));
+    if (ms >= 2) P.filter((p) => p.splats === ms).forEach((p) => give(p, 'brood', `${ms} crablets`));
+    if (mt > 0) P.filter((p) => p.turf === mt).forEach((p) => give(p, 'cleaner', `${fmtInt(p.turf)}p inked`));
+    const active = P.filter((p) => p.dmg > 0 || p.turf >= 30);
+    const zero = active.filter((p) => p.deaths === 0);
+    if (zero.length && zero.length <= 3) zero.forEach((p) => give(p, 'unsinkable', 'Never splatted'));
+    else if (!zero.length && active.length) {
+      const m = Math.min(...active.map((p) => p.deaths));
+      const s = active.filter((p) => p.deaths === m);
+      if (s.length === 1) give(s[0], 'survivor', `Splatted ${m}×`);
+    }
+    const score = (p) => p.dmg / Math.max(1, md) + 0.35 * (p.weak / Math.max(1, mw)) + 0.2 * (p.splats / Math.max(1, ms)) + 0.15 * (p.turf / Math.max(1, mt)) - 0.25 * (p.deaths / mD);
+    const cand = P.filter((p) => p.dmg > 0 || p.turf > 0);
+    if (cand.length) give(cand.reduce((b, p) => (score(p) > score(b) + 1e-9 ? p : b)), 'mvp', 'Top all-round score');
+    for (const list of by) list.sort((x, y) => BOSS_ORDER.indexOf(x.id) - BOSS_ORDER.indexOf(y.id));
+  }
+  return { byPlayer: by, match: [] };
+}
 export const MATCH_TAGS = {
   close: { id: 'close', label: 'PHOTO FINISH', icon: 'stopwatch' },
   landslide: { id: 'landslide', label: 'LANDSLIDE', icon: 'wave' },
@@ -939,6 +987,62 @@ export function outfitIcon(o = {}) {
     <rect x="18" y="51" width="6" height="4" fill="${sock}" ${ol} stroke-width="2"/><rect x="32" y="51" width="6" height="4" fill="${sock}" ${ol} stroke-width="2"/>
     <path d="M12 55 Q12 52 16 52 L24.5 52 L25 59 L12 59 Z" fill="${shoe}" ${ol}/><path d="M31 52 L40 52 Q44 52 44 55 L44 59 L31 59 Z" fill="${shoe}" ${ol}/>
     <path d="M11.5 59 L25.5 59 M30.5 59 L44.5 59" stroke="${sole}" stroke-width="3" stroke-linecap="round"/></svg>`;
+}
+
+// ================================================================================== online: splashtags, ink band, drips
+// Splashtag banner art: one of seven illustrated patterns in the owner's team ink (classes .iw-tf0..3 read --tc,
+// --tc-dark, --tc-light, --tc-deep off the tag, so a team change recolours it without rebuilding). 240×64, sliced.
+export const TAG_KINDS = 7;
+export function tagArt(seed = 1) {
+  const R = rng((seed >>> 0) * 16807 + 11);
+  const kind = (seed >>> 0) % TAG_KINDS;
+  const sq = (x, y, s, r, cls) => `<path class="${cls}" transform="translate(${f1(x)} ${f1(y)}) rotate(${f1(r)}) scale(${f1(s * 100) / 100}) translate(-32 -32)" d="${SQUID_PATH}"/>`;
+  let b = '';
+  if (kind === 0) {        // splats
+    const s1 = splatShape(196, 38, 30, { seed: 3 + (seed % 97), arms: 9, drops: 5, armLen: 0.5 });
+    const s2 = splatShape(34, 2, 20, { seed: 7 + (seed % 89), arms: 8, drops: 3 });
+    b = `<rect class="iw-tf0" width="240" height="64"/><path class="iw-tf2" d="${s2.core}"/>${s2.drops.map((d) => `<circle class="iw-tf2" cx="${d.x}" cy="${d.y}" r="${d.r}"/>`).join('')}
+      <path class="iw-tf1" d="${s1.core}"/>${s1.drops.map((d) => `<circle class="iw-tf1" cx="${d.x}" cy="${d.y}" r="${d.r}"/>`).join('')}`;
+  } else if (kind === 1) { // diagonal bands
+    for (let x = -70; x < 280; x += 34) b += `<path class="iw-tf1" d="M${x} 0 L${x + 17} 0 L${x - 13} 64 L${x - 30} 64 Z"/>`;
+    b = `<rect class="iw-tf0" width="240" height="64"/>${b}<rect class="iw-tf2" y="52" width="240" height="4" opacity=".7"/>`;
+  } else if (kind === 2) { // waves
+    const wave = (y0, a, ph) => { let d = `M0 64 L0 ${y0}`; for (let x = 0; x <= 240; x += 20) d += ` Q${x + 10} ${f1(y0 + Math.sin(x * 0.05 + ph) * a - a)} ${x + 20} ${f1(y0 + Math.sin((x + 20) * 0.05 + ph) * a)}`; return d + ' L240 64 Z'; };
+    b = `<rect class="iw-tf2" width="240" height="64"/><path class="iw-tf0" d="${wave(22, 6, R() * 6)}"/><path class="iw-tf1" d="${wave(44, 5, R() * 6)}"/>`;
+  } else if (kind === 3) { // sunburst
+    const cx = 170 + R() * 40, cy = 64;
+    for (let i = 0; i < 16; i += 2) { const a0 = Math.PI + (i / 16) * Math.PI, a1 = Math.PI + ((i + 1) / 16) * Math.PI; b += `<path class="iw-tf2" d="M${f1(cx)} ${cy} L${f1(cx + Math.cos(a0) * 320)} ${f1(cy + Math.sin(a0) * 320)} L${f1(cx + Math.cos(a1) * 320)} ${f1(cy + Math.sin(a1) * 320)} Z" opacity=".55"/>`; }
+    b = `<rect class="iw-tf0" width="240" height="64"/>${b}<circle class="iw-tf1" cx="${f1(cx)}" cy="${cy}" r="16"/>`;
+  } else if (kind === 4) { // squid school
+    for (let i = 0; i < 9; i++) b += sq(14 + i * 27 + R() * 8, 10 + (i % 2) * 34 + R() * 10, 0.36 + R() * 0.12, -30 + R() * 60, i % 3 ? 'iw-tf0' : 'iw-tf2');
+    b = `<rect class="iw-tf1" width="240" height="64"/>${b}`;
+  } else if (kind === 5) { // zigzag
+    const zig = (y, a, n) => { let d = `M0 ${y}`; for (let i = 0; i <= n; i++) d += ` L${f1((i + 0.5) * (240 / n))} ${y + (i % 2 ? -a : a)}`; return d; };
+    b = `<rect class="iw-tf0" width="240" height="64"/><path class="iw-tf1" d="${zig(40, 8, 12)} L240 64 L0 64 Z"/><path d="${zig(22, 5, 16)}" fill="none" stroke="var(--tc-light)" stroke-width="5" stroke-linejoin="round"/>`;
+  } else {                 // halftone swell
+    for (let x = 0; x < 16; x++) for (let y = 0; y < 5; y++) { const r = 1 + (x / 15) * 6.2; b += `<circle class="iw-tf1" cx="${x * 16 + (y % 2) * 8}" cy="${y * 16}" r="${f1(r)}"/>`; }
+    b = `<rect class="iw-tf0" width="240" height="64"/>${b}`;
+  }
+  return `<svg viewBox="0 0 240 64" preserveAspectRatio="xMidYMid slice" aria-hidden="true">${b}</svg>`;
+}
+
+/** The lobby's bottom ink band: solid ink with a gooey, bulging top edge (1600×150 box, stretched to the screen). */
+export function inkBand(seed = 5) {
+  const R = rng(seed * 131 + 7);
+  let d = 'M0 150 L0 34';
+  let x = 0, y = 34;
+  while (x < 1600) {
+    const w = 70 + R() * 90, nx = Math.min(1600, x + w), ny = 26 + R() * 22, bump = R() < 0.3 ? 16 + R() * 16 : 4 + R() * 6;
+    d += ` C${f1(x + w * 0.3)} ${f1(y - bump)} ${f1(nx - w * 0.3)} ${f1(ny - bump)} ${f1(nx)} ${f1(ny)}`;
+    x = nx; y = ny;
+  }
+  return `<svg viewBox="0 0 1600 150" preserveAspectRatio="none" aria-hidden="true"><path d="${d} L1600 150 Z"/></svg>`;
+}
+
+/** Drips hanging off a sticker's bottom edge (400×60 box, stretched along the edge). spec: [[x, length 0.6..1.8], …]. */
+export function dripsSVG(spec, cls = 'iw-fa') {
+  return `<svg viewBox="0 0 400 60" preserveAspectRatio="none" aria-hidden="true">${spec.map(([x, k], i) =>
+    `<g class="iw-sdrip" style="--d:${i}"><path class="${cls}" d="M${x - 7} -2 L${x + 7} -2 L${x + 5} ${f1(22 * k)} Q${x} ${f1(32 * k)} ${x - 5} ${f1(22 * k)} Z"/></g>`).join('')}</svg>`;
 }
 
 // small re-exports used by menus.js

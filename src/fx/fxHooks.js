@@ -1,4 +1,4 @@
-// INKWAVE — gameplay → VFX glue. main.js calls `initFxHooks(G)` once at boot and `hooks.update(dt)` every
+// INKWAVE — gameplay → VFX glue (Stream 5). main.js calls `initFxHooks(G)` once at boot and `hooks.update(dt)` every
 // unpaused frame. Discrete moments come from the event bus (docs/EVENTS.md); continuous effects poll actor / projectile
 // state. Every event has a state-polling fallback that switches itself off the first time the real event is seen, so
 // the effects work whether or not a given event is emitted yet. The recipes themselves live in fx.js.
@@ -50,7 +50,7 @@ class FxHooks {
       G.fx.onSpeck = (p, n, col, size) => {
         const P = this.G.paint, t = this._teamOf(col);
         if (!P || t < 0 || size < 0.014) return;
-        P.speck(this._sp.copy(p).addScaledVector(n, 0.04), Math.min(0.11, size * 1.7), t);
+        P.speck?.(this._sp.copy(p).addScaledVector(n, 0.04), Math.min(0.11, size * 1.7), t);
       };
       G.fx.onRipple = (p, amp, wl, speed, life) => this.G.paint?.ripple?.(p, amp, wl, speed, life);
     }
@@ -241,7 +241,7 @@ class FxHooks {
     const dir = e.dir || a.aimDir;
     if (kind === 'blaster') this.fx.muzzle?.(e.muzzle, dir, a.color, 'blaster');
     else if (kind === 'charger') this.fx.muzzle?.(e.muzzle, dir, a.color, 'charger');
-    else if (kind === 'roller') this._flick(a);
+    else if (kind === 'roller' || kind === 'bucket' || kind === 'brush') this._flick(a);
     this._bump(FIRE_KEY[kind] || 'fire:other');
   }
   _impact(e) {
@@ -404,8 +404,8 @@ class FxHooks {
       const wr = a.weaponRunner;
       if (wr) {
         const wk = a.weapon?.kind ?? 'charger';
-        // charger only — the splatling's spin-up also sets `charging` but has its own tells
-        if (wr.charging && form === 'kid' && wk === 'charger') {
+        // charger + spinner only — the splatling's spin-up also sets `charging` but has its own tells
+        if (wr.charging && form === 'kid' && (wk === 'charger' || wk === 'spinner')) {
           a.character?.getMuzzle?.(_v);
           if (Number.isFinite(_v.x)) {
             fx.chargeGlow?.(_v, col, wr.charge);
@@ -458,11 +458,11 @@ class FxHooks {
       if (sj.phase === 'charge') {
         fx.superJumpCharge?.(pos, a.color, clamp(sj.t / 0.75, 0, 1));
         const tg = sj.target;
-        const tp = tg && tg.pos && tg.pos.isVector3 ? tg.pos : tg && tg.isVector3 ? tg : null;
-        if (tp) fx.jumpMarker?.(tp, a.color, sj.t);
+        const tp = tg && tg.pos && tg.pos.isVector3 ? (tg.jumpAnchor ? tg.jumpAnchor() : tg.pos) : tg && tg.isVector3 ? tg : null;
+        if (tp && !sj.home) fx.jumpMarker?.(tp, a.color, sj.t);   // (home jumps: the return beacon marks it)
       } else if (sj.phase === 'flight') {
         fx.superJumpTrail?.(pos, a.vel, a.color);
-        if (sj.to) { fx.jumpMarker?.(sj.to, a.color, sj.t); s.lastSJTo.copy(sj.to); }
+        if (sj.to) { if (!sj.home) fx.jumpMarker?.(sj.to, a.color, sj.t); s.lastSJTo.copy(sj.to); }
       }
       if (!this.seen['superjump'] && s.sj !== sj.phase) { if (sj.phase === 'flight') this._superjump(a, 'flight'); else s.sj = sj.phase; }
     } else if (s.sj === 'flight' && !this.seen['superjump:land']) {
@@ -683,10 +683,17 @@ class FxHooks {
     const G = this.G;
     this.edgeLevel = G.level;
     this.edges = [];
+    // the environment knows the real deck edges (turned slabs included): spray only where a deck meets open water
+    if (G.env && typeof G.env.deckEdges === 'function') { const e = G.env.deckEdges(1.6); if (e.length) { this.edges = e; return; } }
     const rects = (G.env && G.env.footprint && G.env.footprint.length ? G.env.footprint : null) || (G.level ? [G.level.bounds] : []);
-    const inside = (x, z) => rects.some((r) => x > r.minX && x < r.maxX && z > r.minZ && z < r.maxZ);
+    // (turned slabs — env.footprint rects with aligned === false: Cargo Terminal — use their own edges, not the AABB)
+    const inR = (r, x, z) => (r.aligned !== false ? x > r.minX && x < r.maxX && z > r.minZ && z < r.maxZ
+      : Math.abs((x - r.cx) * r.ax + (z - r.cz) * r.az) < r.hx && Math.abs((z - r.cz) * r.ax - (x - r.cx) * r.az) < r.hz);
+    const inside = (x, z) => rects.some((r) => inR(r, x, z));
+    const P = (r, u, v) => [r.cx + u * r.ax - v * r.az, r.cz + u * r.az + v * r.ax];
     for (const r of rects) {
-      const sides = [
+      const q = r.aligned === false ? [P(r, -r.hx, -r.hz), P(r, r.hx, -r.hz), P(r, r.hx, r.hz), P(r, -r.hx, r.hz)] : null;
+      const sides = q ? q.map((a, i) => { const c = q[(i + 1) & 3], n = [[r.az, -r.ax], [r.ax, r.az], [-r.az, r.ax], [-r.ax, -r.az]][i]; return [a[0], a[1], c[0], c[1], n[0], n[1]]; }) : [
         [r.minX, r.minZ, r.maxX, r.minZ, 0, -1], [r.maxX, r.minZ, r.maxX, r.maxZ, 1, 0],
         [r.maxX, r.maxZ, r.minX, r.maxZ, 0, 1], [r.minX, r.maxZ, r.minX, r.minZ, -1, 0],
       ];

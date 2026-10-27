@@ -1,4 +1,4 @@
-// Camera rig: third-person follow, death spectate, cinematic paths, orbit, judge overview.
+// Camera rig: third-person follow, death spectate, cinematic paths, orbit, judge overview (stream 4).
 //
 // Follow: the pivot rides critically-damped springs toward the character's *visual* position with velocity
 // feed-forward (smooth starts/stops/landings, no steady lag), a little strafe look-ahead, a soft vertical for jumps
@@ -218,7 +218,8 @@ export class CameraRig {
     // map diorama (eased both ways; reverses smoothly if the key is released mid-swoop)
     const inPlay = this.mode === 'follow' || this.mode === 'spectate';
     const want = this.mapOpen && inPlay ? 1 : 0;
-    this.mapK = want > this.mapK ? Math.min(1, this.mapK + dt / 0.42) : Math.max(0, this.mapK - dt / 0.34);
+    // (branch on the target, not on want > mapK: that compare turned a fully open map back down every few frames)
+    this.mapK = want ? Math.min(1, this.mapK + dt / 0.42) : Math.max(0, this.mapK - dt / 0.34);
     if (this.mapK > 1e-4) {
       this._diorama(dt);
       const e = easeInOut(this.mapK);
@@ -249,7 +250,9 @@ export class CameraRig {
     if (D.layout !== L.layout || Math.abs(D.aspect - aspect) > 1e-3) { D.layout = L.layout; D.aspect = aspect; this._fitDiorama(B, aspect); }
     D.yaw = damp(D.yaw, this.dioLook.x * 0.09, 4, dt);
     D.pitch = damp(D.pitch, -this.dioLook.y * 0.05, 4, dt);
-    this._dioPose(D.d, D.zShift, B, D.yaw, DIO_PITCH + D.pitch, D.pos, D.quat);
+    // online Bravo players look at the stage from their own end (layouts are 180° mirrors, so the same fit holds)
+    const f = this.dioFlip ? 1 : 0;
+    this._dioPose(D.d, f ? -D.zShift : D.zShift, B, D.yaw + f * Math.PI, DIO_PITCH + D.pitch, D.pos, D.quat);
     D.target.copy(_dT);
   }
 

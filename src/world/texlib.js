@@ -80,6 +80,7 @@
 //       never breaks into dotted, shimmering holes or vanishes at distance. texSize = lib.size.
 
 import * as THREE from 'three';
+import { STAGE_SURFACES } from './stages/surfaces.js';
 
 export const TEXLIB_MODE = { plain: 0, grid: 1, hex: 2 };
 const { plain: PLAIN, grid: GRID, hex: HEX } = TEXLIB_MODE;
@@ -1161,6 +1162,10 @@ const MATERIALS = [
   },
 ];
 
+// stage-owned surface materials (src/world/stages/<id>/surfaces.js, layers '<id>:<name>'): appended after every original
+// layer (their indices never move), compiled into the group their registry names (stages/surfaces.js)
+for (const s of STAGE_SURFACES) MATERIALS.push({ ...s.mat, name: s.name, group: s.group });
+
 // ---------------------------------------------------------------------------------------------------------------
 // Runtime sampling helpers
 // ---------------------------------------------------------------------------------------------------------------
@@ -1359,7 +1364,7 @@ export async function createTextureLibrary(renderer, { size = 512 } = {}) {
     uRes: { value: new THREE.Vector2(size, size) }, uScale: { value: 1 }, uMat: { value: 0 }, uOne: { value: 1 },
     uHRange: { value: new THREE.Vector2() }, uAO: { value: 0.5 },
   };
-  const groups = [0, 1, 2].map((g) => MATERIALS.map((m, i) => [m, i]).filter(([m]) => (m.group || 0) === g)).filter((l) => l.length);
+  const groups = [...new Set(MATERIALS.map((m) => m.group || 0))].sort((a, b) => a - b).map((g) => MATERIALS.map((m, i) => [m, i]).filter(([m]) => (m.group || 0) === g)).filter((l) => l.length);
   const progs = groups.map((list) => {
     const fns = list.map(([m, i]) => `void prep${i}(${PREP_SIG}) {\n  ${m.prep}\n}\nvoid surf${i}(${SURF_SIG}) {${m.surf}\n}`).join('\n');
     const sw = (fn, args) => list.map(([, i], k) => `${k ? 'else ' : ''}if (uMat == ${i}) ${fn}${i}(${args});`).join('\n  ');

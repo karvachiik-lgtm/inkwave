@@ -16,6 +16,7 @@ import * as THREE from 'three';
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { registerMarinaVessels } from './props-marina-vessels.js';
 import { registerMarinaDock } from './props-marina-dock.js';
+import { STAGES } from './stages/index.js';
 
 const PI = Math.PI, TAU = PI * 2, HP = PI / 2;
 
@@ -1172,7 +1173,9 @@ class Builder {
   tube(mat, c, pts, r, o = {}) { this.add(mat, tubeGeo(pts, r, o.radial ?? 8, !!o.closed, o.up || null), c, o.x || 0, o.y || 0, o.z || 0, o); }
   decal(name, w, h, x, y, z, o = {}) { this.add(o.glow ? 'glow' : 'paint', G.plane(w, h), o.tint ?? 'white', x, y, z, { ...o, uv: regUV(name), ao: false }); }
   blob(w, d, x = 0, z = 0) { if (this.aoBase == null) return; this.add('blob', G.plane(1, 1), 'white', x, 0.012, z, { rx: -HP, sx: w, sy: d, uvs: [1, 1] }); this.tris -= 2; }
-  col(x0, y0, z0, x1, y1, z1) { this.cols.push([x0, y0, z0, x1, y1, z1]); }
+  // collision box (local, metres). Optional flags (stage packs): o.roof = an off-limits top (never inkable, you slide
+  // off), o.perch = a top you can stand on but never ink, o.rail = a railing (kids blocked; shots / ink / squids pass)
+  col(x0, y0, z0, x1, y1, z1, o) { const f = (o && o.roof ? 1 : 0) | (o && o.rail ? 2 : 0) | (o && o.perch ? 4 : 0); this.cols.push(f ? [x0, y0, z0, x1, y1, z1, f] : [x0, y0, z0, x1, y1, z1]); }
   spin(kind, x, y, z, o = {}) { this.k._spin.push({ kind, base: this._m(x, y, z, o), speed: o.speed ?? 8, phase: this.r(0, TAU) }); this.tris += this.k._tplTris(kind); }
   blink(c, x, y, z, o = {}) { this.k._blink.push({ m: this._m(x, y, z, { s: o.size ?? 0.045 }), color: col(c).clone(), rate: o.rate ?? 1, phase: o.phase ?? this.r(0, TAU), lo: o.lo ?? 0.25, hi: o.hi ?? 5 }); this.tris += 84; }
   flag(x, y, z, o = {}) { this.k._flags.push({ m: this._m(x, y, z, o), team: o.team ?? null, color: col(o.color ?? 'offwhite').clone(), tint: o.tint ?? 0 }); this.tris += 16; }
@@ -1219,7 +1222,7 @@ D.railing = {
     B.sph('gloss', c, 0.04, L, H - 0.018, 0, { ws: 10, hs: 6 });
     B.cyl('gloss', c, 0.021, L, L / 2, H * 0.55, 0, { rz: HP, seg: 8, open: true });
     B.cyl('gloss', c, 0.018, L, L / 2, 0.15, 0, { rz: HP, seg: 8, open: true });
-    B.col(-0.05, 0, -0.06, L + 0.05, H, 0.06);
+    B.col(-0.05, 0, -0.06, L + 0.05, H, 0.06, { rail: true });
   },
 };
 
@@ -1248,7 +1251,7 @@ D.fence = {
         B.cyl('gloss', c, 0.016, w, xm, (y0 + top) / 2 + 0.15, 0, { rz: HP, seg: 6, open: true });
       }
     }
-    B.col(-0.3, 0, -0.14, L + 0.3, top, 0.14);
+    B.col(-0.3, 0, -0.14, L + 0.3, top, 0.14, { rail: true });   // see-through fence: kids blocked, shots / ink / squids pass
   },
 };
 
@@ -2384,7 +2387,7 @@ D.bikerack = {
       bike(B, pick(B, BIKE_COLS), B.r() < 0.4);
       B.pop();
     }
-    B.col(-0.25, 0, -0.95, (n - 1) * sp + 0.45, 1.05, 0.95);
+    B.col(-0.25, 0, -0.95, (n - 1) * sp + 0.45, 1.05, 0.95, { rail: true });   // hoops + bike frames: see-through
     B.blob(n * sp + 0.6, 2.0, (n - 1) * sp / 2, 0);
   },
 };
@@ -3079,6 +3082,13 @@ const PACK_HELPERS = {
 };
 registerMarinaVessels(D, PACK_HELPERS);
 registerMarinaDock(D, PACK_HELPERS);
+// stage-owned packs (src/world/stages/<id>/props.js, types prefixed '<id>_'), each on its own: a broken pack only loses
+// its own types (and never overrides a type that already exists)
+for (const [id, st] of Object.entries(STAGES)) {
+  if (!st.register) continue;
+  const before = new Set(Object.keys(D));
+  try { st.register(D, PACK_HELPERS); } catch (e) { console.error(`[inkwave] stage prop pack ${id} failed`, e); for (const k of Object.keys(D)) if (!before.has(k)) delete D[k]; }
+}
 
 export class PropKit {
   constructor(scene, opts = {}) {
@@ -3150,22 +3160,38 @@ export class PropKit {
     def.build(B, o);
     this.lastTris = B.tris;
     this.count++;
-    return { colliders: this._xfCols(B.cols, pos, rotY, scale) };
+    return { colliders: this._xfCols(B.cols, pos, rotY, scale, !!o.oboxCols) };
   }
 
-  _xfCols(cols, pos, rotY, s) {
+  // Local collider boxes → level boxes. A quarter-turned prop gives exact axis-aligned boxes; any other angle gives the
+  // rotated box's world AABB — or, with `obox` (the placement asked for it: a stage laid out at an angle), the box
+  // turned with the prop. Stage-pack flags (roof / rail / perch) ride along.
+  _xfCols(cols, pos, rotY, s, obox = false) {
     const q = Math.round(rotY / HP), snapped = Math.abs(rotY - q * HP) < 1e-3;
     const qq = ((q % 4) + 4) % 4;
     const c = snapped ? [1, 0, -1, 0][qq] : Math.cos(rotY), sn = snapped ? [0, 1, 0, -1][qq] : Math.sin(rotY);
     const out = [];
+    const r4 = (v) => Math.round(v * 1e4) / 1e4;
     for (const b of cols) {
-      let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-      for (const [lx, lz] of [[b[0], b[2]], [b[3], b[2]], [b[3], b[5]], [b[0], b[5]]]) {
-        const x = (lx * c + lz * sn) * s, z = (-lx * sn + lz * c) * s;
-        x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z);
+      let box;
+      if (!snapped) {
+        // turned prop: keep the collider turned with it (a world-axis box would swell past the real shape)
+        const mx = (b[0] + b[3]) / 2, mz = (b[2] + b[5]) / 2;
+        const cx = (mx * c + mz * sn) * s, cz = (-mx * sn + mz * c) * s;
+        box = { obox: true, center: [r4(pos[0] + cx), r4(pos[1] + ((b[1] + b[4]) / 2) * s), r4(pos[2] + cz)],
+          size: [r4((b[3] - b[0]) * s), r4((b[4] - b[1]) * s), r4((b[5] - b[2]) * s)], rotY: (rotY * 180) / Math.PI };
+      } else {
+        let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+        for (const [lx, lz] of [[b[0], b[2]], [b[3], b[2]], [b[3], b[5]], [b[0], b[5]]]) {
+          const x = (lx * c + lz * sn) * s, z = (-lx * sn + lz * c) * s;
+          x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z);
+        }
+        box = { min: [r4(pos[0] + x0), r4(pos[1] + b[1] * s), r4(pos[2] + z0)], max: [r4(pos[0] + x1), r4(pos[1] + b[4] * s), r4(pos[2] + z1)] };
       }
-      const r4 = (v) => Math.round(v * 1e4) / 1e4;
-      out.push({ min: [r4(pos[0] + x0), r4(pos[1] + b[1] * s), r4(pos[2] + z0)], max: [r4(pos[0] + x1), r4(pos[1] + b[4] * s), r4(pos[2] + z1)] });
+      if (b[6] & 1) box.roof = true;
+      if (b[6] & 2) box.rail = true;
+      if (b[6] & 4) box.perch = true;
+      out.push(box);
     }
     return out;
   }
